@@ -24,7 +24,9 @@ impl Collection {
             consent: telemetry::consent(),
             body_scroll: Scrollbar::default(),
             json_scroll: Scrollbar::default(),
-            draft: Choices::NONE,
+            // The ping is the one thing already on (Choices::default), so the question shows it
+            // as such; the four switches start off.
+            draft: Choices::default(),
             view: None,
             note: None,
             confirm_delete: false,
@@ -45,13 +47,9 @@ fn kind_id(prefix: &str, kind: DataKind) -> &'static str {
     }
 }
 
-/// Where a switch would be: the ping has none.
-fn always_on(t: &Theme) -> Div {
-    caps(tr("Always on")).flex_none().text_color(t.muted)
-}
-
-/// The "I'm playing" ping on the first-run question, laid out as the switches' rows.
-fn ping_row(t: &Theme) -> Div {
+/// The "I'm playing" ping on the first-run question, laid out as the switches' rows, with its own
+/// switch (`ask-ping`).
+fn ping_row(t: &Theme, control: AnyElement) -> Div {
     div()
         .flex()
         .items_start()
@@ -77,7 +75,7 @@ fn ping_row(t: &Theme) -> Div {
                         .child(tr(telemetry::PING)),
                 ),
         )
-        .child(always_on(t))
+        .child(control)
 }
 
 /// The exact JSON, in mono, scrolling inside a plate.
@@ -200,7 +198,15 @@ impl Launcher {
                     .border_t_1()
                     .border_color(t.rule)
                     .children(rows)
-                    .child(ping_row(&t)),
+                    .child(ping_row(
+                        &t,
+                        switch("ask-ping", draft.live, &t)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.collection.draft.live = !this.collection.draft.live;
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    )),
             )
             .child(text(theme::CAPTION).text_color(t.muted).child(tr(telemetry::NEVER)))
             .child(
@@ -278,7 +284,7 @@ impl Launcher {
             let toggle = switch(kind_id("data", kind), on, &t).on_click(cx.listener(
                 move |this, _: &ClickEvent, _, cx| {
                     let mut choices = if this.collection.consent.needs_asking() {
-                        Choices::NONE
+                        Choices::default()
                     } else {
                         this.collection.consent.choices
                     };
@@ -299,7 +305,20 @@ impl Launcher {
             telemetry::SWITCHES.len() + 1,
             tr(telemetry::PING_NAME),
             Some(div().child(tr(telemetry::PING)).into_any_element()),
-            Some(always_on(&t).into_any_element()),
+            Some(
+                switch("data-ping", consent.pings(), &t)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        let mut choices = if this.collection.consent.needs_asking() {
+                            Choices::default()
+                        } else {
+                            this.collection.consent.choices
+                        };
+                        choices.live = !consent.choices.live;
+                        this.answer_consent(choices);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            ),
             &t,
         ));
         let waiting = horizon_telemetry::outbox::pending(&telemetry::home()).len();

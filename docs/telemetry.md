@@ -2,14 +2,14 @@
 
 Horizon collects nothing unless the player says yes. The launcher asks once, with four separate switches that are all off until the player turns one on, and the same switches stay in Settings. The game and the launcher obey the same answer. The code is in `crates/horizon-telemetry`.
 
-The one exception is the anonymous ["I'm playing" ping](#the-im-playing-ping) behind the launcher's "N playing now": it holds nothing about the player, and the launcher says so next to the switches.
+Beside them sits the anonymous ["I'm playing" ping](#the-im-playing-ping) behind the launcher's "N playing now": it holds nothing about the player, it has a switch of its own (`ping`), it is on until the player turns it off, and "Send nothing" turns it off with everything else.
 
 ## Consent
 
 `telemetry/consent.json` in the game folder (`HORIZON_HOME`, else `horizon` in the platform data folder):
 
 ```json
-{ "version": 2, "answered": 1792060800, "choices": { "performance": true, "crashes": true, "bugs": false, "benchmarks": false }, "install_id": "3f2c…" }
+{ "version": 2, "answered": 1792060800, "choices": { "performance": true, "crashes": true, "bugs": false, "benchmarks": false, "live": true }, "install_id": "3f2c…" }
 ```
 
 - `version` is the consent version the player answered (`CONSENT_VERSION`). It goes up when what is collected changes. The launcher then asks again, and until the player answers nothing new is kept or sent.
@@ -65,12 +65,12 @@ Never sent: account names or UUIDs, world names, server or LAN addresses, chat, 
 - The launcher sends the outbox when it starts and when it closes. Items go as one JSON batch (`{"schema":1,"install_id":…,"items":[…]}`, up to 64 items and 1 MiB), compressed with zstd: `POST /v1/batch` with `Content-Encoding: zstd`. A day's perf summaries are under 2 KB on the wire.
 - After a failure the launcher waits a minute, doubling up to a day, and sends at most 8 batches a day. A batch the server refuses with a 4xx (not 429) is dropped.
 - The server is `https://telemetry.playhorizon.dev` (`DEFAULT_ENDPOINT`), on Railway in the EU (`europe-west4`, Amsterdam). `HORIZON_TELEMETRY_URL` names another one (a local server); `HORIZON_TELEMETRY_URL=off` sends nothing at all, no ping either. Tests, CI and the benchmark and test harnesses set `off`.
-- What is sent still depends on the switches: with every switch off nothing but the ping leaves, and the outbox stays empty.
+- What is sent still depends on the switches: with every switch off and the ping off, nothing leaves, and the outbox stays empty.
 - `SCHEMA` versions the format. New optional fields keep it. A field that changes meaning or goes bumps it, and the server keeps reading the older ones.
 
 ## The "I'm playing" ping
 
-Ludovic decided on 2026-10-22 to count every player, with or without consent, and to tell them. The launcher's first-run question and Settings → Data collection show it as an "Always on" row next to the switches. Players who answered the question before the ping existed see the same text once on the Play page. The privacy page on playhorizon.dev says the same.
+Ludovic decided on 2026-10-22 to count every player and to tell them. The launcher's first-run question and Settings → Data collection show it as a row next to the switches, with a switch of its own (`Choices::live`): it starts on, and a player who turns it off, or clicks "Send nothing", gets no ping — the game reads the answer (`Consent::pings`) before its first request, so the choice holds from the start of the session. Players who answered the question before the switch existed keep pinging, and see the text once on the Play page. The privacy page on playhorizon.dev says the same.
 
 While the game runs (not a dedicated server, a benchmark or a run that quits by itself), a thread of its own (`crates/horizon-client/src/heartbeat.rs`) sends `POST /v1/live` once a minute. It also sends one at once when a world is opened to or closed from LAN or friends:
 

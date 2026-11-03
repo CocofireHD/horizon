@@ -159,12 +159,12 @@ enum AccountCmd {
 enum DataCmd {
     /// What is allowed, the install ID and how many items wait (the default)
     Status,
-    /// Turn kinds on: performance, crashes, bugs, benchmarks, or all
+    /// Turn kinds on: performance, crashes, bugs, benchmarks, ping, or all
     Allow {
         #[arg(required = true)]
         kinds: Vec<String>,
     },
-    /// Turn kinds off: performance, crashes, bugs, benchmarks, or all
+    /// Turn kinds off: performance, crashes, bugs, benchmarks, ping, or all
     Deny {
         #[arg(required = true)]
         kinds: Vec<String>,
@@ -2062,6 +2062,23 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
 }
 
 /// `data`: the same consent as Settings → Data collection.
+/// `data allow`/`deny`: `ping` is the "I'm playing" switch, the rest are kinds of item; `all`
+/// means every switch, the ping too, as "Send nothing" does.
+fn set_switches(names: Vec<String>, on: bool) -> Result<(), String> {
+    use horizon_launcher::telemetry;
+    let everything = names.iter().any(|name| name == "all");
+    let (own, names): (Vec<String>, Vec<String>) = names
+        .into_iter()
+        .partition(|name| name == "ping" || name == "all");
+    if everything || !own.is_empty() {
+        telemetry::set_ping(on)?;
+    }
+    if !names.is_empty() {
+        telemetry::set(&telemetry::parse_kinds(&names)?, on)?;
+    }
+    Ok(())
+}
+
 fn data(action: DataCmd, as_json: bool) -> Result<(), String> {
     use horizon_launcher::telemetry;
     let review = |item: &horizon_telemetry::Item, yes: bool| -> Result<bool, String> {
@@ -2097,6 +2114,11 @@ fn data(action: DataCmd, as_json: bool) -> Result<(), String> {
                 let on = consent.allows(kind);
                 println!("{name}: {}", if on { "on" } else { "off" });
             }
+            println!(
+                "{}: {}",
+                telemetry::PING_NAME,
+                if consent.pings() { "on" } else { "off" }
+            );
             println!("Waiting to be sent: {}", status["waiting"]);
             match horizon_telemetry::endpoint() {
                 Some(url) => println!("Server: {url}"),
@@ -2104,11 +2126,11 @@ fn data(action: DataCmd, as_json: bool) -> Result<(), String> {
             }
         }
         DataCmd::Allow { kinds } => {
-            telemetry::set(&telemetry::parse_kinds(&kinds)?, true)?;
+            set_switches(kinds, true)?;
             return data(DataCmd::Status, as_json);
         }
         DataCmd::Deny { kinds } => {
-            telemetry::set(&telemetry::parse_kinds(&kinds)?, false)?;
+            set_switches(kinds, false)?;
             return data(DataCmd::Status, as_json);
         }
         DataCmd::Show => {

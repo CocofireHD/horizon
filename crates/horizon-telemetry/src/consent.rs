@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{CONSENT_VERSION, Kind};
 
 /// What the player allows, kind by kind.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Choices {
     /// Performance summaries: frame-time percentiles and buckets, tick times, memory, startup.
@@ -18,6 +18,19 @@ pub struct Choices {
     pub bugs: bool,
     /// Benchmark reports from the launcher and the game.
     pub benchmarks: bool,
+    /// The anonymous "I'm playing" ping (`live`), whatever the switches above say. Unlike them it
+    /// is on until the player turns it off (a missing answer means on, so a file written before
+    /// the switch existed keeps pinging), and it needs no install ID: a ping holds none.
+    pub live: bool,
+}
+
+impl Default for Choices {
+    fn default() -> Self {
+        Self {
+            live: true,
+            ..Self::NONE
+        }
+    }
 }
 
 impl Choices {
@@ -26,12 +39,14 @@ impl Choices {
         crashes: false,
         bugs: false,
         benchmarks: false,
+        live: false,
     };
     pub const ALL: Self = Self {
         performance: true,
         crashes: true,
         bugs: true,
         benchmarks: true,
+        live: true,
     };
 
     pub fn allows(self, kind: Kind) -> bool {
@@ -98,6 +113,13 @@ impl Consent {
     /// question (a newer launcher's answer covers an older game's).
     pub fn allows(&self, kind: Kind) -> bool {
         !self.needs_asking() && !self.install_id.is_empty() && self.choices.allows(kind)
+    }
+
+    /// Whether the game may send its anonymous "I'm playing" ping (`live`). On until the player
+    /// turns it off: it is not one of the kinds above, needs no install ID (a ping holds none) and
+    /// is honoured from the first request, so the game reads this before it starts pinging.
+    pub fn pings(&self) -> bool {
+        self.choices.live
     }
 
     /// Records the player's answer now. The install ID is made at the first yes and kept when
@@ -173,6 +195,31 @@ mod tests {
         consent.version = CONSENT_VERSION - 1;
         assert!(consent.needs_asking());
         assert!(Kind::ALL.iter().all(|&k| !consent.allows(k)));
+    }
+
+    #[test]
+    fn the_live_ping_is_on_until_the_player_turns_it_off() {
+        let home = crate::test_home::new("consent-ping");
+        // Nobody asked yet, and a file written before the switch existed: still on, as before.
+        assert!(Consent::load(&home).pings());
+        std::fs::create_dir_all(crate::dir(&home)).unwrap();
+        std::fs::write(
+            Consent::path(&home),
+            br#"{"version":2,"answered":1,"choices":{"performance":true}}"#,
+        )
+        .unwrap();
+        assert!(Consent::load(&home).pings());
+
+        // "Send nothing" is nothing: the ping goes too, and stays gone across a reload.
+        let mut consent = Consent::load(&home);
+        consent.answer(Choices::NONE);
+        consent.save(&home).unwrap();
+        assert!(!Consent::load(&home).pings());
+
+        // It follows the switches back on, and needs no install ID of its own: a ping holds none.
+        consent.answer(Choices::ALL);
+        consent.save(&home).unwrap();
+        assert!(Consent::load(&home).pings());
     }
 
     #[test]
