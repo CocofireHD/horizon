@@ -109,7 +109,7 @@ fn debug_lines_opaque_first(lines: &[[f32; 8]]) -> impl Iterator<Item = &[f32; 8
 /// Whether Translucent Batching is offered (`graphics::offer_translucent_batching`): where
 /// indirect multi-draws (`multi_draw`) take its batches, but not OpenGL's, which loop over
 /// their entries on the CPU (and without them every section is a call of its own anyway).
-/// Frames drawn flat (Metal, Intel Gen11/Gen12's Vulkan driver) take it too: their
+/// Frames drawn flat (Metal, Intel Gen11/Gen12's ANV Vulkan driver) take it too: their
 /// translucent calls then come one per page of its arena rather than about one per section.
 fn translucent_batchable(info: &wgpu::AdapterInfo, multi_draw: bool) -> bool {
     multi_draw && info.backend != wgpu::Backend::Gl
@@ -11720,7 +11720,7 @@ mod tests {
     }
 
     /// Translucent Batching is offered with indirect multi-draws that aren't OpenGL's, flat
-    /// frames (Metal, Intel Gen11/Gen12 on Vulkan) included.
+    /// frames (Metal, Intel Gen11/Gen12 on Vulkan's ANV driver) included.
     #[test]
     fn translucent_batching_is_offered_with_indirect_multi_draws_except_on_opengl() {
         let vulkan = adapter(wgpu::DeviceType::DiscreteGpu);
@@ -11738,8 +11738,8 @@ mod tests {
     /// GPU culling is offered where the device draws counts the GPU wrote and runs compute
     /// shaders with storage buffers enough, where Translucent Batching is (indirect
     /// multi-draws that aren't OpenGL's) and vanilla frames are never drawn flat, and never
-    /// on Intel Gen11/Gen12's Vulkan driver, whose draws read instance-rate origins from the
-    /// wrong first instance, even with flat draws off there, nor on DX12 with flat page
+    /// on Intel Gen11/Gen12's ANV Vulkan driver, whose draws read instance-rate origins from
+    /// the wrong first instance, even with flat draws off there, nor on DX12 with flat page
     /// groups, whose count draws leave the base vertex out of the pulled pipelines'
     /// `vertex_index`.
     #[test]
@@ -11751,6 +11751,12 @@ mod tests {
         dx12.backend = wgpu::Backend::Dx12;
         let mut intel = adapter(wgpu::DeviceType::IntegratedGpu);
         (intel.vendor, intel.device) = (0x8086, 0x9a49); // Tiger Lake
+        intel.driver = "Intel open-source Mesa driver".into();
+        intel.driver_info = "Mesa 24.3.4".into();
+        // The same chip on Intel's Windows driver, where the ANV bug is absent.
+        let mut windows_intel = intel.clone();
+        windows_intel.driver = "Intel Corporation".into();
+        windows_intel.driver_info = "Intel driver 32.0.101.6078".into();
         let counts = wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
         let compute = wgpu::DownlevelFlags::COMPUTE_SHADERS;
         let storage = |buffers| wgpu::Limits {
@@ -11782,6 +11788,7 @@ mod tests {
         assert!(!offered(&vulkan, counts, compute, 8, false, None));
         assert!(!offered(&gl, counts, compute, 8, true, None));
         assert!(!offered(&intel, counts, compute, 8, true, None));
+        assert!(offered(&windows_intel, counts, compute, 8, true, None));
         assert!(offered(&dx12, counts, compute, 8, true, None));
         assert!(!offered(&dx12, counts, compute, 8, true, Some(usize::MAX)));
         // The settings offer it there, but not on a software adapter (WARP, lavapipe),

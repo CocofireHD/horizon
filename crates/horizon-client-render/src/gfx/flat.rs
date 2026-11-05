@@ -170,21 +170,34 @@ pub fn wanted(adapter: &wgpu::Adapter, device: &wgpu::Device) -> bool {
 }
 
 /// Whether frames without a shader pack's terrain draw flat: where the backend
-/// emulates multi-draw (Metal, past `MIN_SECTIONS`), on Intel Gen11/Gen12's Vulkan
-/// driver, or with `HORIZON_FLAT_DRAWS=1`. Elsewhere per-section draws stay.
+/// emulates multi-draw (Metal, past `MIN_SECTIONS`), on Intel Gen11/Gen12's ANV
+/// Vulkan driver, or with `HORIZON_FLAT_DRAWS=1`. Elsewhere per-section draws stay.
 pub fn for_vanilla(info: &wgpu::AdapterInfo) -> bool {
     std::env::var("HORIZON_FLAT_DRAWS").as_deref() == Ok("1")
         || info.backend == wgpu::Backend::Metal
         || is_broken_intel_vulkan(info)
 }
 
+/// Whether a Vulkan adapter's driver is Mesa's. wgpu fills `driver` from
+/// `VkPhysicalDeviceDriverProperties::driverName`, which ANV reports as "Intel
+/// open-source Mesa driver"; Intel's Windows driver reports "Intel Corporation"
+/// there instead. `driver_info` holds the version ("Mesa 24.3.4" on ANV).
+fn is_mesa_driver(info: &wgpu::AdapterInfo) -> bool {
+    [info.driver.as_str(), info.driver_info.as_str()]
+        .iter()
+        .any(|name| name.to_ascii_lowercase().contains("mesa"))
+}
+
 /// Intel Gen11 (Ice Lake) and Gen12 (Tiger Lake, Rocket Lake, Alder Lake,
 /// Raptor Lake) ANV Vulkan drivers have broken `first_instance` for
 /// instance-step vertex attributes (#3529, #4599), causing terrain sections to
-/// be drawn with another section's origin and flicker.
+/// be drawn with another section's origin and flicker. Only the Mesa/ANV
+/// drivers have the bug: Intel's proprietary Windows Vulkan driver needs no
+/// workaround, and dropping it there keeps GPU culling and per-section draws.
 pub fn is_broken_intel_vulkan(info: &wgpu::AdapterInfo) -> bool {
     info.backend == wgpu::Backend::Vulkan
         && info.vendor == 0x8086
+        && is_mesa_driver(info)
         && (matches!(
             info.device,
             0x8a50..=0x8a71 // Gen11: Ice Lake
@@ -1056,6 +1069,51 @@ mod tests {
             (0, Some(1)),
         ];
         (draws, pages, 4)
+    }
+
+    fn intel_vulkan(device: u32, driver: &str, driver_info: &str) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: "Intel(R) Iris(R) Xe Graphics".into(),
+            vendor: 0x8086,
+            device,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            device_pci_bus_id: String::new(),
+            driver: driver.into(),
+            driver_info: driver_info.into(),
+            backend: wgpu::Backend::Vulkan,
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: None,
+            limit_bucket: None,
+        }
+    }
+
+    /// The workaround is for ANV, whose driver reports "Mesa" in its name or
+    /// version, and only for Gen11/Gen12 there.
+    #[test]
+    fn broken_intel_vulkan_is_anv_on_gen11_and_gen12_only() {
+        let anv = |device| intel_vulkan(device, "Intel open-source Mesa driver", "Mesa 24.3.4");
+        // Tiger Lake (Gen12) and Ice Lake (Gen11) on Linux ANV.
+        assert!(is_broken_intel_vulkan(&anv(0x9a49)));
+        assert!(is_broken_intel_vulkan(&anv(0x8a52)));
+        // The same Gen12 chip on Intel's proprietary Windows Vulkan driver.
+        assert!(!is_broken_intel_vulkan(&intel_vulkan(
+            0x9a49,
+            "Intel Corporation",
+            "Intel driver 32.0.101.6078",
+        )));
+        // Gen9 (Kaby Lake) on ANV is outside the broken range.
+        assert!(!is_broken_intel_vulkan(&anv(0x5916)));
+        // Another vendor's Mesa driver, and an unnamed driver, are not Intel ANV.
+        let mut amd = anv(0x9a49);
+        amd.vendor = 0x1002;
+        amd.driver = "AMD open-source driver".into();
+        amd.driver_info = "Mesa 24.3.4".into();
+        assert!(!is_broken_intel_vulkan(&amd));
+        let mut unnamed = anv(0x9a49);
+        unnamed.driver.clear();
+        unnamed.driver_info.clear();
+        assert!(!is_broken_intel_vulkan(&unnamed));
     }
 
     #[test]

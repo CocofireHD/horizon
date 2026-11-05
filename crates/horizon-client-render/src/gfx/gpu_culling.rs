@@ -498,7 +498,7 @@ fn tables(input: &FrameInputs<'_>, words: &mut Vec<u32>) -> Option<Params> {
 
 /// Whether GPU culling is offered: where the device draws a count the GPU wrote
 /// and runs compute shaders, where its multi-draws offset instance-rate origins
-/// by each draw's first instance (`multi_draw`; Intel Gen11/Gen12's Vulkan
+/// by each draw's first instance (`multi_draw`; Intel Gen11/Gen12's ANV Vulkan
 /// driver gets that wrong, `flat::is_broken_intel_vulkan`, tested here too for
 /// when flat draws are off), where Translucent Batching is
 /// (`translucent_batchable`), and where vanilla frames never draw flat (flat
@@ -2706,7 +2706,7 @@ mod tests {
 
     /// A device of `backends` that draws counts with first instances, if this
     /// machine has one; on DirectX 12, `compiler` compiles its shaders. Not
-    /// Intel's Gen11 and Gen12 Vulkan driver, which gets first instances wrong
+    /// Intel's Gen11 and Gen12 ANV Vulkan driver, which gets first instances wrong
     /// and is never offered GPU culling (`supported`).
     fn device(
         backends: wgpu::Backends,
