@@ -143,14 +143,14 @@ Each is under about 500 lines, compiles alone, and keeps every 26.3 harness gree
 1. **`NetConfig` version policy** — `accept_older: Vec<ServerVersion>` on `NetConfig`
    (`lan/mod.rs`), a `server.properties` key parsed into it, empty by default. Status keeps advertising
    777. No behaviour change yet.
-2. **Handshake recognition** — `lan/conn.rs` accepts a protocol in the configured set instead of
-   `!= 777`, attaches nothing yet, and login passes through as today; state the accepted version on the
-   connection so later PRs can read it. Tests cover 777 (unchanged), 776 accepted when configured, 776
-   refused when not.
+2. **Handshake recognition** — `lan/conn.rs` recognizes a protocol in the configured set and records
+   its version for the later adapter, but still rejects older clients until server-role translation is
+   installed. A configured 776 connection must never enter login and play using 777 packet layouts.
+   Tests cover 777 (unchanged) and 776 refused both with and without configuration at this stage.
 3. **Server-role session and the zero-cost hook** — `Session::for_server`, `Connection::adapt_server`,
    and serverbound-up / clientbound-down layout translation for the packets that already have a
-   client-role translation. Tests: a 26.2 body round-trips, and `adapt(Current)` leaves both adapter
-   slots `None`.
+   client-role translation. Keep 776 rejected until all required translation and registry sync are in
+   place. Tests: a 26.2 body round-trips, and `adapt(Current)` leaves both adapter slots `None`.
 4. **Registry sync down** — filter `RegistryData` entries by name for a 26.2 peer, apply the `DOWN` runs
    to the numeric registries, and drop components the client cannot parse. Tests compare the emitted
    names and ids against the generated 26.2 tables.
