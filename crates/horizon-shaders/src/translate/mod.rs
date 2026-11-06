@@ -408,6 +408,22 @@ fn translate(
         })
         .collect();
     let images = bind_images([&v, &f], samplers.len());
+    // Cutout terrain tests the sprite's own alpha, as vanilla's `terrain.fsh` does
+    // (`ALPHA_CUTOUT` on the sampled `color.a`), rather than output 0's: packs such as
+    // Chocapic13 write the gbuffer's encoded data there, whose alpha is not the sprite's
+    // (a leaf's 0.5 encodes to just below 0.5, so the output test discarded every leaf).
+    // The atlas is the sampler the renderer binds for `texture`, `gtexture` and `tex`.
+    let cutout_sampler = gbuffers
+        .filter(|g| {
+            g.alpha_test
+                .is_some_and(|t| t.op == ">" && t.reference == 0.5)
+        })
+        .and_then(|_| {
+            samplers.iter().find(|s| {
+                s.ty == "sampler2D" && matches!(s.name.as_str(), "texture" | "gtexture" | "tex")
+            })
+        })
+        .map(|s| s.name.clone());
 
     // Varyings by name: the vertex outputs, then fragment inputs the vertex stage lacks. A
     // matrix or array travels as one varying per column or element (`varying_parts`), a
@@ -457,6 +473,14 @@ fn translate(
                 locations.insert(var.name.clone(), (next, var.decl.clone()));
             }
         }
+    }
+    // The cutout test's sprite UV (the atlas coordinates `hz_MultiTexCoord0` holds).
+    if cutout_sampler.is_some() {
+        let next = locations.len() as u32;
+        locations.insert(
+            "hz_cutout_uv".to_owned(),
+            (next, "vec2 hz_cutout_uv;".to_owned()),
+        );
     }
 
     // Terrain's fade input is supplied without a pack declaration. Inject it only when
@@ -536,6 +560,9 @@ fn translate(
         writeln!(vertex_main, "    {name} = hz_init_{name}();").unwrap();
     }
     vertex_main.push_str("    hz_main();\n");
+    if cutout_sampler.is_some() {
+        vertex_main.push_str("    hz_cutout_uv = hz_MultiTexCoord0.xy;\n");
+    }
     // A struct's own declaration is the pack's: only a stage that declares it copies it.
     let declared = |list: &[scan::Var], name: &str, global: &str| {
         !global.is_empty() || list.iter().any(|var| var.name == name)
@@ -588,9 +615,15 @@ fn translate(
         && f.outputs.contains(&0)
         && !f.frag_outs.iter().any(|(n, _)| *n == 0)
     {
-        match t.op {
-            "false" => fragment_main.push_str("    discard;\n"),
-            op => writeln!(
+        match (t.op, &cutout_sampler) {
+            ("false", _) => fragment_main.push_str("    discard;\n"),
+            (op, Some(name)) => writeln!(
+                fragment_main,
+                "    if (!(texture(sampler2D({name}, hz_s_{name}), hz_cutout_uv).a {op} {:?})) {{ discard; }}",
+                t.reference
+            )
+            .unwrap(),
+            (op, None) => writeln!(
                 fragment_main,
                 "    if (!(hz_out0.a {op} {:?})) {{ discard; }}",
                 t.reference

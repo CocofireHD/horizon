@@ -32,6 +32,25 @@ fn program(name: &str, rgb: [u8; 3], alpha: f32) -> [(String, String); 2] {
     ]
 }
 
+/// A program writing `rgb` with `alpha` into colortex0, and sampling the atlas (`texture`) so
+/// the cutout test can read its alpha.
+fn textured_program(name: &str, rgb: [u8; 3], alpha: f32) -> [(String, String); 2] {
+    let [r, g, b] = rgb.map(|c| f32::from(c) / 255.0);
+    [
+        (
+            format!("{name}.vsh"),
+            "#version 120\nvoid main(){gl_Position=vec4(gl_Vertex.xy,0.0,1.0);}".into(),
+        ),
+        (
+            format!("{name}.fsh"),
+            format!(
+                "#version 120\nuniform sampler2D texture;\n/* DRAWBUFFERS:0 */\n\
+                 void main(){{gl_FragData[0]=vec4({r:?},{g:?},{b:?},{alpha:?});}}"
+            ),
+        ),
+    ]
+}
+
 /// Lava's sprite layer in the fixture.
 const LAVA: u16 = 5;
 
@@ -314,6 +333,20 @@ fn cutout_terrain_keeps_alphas_above_0_5_and_solid_terrain_keeps_all() {
         let want = [Some(GREEN), cutout.then_some(BLUE), Some(GREEN)];
         assert_eq!(got, want, "split programs writing alpha {alpha}");
     }
+}
+
+/// A pack that encodes the gbuffer in the primary output's alpha (Chocapic13's
+/// `gbuffers_terrain` writes `encodeVec2(...)` to all four components: a plant's alpha 0.5
+/// with full sky light encodes to 32767/65535, just below 0.5) still keeps its cutout
+/// terrain: the test reads the sprite's alpha, as vanilla's `terrain.fsh` does, not the
+/// output's.
+#[test]
+fn cutout_terrain_tests_the_sprite_alpha_not_the_output() {
+    let files = textured_program("gbuffers_terrain", RED, 0.499_99).to_vec();
+    let Some((got, _)) = strips_of(files, [255; 4]) else {
+        return;
+    };
+    assert_eq!(got, [Some(RED); 3]);
 }
 
 /// `alphaTestRef` in the same probes: 0 for solid terrain and 0.5 for cutout terrain, through
