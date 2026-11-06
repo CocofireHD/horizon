@@ -35,6 +35,25 @@ fn program(name: &str, rgb: [u8; 3], alpha: f32) -> [(String, String); 2] {
 /// Lava's sprite layer in the fixture.
 const LAVA: u16 = 5;
 
+/// A program writing `rgb` with `alpha` into colortex0 that declares the atlas sampler, as a
+/// pack's terrain program does: `texture`'s alpha is the sprite's.
+fn sampling_program(name: &str, rgb: [u8; 3], alpha: f32) -> [(String, String); 2] {
+    let [r, g, b] = rgb.map(|c| f32::from(c) / 255.0);
+    [
+        (
+            format!("{name}.vsh"),
+            "#version 120\nvoid main(){gl_Position=vec4(gl_Vertex.xy,0.0,1.0);}".into(),
+        ),
+        (
+            format!("{name}.fsh"),
+            format!(
+                "#version 120\nuniform sampler2D texture;\n/* DRAWBUFFERS:0 */\n\
+                 void main(){{gl_FragData[0]=vec4({r:?},{g:?},{b:?},{alpha:?});}}"
+            ),
+        ),
+    ]
+}
+
 /// The pack (`final` shows colortex0, cleared to black) drawn over three strips of terrain, left
 /// to right: a quad over opaque texels, a cutout quad, a lava quad, all with opaque vertex
 /// colours. Each strip's colour, `None` where nothing drew; `None` overall without a GPU.
@@ -56,12 +75,23 @@ fn strips_with_alphas(
     Some(strips)
 }
 
-/// `strips_with_alphas` with the pack's terrain programs' `files`, and the built pack's notes
-/// when it draws no terrain itself (`None` when it does).
+/// `strips_with_alphas` with the pack's terrain programs' `files` and the atlas `texture` binds
+/// (`None`: the game's white stand-in), and the built pack's notes when it draws no terrain
+/// itself (`None` when it does).
 #[allow(clippy::type_complexity)]
 fn strips_of(
     programs: Vec<(String, String)>,
     alphas: [u8; 4],
+) -> Option<([Option<[u8; 3]>; 3], Option<Vec<String>>)> {
+    strips_of_atlas(programs, alphas, None)
+}
+
+/// `strips_of` with the atlas `texture` binds: its texels' alpha is the sprite's.
+#[allow(clippy::type_complexity)]
+fn strips_of_atlas(
+    programs: Vec<(String, String)>,
+    alphas: [u8; 4],
+    atlas: Option<wgpu::TextureView>,
 ) -> Option<([Option<[u8; 3]>; 3], Option<Vec<String>>)> {
     let Some(gpu) = Gpu::new() else {
         eprintln!("TERRAIN_PARTS_NO_ADAPTER");
@@ -116,7 +146,7 @@ fn strips_of(
                 buffers: &layouts,
                 table: None,
                 depth_write: true,
-                atlas: None,
+                atlas,
                 material_maps: false,
                 ids: None,
                 cull: false,
@@ -314,6 +344,28 @@ fn cutout_terrain_keeps_alphas_above_0_5_and_solid_terrain_keeps_all() {
         let want = [Some(GREEN), cutout.then_some(BLUE), Some(GREEN)];
         assert_eq!(got, want, "split programs writing alpha {alpha}");
     }
+}
+
+/// A pack that writes the gbuffer's data into output 0's alpha (Chocapic13's `gbuffers_terrain`
+/// encodes it into all four components) still cuts a sprite's clear texels: the cutout test
+/// reads the sprite's alpha, as vanilla's `terrain.fsh` does. Kelp and the other cross models
+/// drew as opaque sheets, their clear texels kept and shaded (#8388).
+#[test]
+fn cutout_terrain_tests_the_sprite_alpha_not_the_output() {
+    let Some(gpu) = Gpu::new() else {
+        eprintln!("TERRAIN_PARTS_NO_ADAPTER");
+        return;
+    };
+    // A sprite with clear texels: wgpu zeroes a new texture, so every texel's alpha is 0.
+    let atlas = gpu.texture(T::Rgba8Unorm);
+    let Some((got, _)) = strips_of_atlas(
+        sampling_program("gbuffers_terrain", RED, 1.0).to_vec(),
+        [255; 4],
+        Some(atlas),
+    ) else {
+        return;
+    };
+    assert_eq!(got, [Some(RED), None, Some(RED)]);
 }
 
 /// `alphaTestRef` in the same probes: 0 for solid terrain and 0.5 for cutout terrain, through
