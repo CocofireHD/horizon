@@ -2655,6 +2655,11 @@ impl BlockEntityRenderer {
                 y_rot,
                 ..
             } => {
+                // `ChestModel`'s render type is `entityCutoutCull`, so its faces are
+                // one-sided. Without the cull, an open lid whose face lands on a
+                // neighbouring chest's surface draws both coincident faces and
+                // z-fights (#7892).
+                let first = out.len();
                 // ChestRenderer.getChestMaterial: normal and trapped chests use the christmas
                 // sprites on 24-26 December. Copper and ender chests keep theirs.
                 let texture = if matches!(block.as_str(), "chest" | "trapped_chest")
@@ -2731,6 +2736,9 @@ impl BlockEntityRenderer {
                             }));
                         }
                     }
+                    for vertex in &mut out[first..] {
+                        vertex.normal = CULL_BACK;
+                    }
                     return;
                 }
                 let m = base
@@ -2746,6 +2754,9 @@ impl BlockEntityRenderer {
                 };
                 if let Some(paint) = paint(texture, 0xFFFFFF, packed) {
                     draw_part(model, "root", m, &adjust, paint, out);
+                }
+                for vertex in &mut out[first..] {
+                    vertex.normal = CULL_BACK;
                 }
             }
             Kind::Shulker { texture, facing } => {

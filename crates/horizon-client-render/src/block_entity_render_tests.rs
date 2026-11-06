@@ -6,7 +6,7 @@ use crate::{
     chunk::Chunk,
     font::Glyph,
     hud::Rect,
-    mesher::Vertex,
+    mesher::{CULL_BACK, Vertex},
     signs::{SignData, SignText},
     world::World,
 };
@@ -1187,6 +1187,60 @@ fn double_chest_cache_bypasses_both_halves_while_either_lid_is_open() {
         &|pos| if pos[0] == 0 { 0.0 } else { 0.8 },
     );
     assert_eq!(wrong_facing, (0.0, None), "mismatched facings do not pair");
+}
+
+/// `ChestModel` draws with `entityCutoutCull`, so its faces are one-sided.
+/// Without that cull an open lid's face and a neighbouring chest's face
+/// coincide and both draw, flickering (#7892).
+#[test]
+fn chest_faces_cull_like_entity_cutout_cull() {
+    let renderer = chest_renderer();
+    let mut world = World::new(BlockStateId(0), 1);
+    world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+    let sprites = sprites("entity/chest/normal");
+    let anim = |_: [i32; 3]| BlockAnim::default();
+    let openness = Cell::new(1.0);
+    let lid = |_: [i32; 3]| openness.get();
+    let scene = Scene {
+        camera: DVec3::ZERO,
+        orientation: Quat::IDENTITY,
+        anim: &anim,
+        texts: None,
+        partial: 1.0,
+        game_time: 0,
+        max_y: 320,
+        world: &world,
+        sprites: &sprites,
+        emissive: &Default::default(),
+        translucent_sprites: &HashSet::new(),
+        atlas_revision: 1,
+        nether: false,
+        lid: &lid,
+        sign: &|_| None,
+        banner: &|_| Vec::new(),
+        skull: &|_| None,
+        glyph: &|_| Glyph::default(),
+        glyphs: 0,
+        dynamic_visible: None,
+    };
+    // The open lid is drawn live, from the posed model.
+    let mut open = Vec::new();
+    renderer.render_block(&scene, [0, 64, 0], 0, Mat4::IDENTITY, 0xff, &mut open);
+    assert!(!open.is_empty(), "the open chest draws its model");
+    assert!(
+        open.iter().all(|v| v.normal == CULL_BACK),
+        "entityCutoutCull culls an open lid's back faces"
+    );
+
+    // A closed chest (the neighbour an open lid z-fights) takes the same cull.
+    openness.set(0.0);
+    let mut closed = Vec::new();
+    renderer.render_block(&scene, [0, 64, 0], 0, Mat4::IDENTITY, 0xff, &mut closed);
+    assert!(!closed.is_empty(), "the closed chest draws its model");
+    assert!(
+        closed.iter().all(|v| v.normal == CULL_BACK),
+        "entityCutoutCull culls a closed chest's back faces"
+    );
 }
 
 #[test]
