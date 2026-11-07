@@ -360,9 +360,14 @@ impl Biomes {
         names.sort_by(|a, b| identifier_order(a, b));
         names
     }
+    /// The table id of a biome name. A name this table lacks (a chunk from a
+    /// world whose biome was removed, or a server's registry entry we do not
+    /// have) takes the void: an unknown biome must not read as an overworld
+    /// one, whose spawn list would then spawn its mobs in another dimension.
     pub fn id(&self, name: &str) -> u16 {
         self.index
             .get(name)
+            .or_else(|| self.index.get("minecraft:the_void"))
             .or_else(|| self.index.get("minecraft:plains"))
             .copied()
             .unwrap_or(0)
@@ -558,6 +563,23 @@ mod pack_tests {
         assert_eq!(identifier_order("b:same", "a:same"), Greater);
         assert_eq!(identifier_order("minecraft:a", "minecraft:a_b"), Less);
         assert_eq!(identifier_order("minecraft:a-b", "minecraft:a"), Greater);
+    }
+
+    /// A biome name the table lacks must not read as an overworld biome: its
+    /// spawn list would spawn that biome's mobs wherever the chunk is. The
+    /// void has no natural spawns, and Plains stays for tables without it.
+    #[test]
+    fn an_unknown_biome_takes_the_void_before_plains() {
+        let with_void = builtin(&["minecraft:plains", "minecraft:the_void"]);
+        assert_eq!(
+            with_void.id("example:removed"),
+            with_void.id("minecraft:the_void")
+        );
+        let without_void = builtin(&["minecraft:plains"]);
+        assert_eq!(
+            without_void.id("example:removed"),
+            without_void.id("minecraft:plains")
+        );
     }
 
     #[test]

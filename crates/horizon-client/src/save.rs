@@ -1685,9 +1685,14 @@ fn decode_column(
     }
     let air = registry.default_state("minecraft:air")?.0;
     let mut cache: HashMap<String, u32> = HashMap::new();
-    let Some(Tag::List(sections)) = tag.get("sections") else {
-        return Some(chunk);
+    let sections: &[Tag] = match tag.get("sections") {
+        Some(Tag::List(sections)) => sections,
+        _ => &[],
     };
+    // The sections the record gives biomes. The rest keep the table's first
+    // biome in `Chunk::with_layout`, which is an overworld one: spawning reads
+    // it and would spawn that biome's mobs in the End or Nether.
+    let mut biome_read = vec![false; chunk.sections.len()];
     for section in sections {
         let Some(y) = number(section.get("Y")) else {
             continue;
@@ -1760,9 +1765,34 @@ fn decode_column(
                 PalettedContainer::from_packed(BIOME_STRATEGY, palette.clone(), data.as_deref())
             {
                 target.biomes = container;
+                biome_read[si] = true;
             } else if let Some(&first) = palette.first() {
                 target.biomes = PalettedContainer::new(BIOME_STRATEGY, first);
+                biome_read[si] = true;
             }
+        }
+    }
+    // A section the record leaves no biome for (an older or partial save) takes
+    // its nearest section's biome, or the void when the chunk has none. It
+    // must not keep the table's first biome, whose spawn list belongs to
+    // another dimension.
+    let known: Vec<Option<u16>> = (0..chunk.sections.len())
+        .map(|i| biome_read[i].then(|| chunk.sections[i].biomes.get(0) as u16))
+        .collect();
+    let void = biomes.id("minecraft:the_void");
+    for si in 0..chunk.sections.len() {
+        if biome_read[si] {
+            continue;
+        }
+        let nearest = known
+            .iter()
+            .enumerate()
+            .filter_map(|(j, b)| b.map(|b| (j.abs_diff(si), b)))
+            .min_by_key(|&(d, _)| d)
+            .map_or(void, |(_, b)| b);
+        if chunk.sections[si].biomes.uniform() != Some(u32::from(nearest)) {
+            Arc::make_mut(&mut chunk.sections[si]).biomes =
+                PalettedContainer::new(BIOME_STRATEGY, u32::from(nearest));
         }
     }
     let mut extras = ChunkExtras {
@@ -5592,6 +5622,60 @@ mod tests {
         assert_eq!(short.sections.len(), SECTIONS);
         assert_eq!(short.get(0, 2000, 0), 0);
         assert_eq!(short.get(0, -64, 0), stone.0);
+    }
+
+    /// A chunk whose record has no biome for a section (an older or partial
+    /// save) or names one the biome table lacks must not read as an overworld
+    /// biome: its monster list would spawn those mobs in the End.
+    #[test]
+    fn chunks_without_biome_data_do_not_take_an_overworld_biome() {
+        let Some(root) = std::env::var_os("HORIZON_TEST_RESOURCES") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let assets = crate::assets::Assets::load(&root).expect("assets");
+        let biomes = Biomes::load(&root).expect("biomes");
+        let one = |name: &str| Tag::compound([("palette", Tag::List(vec![string(name)]))]);
+        let section = |y: i8, biome: Option<Tag>| {
+            let mut entries = vec![("Y", Tag::Byte(y))];
+            if let Some(biome) = biome {
+                entries.push(("biomes", biome));
+            }
+            Tag::compound(entries)
+        };
+        let record = |sections: Vec<Tag>| NamedTag {
+            name: "".into(),
+            tag: Tag::compound([
+                ("xPos", Tag::Int(0)),
+                ("zPos", Tag::Int(0)),
+                ("Status", string("minecraft:full")),
+                ("sections", Tag::List(sections)),
+            ]),
+        };
+        let decode_end = |sections| {
+            decode_with(
+                &record(sections),
+                assets.registry,
+                &biomes,
+                None,
+                LevelShape::END.column(),
+            )
+            .expect("decodes")
+        };
+        let name_at = |chunk: &Chunk, y| biomes.get(chunk.biome(0, y, 0)).name.clone();
+        // The section without biomes takes its neighbour's End biome.
+        let chunk = decode_end(vec![
+            section(4, Some(one("minecraft:the_end"))),
+            section(5, None),
+        ]);
+        assert_eq!(name_at(&chunk, 64), "minecraft:the_end");
+        assert_eq!(name_at(&chunk, 80), "minecraft:the_end");
+        // A name the table lacks is the void, not an overworld biome.
+        let chunk = decode_end(vec![section(4, Some(one("example:removed")))]);
+        assert_eq!(name_at(&chunk, 64), "minecraft:the_void");
+        // With no biome data anywhere, every section is the void.
+        let chunk = decode_end(vec![section(4, None)]);
+        assert_eq!(name_at(&chunk, 64), "minecraft:the_void");
     }
 
     #[test]
