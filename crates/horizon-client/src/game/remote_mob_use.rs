@@ -100,8 +100,9 @@ impl Game<'_> {
             }
             // HappyGhast.mobInteract: a harnessed adult is ridden.
             Species::HappyGhast => !baby && m.extra.body.is_some(),
-            // TamableAnimal (wolf, cat, parrot) on a client: CONSUME once tame.
-            Species::Wolf | Species::Cat | Species::Parrot => m.extra.tame,
+            // TamableAnimal (wolf, cat, parrot) on a client: CONSUME once tame,
+            // and a bone tames a wild wolf (SUCCESS) unless it is angry.
+            Species::Wolf | Species::Cat | Species::Parrot => tamable_takes(m, item),
             // Allay.mobInteract: gives an item or takes it back.
             Species::Allay if !act => self.allay_would_take(i, hand, stack.cloned()),
             Species::Allay => self.predict_allay_interaction(i, hand, stack.cloned()),
@@ -216,6 +217,16 @@ impl Game<'_> {
             horizon_client::particles::Burst::HORSE_EATING,
         );
     }
+}
+
+/// `Wolf`/`Cat`/`Parrot.mobInteract` on a client: a tame one answers every
+/// click, and a wild wolf's bone tames it (SUCCESS) unless it is angry.
+/// Cat and parrot taming food is already answered as `Animal` food above.
+fn tamable_takes(m: &Mob, item: &str) -> bool {
+    m.extra.tame
+        || m.species() == Species::Wolf
+            && item == "minecraft:bone"
+            && !horizon_client::mobs::tame::angry(m)
 }
 
 /// `AbstractNautilus.mobInteract` on a client: its food is answered while the
@@ -382,6 +393,26 @@ mod tests {
         assert!(!mob_swings(&cow, "minecraft:wheat"), "adult: CONSUME");
         let sheep = mob("minecraft:sheep").unwrap();
         assert!(!mob_swings(&sheep, "minecraft:shears"), "Sheep: CONSUME");
+    }
+
+    /// `Wolf.mobInteract` tames a wild wolf with a bone before
+    /// `Animal.mobInteract` runs, so the click ends on the wolf and the off
+    /// hand's water bucket is not used (#12568). An angry wolf refuses.
+    #[test]
+    fn an_untamed_wolf_takes_a_bone() {
+        let Some(mut wolf) = mob("minecraft:wolf") else {
+            return;
+        };
+        assert!(tamable_takes(&wolf, "minecraft:bone"));
+        assert!(
+            !tamable_takes(&wolf, "minecraft:water_bucket"),
+            "anything else falls through to the item"
+        );
+        wolf.extra.anger = 1;
+        assert!(
+            !tamable_takes(&wolf, "minecraft:bone"),
+            "Wolf.mobInteract leaves an angry wolf alone"
+        );
     }
 
     /// `AbstractNautilus.mobInteract` (#8595): an untamed adult takes its taming
