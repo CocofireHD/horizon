@@ -169,6 +169,37 @@ same cached `/v1/worn` answers as what they wear (no request of its own, nothing
   does no cosmetics work beyond that. The bench scene `stress_avatars` (300 mannequins, 20×15)
   measures the cost with `HORIZON_COSMETICS=1 HORIZON_COSMETICS_LOCAL=…` against the same run off.
 
+## The in-game Wardrobe (`game/wardrobe.rs`, `wardrobe_screen.rs`)
+
+Right Shift opens the same outfit editor over the world (with cosmetics on, and when the world
+has a player; a Right Shift the player bound to a game key keeps that job). Escape or the
+close button closes it, and it pauses a single-player world like the pause menu.
+
+- **What it shows**: a two-panel locker overlay. The catalogue has the five slots as tabs, a
+  filter/search row, and a grid of cards for the chosen slot ("Nothing" first) with a
+  CPU-rendered 3D preview of the item on a mannequin. The right stage is the main event: the
+  player on their own skin, wearing the current outfit or the card being previewed, with the
+  Equip / Take off / Locked action over it. The toolbar cycles the scope (all, owned, equipped)
+  and the sort (name, newest, rarer first), and typing filters the grid by name. Clicking a card
+  previews it without changing the outfit; a locked item's file is fetched for that preview, and
+  it never opens the shop by itself. Show my cosmetics, how much of other players' cosmetics to
+  show and auras sit as compact switches under the preview; Shop and the founder set's free
+  claim are in the title bar.
+- **Instant**: a change is applied to the game's cosmetics cache at once
+  (`horizon_cosmetics::Cosmetics::set_worn`), so the player's own model and the picture update
+  before the service answers. In single player, where the server's offline profile is all the
+  game has, the wardrobe's outfit still shows on the player's own model.
+- **Where it keeps things**: the last catalogue and answer, and changes not sent yet, in
+  `<game folder>/wardrobe/<uuid hex>.json` (never a session or token). Item files share the
+  game's `assets/cosmetics` cache. Offline, changes stay there and are sent the next time the
+  wardrobe is opened or a change is made; the line says how many wait.
+- **Account switches**: Show my cosmetics goes through the service like the launcher's
+  (`horizon_cosmetics::wardrobe::Change::Visible`), and what it confirms is written to
+  `cosmetics-visible.txt` so the game's own switch does not send it twice. The other two switches
+  are the game's `horizon-extras.txt` lines (`horizon_cosmetics::prefs`).
+- **No new keybinding**: Right Shift is the fixed shortcut, as F3 keys are; the vanilla key
+  screen does not grow a Horizon entry.
+
 ## A still picture (`horizon_cosmetics::preview`)
 
 The launcher shows items on the player's own skin without the game: `preview::render` draws the

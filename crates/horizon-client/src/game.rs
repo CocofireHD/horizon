@@ -362,6 +362,7 @@ mod vault;
 mod vehicle_teleport;
 mod villagers;
 mod wandering_trader;
+mod wardrobe;
 mod win;
 mod wind;
 mod wither;
@@ -690,7 +691,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..128 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --transfers SETTINGS    A dedicated server takes a proxy's hand-over requests (server.toml [transfer], docs/server.md)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --session-stdin         The same account as JSON on standard input\n  --game-dir DIR          Game folder: saves, options.txt, packs, mods (default: the working directory)\n  --home DIR              Logs and crash reports (default $HORIZON_HOME, else the platform data folder)\n  --player-dir DIR        This player's own files when several play in one game folder: options.txt, logs, horizon-player.txt, servers.dat, screenshots\n  --fullscreen            Open the window fullscreen\n  --launch-api            Print the Launch API version and options as JSON (docs/api/launch.md)\n  --dev-mod PATH          A content mod (.hmod or folder) to develop: always on\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
+                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..128 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --transfers SETTINGS    A dedicated server takes a proxy's hand-over requests (server.toml [transfer], docs/server.md)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --session-stdin         The same account as JSON on standard input\n  --game-dir DIR          Game folder: saves, options.txt, packs, mods (default: the working directory)\n  --home DIR              Logs and crash reports (default $HORIZON_HOME, else the platform data folder)\n  --player-dir DIR        This player's own files when several play in one game folder: options.txt, logs, horizon-player.txt, servers.dat, screenshots\n  --fullscreen            Open the window fullscreen\n  --launch-api            Print the Launch API version and options as JSON (docs/api/launch.md)\n  --dev-mod PATH          A content mod (.hmod or folder) to develop: always on\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause, Right Shift wardrobe.",
                         horizon_core::VANILLA_VERSION
                     );
                     return Ok(None);
@@ -860,6 +861,8 @@ enum Screen {
     Win,
     /// DebugOptionsScreen, F3+F6 (game/debug_options.rs).
     DebugOptions,
+    /// The in-game Wardrobe, Right Shift (game/wardrobe.rs).
+    Wardrobe,
     /// A screen of a native mod's own (`native_mod_screen_open`): it draws and
     /// takes its input through the screen hooks.
     Mod,
@@ -890,6 +893,7 @@ impl Screen {
             Screen::DialogWarning => "dialog_warning",
             Screen::Win => "win",
             Screen::DebugOptions => "debug_options",
+            Screen::Wardrobe => "wardrobe",
             Screen::Mod => "mod",
         }
     }
@@ -2937,6 +2941,8 @@ struct Game<'a> {
     skin_slots: horizon_client::skins::SkinSlots,
     /// Cosmetics on players (game/cosmetics.rs), off by default.
     cosmetics: cosmetics::Cosmetics,
+    /// The in-game Wardrobe (game/wardrobe.rs): the launcher's outfit editor over the world.
+    wardrobe: wardrobe::Wardrobe,
     /// 3D skin layers: each player's outer layer as one slab per painted
     /// texel, built once per (skin, slim) (`mobs::skin_layers`).
     skin_3d: RefCell<skin_models::SkinModels>,
@@ -8300,6 +8306,7 @@ impl Game<'_> {
                     | Screen::DialogWarning
                     | Screen::CommandBlock
                     | Screen::DebugOptions
+                    | Screen::Wardrobe
             ) || self.book.is_some()
                 || self.win_screen_pauses())
     }
@@ -8733,6 +8740,16 @@ impl Game<'_> {
     }
     fn hud_layers(&mut self, size: [u32; 2]) -> HudBatch {
         let mut batch = HudBatch::new(size);
+        // The wardrobe locker is a reading screen: at the vanilla GUI scale its
+        // text and cards are coarse blocks, so while it is open the whole frame
+        // renders at half the scale (twice the pixel grid) and everything,
+        // the HUD behind included, reads fine. Input keeps the vanilla GUI
+        // scale; the wardrobe's own click code converts.
+        if self.screen == Screen::Wardrobe {
+            batch.scale = (batch.scale / 2.0).max(1.0);
+            batch.width = (size[0] as f32 / batch.scale).ceil();
+            batch.height = (size[1] as f32 / batch.scale).ceil();
+        }
         batch.glint_colour = self.settings.extras.pvp.tweaks.glint_texel();
         // GlobalSettingsUniform's GameTime, for a resource pack's text shader.
         batch.game_time = ((self.world.game_time.rem_euclid(24000)) as f32
@@ -9110,6 +9127,7 @@ impl Game<'_> {
             Screen::CommandBlock => self.draw_command_block(&mut batch),
             Screen::BlockEditor => self.draw_block_editor(&mut batch),
             Screen::DebugOptions => self.draw_debug_options(&mut batch),
+            Screen::Wardrobe => self.draw_wardrobe_screen(&mut batch),
             Screen::Inventory => {
                 self.draw_inventory(&mut batch);
                 self.draw_mod_browser(&mut batch);
@@ -16807,6 +16825,13 @@ impl Game<'_> {
             }
             return Ok(());
         }
+        if self.wardrobe_toggle_key(key, raw) {
+            return Ok(());
+        }
+        if self.screen == Screen::Wardrobe && key == KeyCode::Backspace {
+            self.wardrobe_backspace();
+            return Ok(());
+        }
         if self.sort_key_press(key) || self.hdr_key_press(key) {
             return Ok(());
         }
@@ -16855,6 +16880,7 @@ impl Game<'_> {
                 Screen::Chat => self.close_chat(chat::ChatExit::Intentional),
                 Screen::Win => self.close_win_screen()?,
                 Screen::DebugOptions => self.close_debug_options(),
+                Screen::Wardrobe => self.close_wardrobe(),
                 Screen::Mod => self.close_mod_screen(),
             },
             // `checkHotbarKeyPressed`: the keys the controls bind to the off
@@ -18314,6 +18340,9 @@ impl Game<'_> {
                     if self.screen == Screen::Advancements {
                         self.advancements_scroll(scaled(raw_x) as f32, d);
                     }
+                    if self.screen == Screen::Wardrobe && d != 0.0 {
+                        self.wardrobe_scroll(d);
+                    }
                 }
                 WindowEvent::MouseInput { state, button, .. } if self.command_prompt.is_some() => {
                     if state == ElementState::Pressed && button == MouseButton::Left {
@@ -18535,6 +18564,9 @@ impl Game<'_> {
                         }
                         Screen::DebugOptions if pressed && button == MouseButton::Left => {
                             self.debug_options_click()
+                        }
+                        Screen::Wardrobe if pressed && button == MouseButton::Left => {
+                            self.wardrobe_click()
                         }
                         Screen::DebugOptions if button == MouseButton::Left => {
                             self.debug_options_release()
@@ -19642,6 +19674,7 @@ impl<'a> Game<'a> {
             skin_profiles: RefCell::new(horizon_client::skins::Resolver::new()),
             skin_slots: horizon_client::skins::SkinSlots::new(horizon_client::hud::SKIN_SLOTS),
             cosmetics: Default::default(),
+            wardrobe: Default::default(),
             skin_3d: Default::default(),
             trim_slots: Vec::new(),
             cart_models: prepared.cart_models,
@@ -22726,6 +22759,7 @@ mod tests {
             Screen::DialogWarning,
             Screen::Win,
             Screen::DebugOptions,
+            Screen::Wardrobe,
         ];
         let ids: Vec<&'static str> = all.iter().map(|screen| screen.id()).collect();
         let unique: BTreeSet<&'static str> = ids.iter().copied().collect();

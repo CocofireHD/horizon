@@ -281,6 +281,7 @@ impl Game<'_> {
             Screen::Social => self.social_type(text),
             Screen::BlockEditor => self.block_editor_type(text),
             Screen::DebugOptions => self.debug_options_type(text),
+            Screen::Wardrobe => self.wardrobe_type(Some(text)),
             Screen::Options => self.ui.options.type_text(&self.gui.atlas, text),
             // The port, or the game rules' search and number boxes.
             Screen::WorldOptions => self.world_options_text(Some(text)),
@@ -298,7 +299,7 @@ impl Game<'_> {
             }
             _ => {
                 return Err(
-                    "type needs the chat screen (key t tap), a sign or book, the language search, the creative search, the anvil or World Options".into(),
+                    "type needs the chat screen (key t tap), a sign or book, the language search, the creative search, the Wardrobe search, the anvil or World Options".into(),
                 );
             }
         }
@@ -1256,6 +1257,7 @@ impl Game<'_> {
             Screen::BlockEditor => "block-editor",
             Screen::Win => "win",
             Screen::DebugOptions => "debug-options",
+            Screen::Wardrobe => "wardrobe",
             Screen::Mod => "mod",
         }
     }
@@ -1573,6 +1575,7 @@ fn key_code(name: &str) -> Option<KeyCode> {
     Some(match name.as_str() {
         "space" => KeyCode::Space,
         "shift" | "lshift" => KeyCode::ShiftLeft,
+        "rshift" | "shiftright" => KeyCode::ShiftRight,
         "ctrl" | "control" | "lctrl" => KeyCode::ControlLeft,
         // The edit modifier on macOS (Cmd+A selects all there).
         "super" | "cmd" | "meta" => KeyCode::SuperLeft,
@@ -1607,6 +1610,13 @@ pub(super) fn title_owns_text(screen: &Screen, title_up: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scripts_can_press_the_right_shift_that_opens_the_wardrobe() {
+        for name in ["rshift", "shiftright", "key.keyboard.right.shift"] {
+            assert_eq!(key_code(name), Some(KeyCode::ShiftRight), "{name}");
+        }
+    }
 
     #[test]
     fn the_title_takes_text_only_on_its_own_screens() {

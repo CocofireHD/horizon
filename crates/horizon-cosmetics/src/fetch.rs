@@ -44,6 +44,9 @@ pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 #[derive(Default)]
 struct State {
     players: HashMap<u128, Entry>,
+    /// What the player just chose in the wardrobe, by UUID, read before the service's answer:
+    /// `None` is "nothing" (everything taken off).
+    local: HashMap<u128, Option<Worn>>,
     /// Seen without a fresh answer, not yet asked.
     pending: HashSet<u128>,
     /// Items by `id@hash`: `None` for a file that can't be read or was refused.
@@ -129,6 +132,19 @@ impl Cosmetics {
         }
     }
 
+    /// Show exactly `worn` for `uuid` from now on, without asking the service or waiting for
+    /// its answer: the player just changed their outfit in the wardrobe. `None` is everything
+    /// taken off. This is the game's own override, not the service's cache; it stands until the
+    /// player changes it again (or the game ends).
+    pub fn set_worn(&self, uuid: u128, worn: Option<Worn>) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.local.insert(uuid, worn);
+    }
+
     /// One frame's reads: lock once, ask `worn` for each player in view.
     pub fn frame(&self) -> Frame<'_> {
         Frame {
@@ -163,9 +179,12 @@ pub struct Frame<'a> {
 }
 
 impl Frame<'_> {
-    /// What `uuid` wears as last known (`None`: nothing, or not known yet).
-    /// A player not known, or known for longer than the TTL, is asked for.
+    /// What `uuid` wears as last known (`None`: nothing, or not known yet). A player not known,
+    /// or known for longer than the TTL, is asked for, unless the wardrobe set a local outfit.
     pub fn worn(&mut self, uuid: u128) -> Option<Worn> {
+        if let Some(local) = self.state.local.get(&uuid) {
+            return local.clone();
+        }
         self.look(uuid).and_then(|e| e.worn.clone())
     }
 

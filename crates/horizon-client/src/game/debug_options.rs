@@ -518,6 +518,7 @@ fn debug_options_interrupts(screen: Screen, playing_overlay: bool) -> bool {
         | Screen::ServerLinks
         | Screen::ConfirmLink
         | Screen::DialogWarning
+        | Screen::Wardrobe
         | Screen::Mod => true,
         Screen::Chat
         | Screen::Options

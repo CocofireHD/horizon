@@ -335,3 +335,22 @@ fn horizon_players_come_with_the_same_request_as_what_they_wear() {
     assert!(!frame.horizon(3));
     assert_eq!(ids(frame.worn(3)), ["hat"]);
 }
+
+#[test]
+fn a_wardrobe_change_shows_at_once_without_asking_the_service() {
+    let (fake, mut c, _) = setup(None);
+    // The service's answer, cached: uuid 7 wears a hat.
+    let _ = c.frame().worn(7);
+    run(&mut c);
+    assert_eq!(ids(c.frame().worn(7)), ["hat"]);
+    let _ = fake.log();
+    // The wardrobe equips a pet: it shows at once, the cached answer notwithstanding.
+    let pet = Arc::new(Item::parse(item_file("pet").as_bytes()).unwrap());
+    c.set_worn(7, Some(vec![pet].into()));
+    assert_eq!(ids(c.frame().worn(7)), ["pet"]);
+    assert!(fake.log().is_empty());
+    // Taken off: nothing, still without asking.
+    c.set_worn(7, None);
+    assert!(c.frame().worn(7).is_none());
+    assert!(fake.log().is_empty());
+}

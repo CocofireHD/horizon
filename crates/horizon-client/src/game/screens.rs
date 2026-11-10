@@ -27,7 +27,8 @@ impl Screen {
             | Self::ServerLinks
             | Self::ConfirmLink
             | Self::DialogWarning
-            | Self::DebugOptions => true,
+            | Self::DebugOptions
+            | Self::Wardrobe => true,
             Self::Playing
             | Self::GameModeSwitcher
             | Self::Chat
@@ -858,6 +859,7 @@ mod tests {
             Screen::Stats,
             Screen::Advancements,
             Screen::WorldOptions,
+            Screen::Wardrobe,
         ] {
             assert!(screen.blurs_background(false));
             assert!(screen.blurs_background(true));

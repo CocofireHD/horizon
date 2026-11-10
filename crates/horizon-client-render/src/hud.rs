@@ -142,6 +142,10 @@ pub const WORLD_ICON_SLOTS: usize = 32;
 pub const PACK_ICON_SLOTS: usize = 64;
 /// A pack icon slot's side: vanilla's own icons are 128x128.
 pub const PACK_ICON_SIZE: u32 = 128;
+/// Atlas slots for the in-game Wardrobe's card previews, one per visible
+/// card: the CPU-rendered item on a neutral mannequin.
+pub const WARDROBE_PREVIEW_SLOTS: usize = 12;
+pub const WARDROBE_PREVIEW_SIZE: u32 = 96;
 /// Atlas slots for armour trim textures made at run time (`trims`), each the
 /// size of the largest trim texture.
 pub const TRIM_SLOTS: usize = 32;
@@ -889,6 +893,15 @@ impl HudAtlas {
                 PACK_ICON_SIZE,
                 PACK_ICON_SIZE,
                 vec![0; side * side * 4],
+            ));
+        }
+        let preview = WARDROBE_PREVIEW_SIZE as usize;
+        for i in 0..WARDROBE_PREVIEW_SLOTS {
+            images.push((
+                format!("horizon/wardrobe-preview{i}"),
+                WARDROBE_PREVIEW_SIZE,
+                WARDROBE_PREVIEW_SIZE,
+                vec![0; preview * preview * 4],
             ));
         }
         // The on-screen keyboard's text and corner masks (ui_theme), rasterized at run time.

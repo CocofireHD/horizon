@@ -693,7 +693,7 @@ impl Game<'_> {
             );
             if horizon_cosmetics::enabled() {
                 let base = horizon_client::mobs::render::base_transform(m, alpha as f32, camera);
-                self.cosmetics_geometry(m, true, base, alpha as f32, packed, false, out);
+                self.cosmetics_geometry(m, true, base, alpha as f32, packed, false, out, None);
             }
             self.player_elytra_geometry(m, chest, camera, alpha as f32, packed, out);
             self.spin_attack_geometry(m, camera, alpha as f32, packed, out);
@@ -744,6 +744,23 @@ impl Game<'_> {
         y1: f32,
         size: f32,
         offset_y: f32,
+    ) {
+        self.draw_player_preview_worn(batch, x0, y0, x1, y1, size, offset_y, None);
+    }
+
+    /// The same preview, with an optional outfit override for the Wardrobe's
+    /// selected card. The game's own cosmetics cache is not touched.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn draw_player_preview_worn(
+        &self,
+        batch: &mut HudBatch,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        size: f32,
+        offset_y: f32,
+        worn: Option<&horizon_cosmetics::Worn>,
     ) {
         let Some(m) = self.player_model.as_ref() else {
             return;
@@ -810,7 +827,7 @@ impl Game<'_> {
         );
         if horizon_cosmetics::enabled() {
             let base = horizon_client::mobs::render::base_transform(&m, 1.0, camera);
-            self.cosmetics_geometry(&m, true, base, 1.0, 240 | 240 << 8, false, &mut verts);
+            self.cosmetics_geometry(&m, true, base, 1.0, 240 | 240 << 8, false, &mut verts, worn);
         }
         // `WingsLayer` draws through `RenderTypes.armorCutoutNoCull`: the
         // wings' faces show from both sides (the elytra texture is empty on

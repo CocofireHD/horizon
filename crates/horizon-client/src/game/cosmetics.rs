@@ -45,7 +45,7 @@ impl Baked {
 
 #[derive(Default)]
 pub(super) struct Cosmetics {
-    client: Option<horizon_cosmetics::Cosmetics>,
+    pub(super) client: Option<horizon_cosmetics::Cosmetics>,
     /// By the item's address; each entry holds its item, so the address isn't reused.
     baked: RefCell<FxHashMap<usize, Baked>>,
     /// Items drawn whose texture isn't in the atlas yet.
@@ -378,6 +378,8 @@ impl Game<'_> {
             .baked
             .borrow_mut()
             .retain(|_, b| Arc::strong_count(&b.item) > 1);
+        // A wardrobe change is shown at once, before the service's next answer.
+        self.wardrobe_apply_local();
     }
 
     /// Items from a folder (`HORIZON_COSMETICS_LOCAL`): mannequins are dressed and marked too.
@@ -469,6 +471,7 @@ impl Game<'_> {
                 self.settings.extras.cosmetics_solo,
                 || horizon_client::auth::current().map(|s| s.uuid),
             )
+            .or_else(|| self.wardrobe_own_uuid())
         } else if &*m.kind.id == "minecraft:player" {
             self.remote_player_uuid(m.id)
         } else if self.cosmetics.local && &*m.kind.id == "minecraft:mannequin" {
@@ -491,9 +494,17 @@ impl Game<'_> {
         light: u32,
         gpu: bool,
         out: &mut Vec<horizon_client::mesher::Vertex>,
+        worn: Option<&horizon_cosmetics::Worn>,
     ) -> Option<(glam::Vec3, glam::Vec3)> {
         use horizon_client::mobs::{anim, render};
-        let worn = self.worn(m, own)?;
+        let fallback;
+        let worn = match worn {
+            Some(worn) => worn,
+            None => {
+                fallback = self.worn(m, own);
+                fallback.as_ref()?
+            }
+        };
         if horizon_client::mobs::trader::is_invisible(m) {
             return None;
         }
