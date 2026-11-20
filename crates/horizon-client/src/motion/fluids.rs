@@ -9,7 +9,7 @@ use horizon_world::{
     },
     entity_fluid_tick::{self, EntityFluidTickWorld},
     fluid::{FluidHeightWorld, FluidKind, FluidState, FluidStateTable},
-    fluid_flow::{FluidFlowWorld, flow_at},
+    fluid_flow::FluidFlowWorld,
     fluid_shape::FluidShapeCache,
     water_splash::{self, SplashParticle, WaterSplashWorld},
 };
@@ -414,7 +414,7 @@ impl FluidInteractionWorld for MotionWorld<'_, '_, '_> {
         f.camera_height_at(self, [p.x, p.y, p.z])
     }
     fn flow(&mut self, f: FluidState, p: BlockPos) -> Result<Vec3> {
-        flow_at(self, f, p)
+        super::pushing_flow(self.loop_context, self, f, p)
     }
 }
 impl EntityFluidTickWorld for MotionWorld<'_, '_, '_> {

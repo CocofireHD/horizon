@@ -50,8 +50,10 @@ impl Pending {
     }
 }
 
+/// Small, its meshes boxed: `draw_frame` walks every tile each frame (thousands at long far
+/// distances), and that walk is bound by the memory it reads.
 pub(super) struct Tile {
-    pub mesh: SectionGpu,
+    pub mesh: Box<SectionGpu>,
     bounds: Bounds,
     /// When it began to fade in; none while the rest of its job uploads.
     shown: Option<Instant>,
@@ -62,7 +64,7 @@ pub(super) struct Tile {
     /// Its mesh before near chunks took some of its columns, drawn in its
     /// place until they have faded in (from the job's end, the instant), so
     /// no hole shows through them.
-    previous: Option<(SectionGpu, Option<Instant>)>,
+    previous: Option<Box<(SectionGpu, Option<Instant>)>>,
     /// Its slot in occlusion culling's results (`cull::TILE`), kept while
     /// meshes of the same tile replace one another.
     pub cull_slot: u32,
@@ -155,10 +157,12 @@ pub(super) struct Visible {
 impl Tile {
     /// The mesh drawn this frame: the previous one while it stands in.
     pub fn drawn(&self) -> &SectionGpu {
-        self.previous.as_ref().map_or(&self.mesh, |(mesh, _)| mesh)
+        self.previous
+            .as_deref()
+            .map_or(&self.mesh, |(mesh, _)| mesh)
     }
     pub fn drawn_mut(&mut self) -> &mut SectionGpu {
-        match &mut self.previous {
+        match self.previous.as_deref_mut() {
             Some((mesh, _)) => mesh,
             None => &mut self.mesh,
         }
@@ -175,9 +179,14 @@ impl Tile {
             ]
         })
     }
+    /// Whether either mesh it holds is in the compact layout: a stand-in drawn in its place can
+    /// hide a compact replacement (`Renderer::follow_packed_layout`).
+    pub fn holds_packed(&self) -> bool {
+        self.mesh.packed || self.previous.as_ref().is_some_and(|p| p.0.packed)
+    }
     /// Both meshes it holds in the arena: its own and the stand-in, if any.
     pub fn meshes_mut(&mut self) -> impl Iterator<Item = &mut SectionGpu> {
-        std::iter::once(&mut self.mesh).chain(self.previous.as_mut().map(|(mesh, _)| mesh))
+        std::iter::once(&mut *self.mesh).chain(self.previous.as_deref_mut().map(|(mesh, _)| mesh))
     }
     pub fn visible(
         &self,
@@ -214,12 +223,12 @@ impl Renderer {
         let (shown, previous) = match self.lods.remove(&key) {
             Some(old) if old.dying.is_none() => match old.previous {
                 Some(previous) => {
-                    self.release_mesh(old.mesh);
+                    self.release_mesh(*old.mesh);
                     (old.shown, Some(previous))
                 }
-                None if keep => (old.shown, Some((old.mesh, None))),
+                None if keep => (old.shown, Some(Box::new((*old.mesh, None)))),
                 None => {
-                    self.release_mesh(old.mesh);
+                    self.release_mesh(*old.mesh);
                     (old.shown, None)
                 }
             },
@@ -240,7 +249,7 @@ impl Renderer {
                 self.lods.insert(
                     key,
                     Tile {
-                        mesh,
+                        mesh: Box::new(mesh),
                         bounds,
                         shown,
                         dying: None,
@@ -251,7 +260,7 @@ impl Renderer {
                 );
             }
             None => {
-                if let Some((previous, _)) = previous {
+                if let Some((previous, _)) = previous.map(|p| *p) {
                     self.release_mesh(previous);
                 }
                 self.lod_cull_free.extend(old_slot);
@@ -260,8 +269,8 @@ impl Renderer {
     }
 
     fn release_tile(&mut self, tile: Tile) {
-        self.release_mesh(tile.mesh);
-        if let Some((previous, _)) = tile.previous {
+        self.release_mesh(*tile.mesh);
+        if let Some((previous, _)) = tile.previous.map(|p| *p) {
             self.release_mesh(previous);
         }
     }
@@ -281,7 +290,17 @@ impl Renderer {
             copies.clear_tiles();
         }
         self.lod_pending = None;
-        // No far terrain left to fade out over.
+        for (_, tile) in std::mem::take(&mut self.lods) {
+            self.release_tile(tile);
+        }
+        self.lod_cull_free.clear();
+        self.lod_cull_next = 0;
+        self.set_lod_cutout(Default::default());
+        // No far terrain left to fade out over. Drained after `set_lod_cutout`, which
+        // moves the sections far terrain still held (`lod_retiring`) onto this list:
+        // `release_left` runs only from `upload_lods`, and the game stops calling that
+        // once far terrain is off, so a section left here would draw its unloaded
+        // column past the render distance for the rest of the renderer's life.
         for (key, since) in std::mem::take(&mut self.lod_leaving) {
             if self
                 .sections
@@ -291,12 +310,6 @@ impl Renderer {
                 self.release_section(key);
             }
         }
-        for (_, tile) in std::mem::take(&mut self.lods) {
-            self.release_tile(tile);
-        }
-        self.lod_cull_free.clear();
-        self.lod_cull_next = 0;
-        self.set_lod_cutout(Default::default());
     }
 
     /// Queues a finished mesh job (`Lod::update`, `Lod::removed`,
@@ -337,8 +350,10 @@ impl Renderer {
         let stood_in: Vec<_> = self
             .lods
             .values_mut()
-            .filter_map(|tile| match tile.previous {
-                Some((_, Some(since))) if start - since >= FADE => tile.previous.take(),
+            .filter_map(|tile| match tile.previous.as_deref() {
+                Some((_, Some(since))) if start - *since >= FADE => {
+                    tile.previous.take().map(|p| *p)
+                }
                 _ => None,
             })
             .collect();
@@ -440,7 +455,7 @@ impl Renderer {
                     if tile.shown.is_none() {
                         tile.shown = Some(if over_replaced(key) { start } else { whole });
                     }
-                    if let Some((_, since)) = &mut tile.previous {
+                    if let Some((_, since)) = tile.previous.as_deref_mut() {
                         since.get_or_insert(start);
                     }
                 }

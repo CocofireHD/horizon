@@ -3,10 +3,38 @@
 use std::collections::BTreeMap;
 
 /// Registry contents and source state used to validate and complete arguments.
+/// A selector token a mod registered: the word after `@` and the base selection it parses to,
+/// before its `[...]` options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectorToken {
+    pub name: String,
+    /// The completion's tooltip, a translation key.
+    pub tooltip: String,
+    /// Only players are candidates (`type=minecraft:player`).
+    pub players_only: bool,
+    /// At most this many results (`usize::MAX`: no limit).
+    pub limit: usize,
+    /// A `sort=` value: `nearest`, `furthest`, `random` or `arbitrary`.
+    pub sort: &'static str,
+}
+/// Who a completion is for, when a mod's own argument type completes the text:
+/// the player typing, whose command permission level is [`Registries::permission`].
+/// The mod's provider decides what to offer; the game does not filter its answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommandSender {
+    /// The player's UUID.
+    pub uuid: u128,
+    /// Their account name.
+    pub name: String,
+}
 #[derive(Clone, Debug, Default)]
 pub struct Registries {
     /// Permission level of the command source.
     pub permission: u8,
+    /// The player a completion is for, while a mod's argument type completes the
+    /// text; `None` for the console and for a client completing its own commands
+    /// before its profile is known.
+    pub sender: Option<CommandSender>,
     pub items: Vec<String>,
     pub item_tags: Vec<String>,
     /// Block id -> (property, allowed values).
@@ -73,6 +101,8 @@ pub struct Registries {
     /// Every registry's element and tag ids (`minecraft:item` -> ...), as
     /// the server's registry access and reloadable registries hold them.
     pub by_registry: BTreeMap<String, RegistryIds>,
+    /// The selector tokens mods registered (`@allies`), in registration order.
+    pub selector_tokens: Vec<SelectorToken>,
     /// Blocks whose default state has a block entity.
     pub block_entities: std::collections::BTreeSet<String>,
     /// Block tag -> member blocks.
@@ -89,6 +119,31 @@ pub struct Registries {
     pub trigger_objectives: Vec<String>,
     /// Objectives with the `trigger` criterion -> holder -> whether its score is locked.
     pub trigger_scores: BTreeMap<String, BTreeMap<String, bool>>,
+    /// The `ConfiguredFeature` codec for an inline `minecraft:worldgen/feature`
+    /// value (`ResourceOrIdArgument`), where the source has the server's live
+    /// features; None leaves the decode to when the command runs.
+    pub inline_feature: Option<InlineFeatureCheck>,
+}
+
+/// A codec check of an inline value: its error message when it does not decode.
+#[derive(Clone)]
+pub struct InlineFeatureCheck(
+    std::sync::Arc<dyn Fn(&horizon_core::nbt::Tag) -> Result<(), String> + Send + Sync>,
+);
+impl InlineFeatureCheck {
+    pub fn new(
+        check: impl Fn(&horizon_core::nbt::Tag) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(std::sync::Arc::new(check))
+    }
+    pub fn check(&self, value: &horizon_core::nbt::Tag) -> Result<(), String> {
+        (self.0)(value)
+    }
+}
+impl std::fmt::Debug for InlineFeatureCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InlineFeatureCheck(..)")
+    }
 }
 /// The ids and tag ids of one registry.
 #[derive(Clone, Debug, Default)]
@@ -275,6 +330,25 @@ impl Registries {
                 .clone_from(&e.advancement_criteria);
         }
     }
+    /// Add the damage catalog's types ([`Self::damage_types`]: content mods'
+    /// and the world's packs' with vanilla's) to the commands'
+    /// `minecraft:damage_type` ids, which the export lists for vanilla alone.
+    /// `ResourceArgument` looks a type up in the server's registries, so
+    /// `/damage` takes every type the world has. The export's tags stay. The
+    /// ids are replaced, not extended: `by_registry` outlives a world, and a
+    /// pack's type must not stay accepted in the next world opened.
+    pub fn sync_damage_type_ids(&mut self) {
+        if self.damage_types.is_empty() {
+            return;
+        }
+        let mut ids = self.damage_types.clone();
+        ids.sort();
+        ids.dedup();
+        self.by_registry
+            .entry("minecraft:damage_type".into())
+            .or_default()
+            .ids = ids;
+    }
     /// The element ids of a registry (sorted).
     pub fn ids(&self, registry: &str) -> &[String] {
         if let Some(r) = self.by_registry.get(registry) {
@@ -310,5 +384,51 @@ impl Registries {
             "minecraft:block" => &self.block_tags,
             _ => EMPTY,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Registries;
+
+    /// A content mod's damage type joins vanilla's in the commands' ids, the
+    /// export's tags stay, and a second world open lists each type once.
+    #[test]
+    fn damage_type_ids_take_the_catalogs_types() {
+        let export = Registries::from_export(&serde_json::json!({
+            "by_registry": {"minecraft:damage_type": {
+                "ids": ["minecraft:fall", "minecraft:magic"],
+                "tags": ["minecraft:is_fall"],
+            }},
+        }));
+        let mut reg = Registries {
+            damage_types: vec![
+                "minecraft:magic".into(),
+                "example:test".into(),
+                "minecraft:fall".into(),
+            ],
+            ..Registries::default()
+        };
+        reg.fill_from_exported(&export);
+        assert_eq!(
+            reg.ids("minecraft:damage_type"),
+            ["minecraft:fall", "minecraft:magic"],
+            "the export alone lists vanilla's types"
+        );
+        for _ in 0..2 {
+            reg.sync_damage_type_ids();
+            assert_eq!(
+                reg.ids("minecraft:damage_type"),
+                ["example:test", "minecraft:fall", "minecraft:magic"]
+            );
+            assert_eq!(reg.tags("minecraft:damage_type"), ["minecraft:is_fall"]);
+        }
+        // The next world, without the pack: its type is no longer accepted.
+        reg.damage_types = vec!["minecraft:fall".into(), "minecraft:magic".into()];
+        reg.sync_damage_type_ids();
+        assert_eq!(
+            reg.ids("minecraft:damage_type"),
+            ["minecraft:fall", "minecraft:magic"]
+        );
     }
 }

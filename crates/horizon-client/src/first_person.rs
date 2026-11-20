@@ -7,6 +7,7 @@
 //! `continueDestroyBlock`, `stopDestroyBlock`).
 //!
 //! What those read and do in the world is behind [`HandWorld`].
+pub use mod_api::client::first_person::Hand;
 
 /// The ranged item state read by the first-person hand renderer.
 #[derive(Clone, Copy, Debug)]
@@ -37,7 +38,7 @@ pub enum ItemPose {
     /// A spear being charged (`ItemUseAnimation.SPEAR`): the time held and
     /// the ticks since its last hit's feedback.
     Spear {
-        kinetic: crate::spear::Kinetic,
+        timing: crate::spear::UseTiming,
         time_held: f32,
         ticks_since_hit: f32,
     },
@@ -89,13 +90,13 @@ pub fn item_pose(left: bool, inverse_height: f32, attack: f32, pose: ItemPose) -
     }
     // The spear's own place in the hand, without the equip height.
     if let ItemPose::Spear {
-        kinetic,
+        timing,
         time_held,
         ticks_since_hit,
     } = pose
     {
         return Mat4::from_translation(Vec3::new(invert * 0.56, -0.52, -0.72))
-            * crate::spear::first_person_use(&kinetic, ticks_since_hit, time_held, !left);
+            * crate::spear::first_person_use(&timing, ticks_since_hit, time_held, !left);
     }
     if matches!(pose, ItemPose::Stab) {
         return m * crate::spear::first_person_attack(attack, !left);
@@ -166,6 +167,128 @@ pub fn item_pose(left: bool, inverse_height: f32, attack: f32, pose: ItemPose) -
         }
     }
     m
+}
+
+/// Combat feel Legacy's first-person item (`docs/pvp.md`): Minecraft 1.8.9's
+/// `ItemRenderer.renderItemInFirstPerson` for a flat item, drawn through 26.3's
+/// model. 1.8.9 posed the item (`transformFirstPersonItem`: the arm's place,
+/// 45° about Y, the swing's turns, a 0.4 scale), then applied its own
+/// `firstperson` display (`[0, -135, 25]`, `[0, 4, 2]`, `1.7`, rotated Y, X,
+/// Z) and `RenderItem`'s 0.5 scale. 26.3 applies `firstperson_righthand`
+/// (`[0, -90, 25]`, `[1.13, 3.2, 1.13]`, `0.68`) itself after this pose, so
+/// the pose ends with its inverse ([`MODERN_FLAT_DISPLAY`]). `block` is a
+/// sword held up while use is held: 1.8.9's `doBlockTransformations`, with
+/// the swing's turns kept as 1.7.10 kept them (hitting while blocking swings
+/// the sword). None for the poses 1.8.9 had no form of (crossbow, trident,
+/// spear, brush), which stay modern.
+pub fn legacy_item_pose(
+    left: bool,
+    inverse_height: f32,
+    attack: f32,
+    pose: ItemPose,
+    block: bool,
+) -> Option<glam::Mat4> {
+    use glam::{Mat4, Vec3};
+    let deg = |d: f32| d.to_radians();
+    let pi = std::f32::consts::PI;
+    let sin = |v: f32| v.sin();
+    // transformFirstPersonItem(equipProgress, swingProgress).
+    let first_person = |swing: f32| {
+        let f = sin(swing * swing * pi);
+        let f1 = sin(swing.sqrt() * pi);
+        Mat4::from_translation(Vec3::new(0.56, -0.52 - inverse_height * 0.6, -0.72))
+            * Mat4::from_rotation_y(deg(45.0))
+            * Mat4::from_rotation_y(deg(f * -20.0))
+            * Mat4::from_rotation_z(deg(f1 * -20.0))
+            * Mat4::from_rotation_x(deg(f1 * -80.0))
+            * Mat4::from_scale(Vec3::splat(0.4))
+    };
+    let m = match pose {
+        _ if block => {
+            // doBlockTransformations.
+            first_person(attack)
+                * Mat4::from_translation(Vec3::new(-0.5, 0.2, 0.0))
+                * Mat4::from_rotation_y(deg(30.0))
+                * Mat4::from_rotation_x(deg(-80.0))
+                * Mat4::from_rotation_y(deg(60.0))
+        }
+        ItemPose::Swing => {
+            // doItemUsedTransformations, then transformFirstPersonItem.
+            let root = attack.sqrt();
+            Mat4::from_translation(Vec3::new(
+                -0.4 * sin(root * pi),
+                0.2 * sin(root * pi * 2.0),
+                -0.2 * sin(attack * pi),
+            )) * first_person(attack)
+        }
+        ItemPose::Using => first_person(0.0),
+        ItemPose::Eat {
+            remaining,
+            duration,
+            partial,
+        } => {
+            // performDrinking.
+            let time = remaining - partial + 1.0;
+            let fraction = time / duration;
+            let bob = if fraction >= 0.8 {
+                0.0
+            } else {
+                ((time / 4.0 * pi).cos() * 0.1).abs()
+            };
+            let j = 1.0 - horizon_core::jmath::pow(f64::from(fraction), 27.0) as f32;
+            Mat4::from_translation(Vec3::new(0.0, bob, 0.0))
+                * Mat4::from_translation(Vec3::new(j * 0.6, j * -0.5, 0.0))
+                * Mat4::from_rotation_y(deg(j * 90.0))
+                * Mat4::from_rotation_x(deg(j * 10.0))
+                * Mat4::from_rotation_z(deg(j * 30.0))
+                * first_person(0.0)
+        }
+        ItemPose::Bow { ticks_used } => {
+            // doBowTransformations.
+            let power = (ticks_used / 20.0 * (ticks_used / 20.0) + ticks_used / 20.0 * 2.0) / 3.0;
+            let power = power.min(1.0);
+            let mut m = first_person(0.0)
+                * Mat4::from_rotation_z(deg(-18.0))
+                * Mat4::from_rotation_y(deg(-12.0))
+                * Mat4::from_rotation_x(deg(-8.0))
+                * Mat4::from_translation(Vec3::new(-0.9, 0.2, 0.0));
+            if power > 0.1 {
+                let shake = sin((ticks_used - 0.1) * 1.3) * (power - 0.1);
+                m *= Mat4::from_translation(Vec3::new(0.0, shake * 0.01, 0.0));
+            }
+            m * Mat4::from_translation(Vec3::new(0.0, 0.0, power * 0.1))
+                * Mat4::from_scale(Vec3::new(1.0, 1.0, 1.0 + power * 0.2))
+        }
+        _ => return None,
+    };
+    // 1.8.9's `firstperson` display and RenderItem's 0.5, then 26.3's display undone.
+    let legacy_display = Mat4::from_translation(Vec3::new(0.0, 4.0, 2.0) / 16.0)
+        * Mat4::from_rotation_y(deg(-135.0))
+        * Mat4::from_rotation_z(deg(25.0))
+        * Mat4::from_scale(Vec3::splat(1.7))
+        * Mat4::from_scale(Vec3::splat(0.5));
+    let right = m * legacy_display * modern_flat_display(false).inverse();
+    // 1.8.9 had only a right main arm: the left arm mirrors it.
+    let mirror = Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0));
+    Some(if left { mirror * right * mirror } else { right })
+}
+/// 26.3's `firstperson_righthand` display of a flat item (`item/generated` and
+/// `item/handheld`), on the `left` hand mirrored as `ItemTransform.apply` does,
+/// without the model's centring translation.
+pub fn modern_flat_display(left: bool) -> glam::Mat4 {
+    use glam::{Mat4, Vec3};
+    let s = if left { -1.0 } else { 1.0 };
+    Mat4::from_translation(Vec3::new(s * 1.13, 3.2, 1.13) / 16.0)
+        * Mat4::from_rotation_y((s * -90.0f32).to_radians())
+        * Mat4::from_rotation_z((s * 25.0f32).to_radians())
+        * Mat4::from_scale(Vec3::splat(0.68))
+}
+/// Whether a model layer's matrix is 26.3's flat-item first-person display (a resource
+/// pack's own display keeps the modern pose).
+pub fn is_modern_flat_display(matrix: &glam::Mat4, left: bool) -> bool {
+    let expected =
+        modern_flat_display(left) * glam::Mat4::from_translation(glam::Vec3::splat(-0.5));
+    matrix.abs_diff_eq(expected, 1e-4)
 }
 
 /// How `submitArmWithItem` holds a stack with a `minecraft:map_id`: in both
@@ -339,16 +462,6 @@ pub fn hands_to_render(held: [Option<(&str, bool)>; 2], using: Option<(Hand, &st
     }
 }
 
-/// `InteractionHand`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Hand {
-    Main,
-    Off,
-}
-impl Hand {
-    pub const BOTH: [Hand; 2] = [Hand::Main, Hand::Off];
-}
-
 /// `SwingAnimation`: its type (`SwingAnimationType` ordinal) and duration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SwingAnimation {
@@ -479,13 +592,24 @@ impl HandHeights {
     /// `getItemSwapScale(1.0F)`. Returns whether each hand's visible item
     /// is replaced at the end.
     pub fn tick(&mut self, hands_busy: bool, swap_scale: f32, changed: [bool; 2]) -> [bool; 2] {
+        self.tick_with(hands_busy, swap_scale, changed, false)
+    }
+    /// [`Self::tick`]; `legacy` (Combat feel Legacy) raises the main hand fully whatever the
+    /// attack strength, as 1.8.9's `ItemRenderer.updateEquippedItem` did (no dip after a hit).
+    pub fn tick_with(
+        &mut self,
+        hands_busy: bool,
+        swap_scale: f32,
+        changed: [bool; 2],
+        legacy: bool,
+    ) -> [bool; 2] {
         self.old_main = self.main;
         self.old_off = self.off;
         if hands_busy {
             self.main = (self.main - 0.4).clamp(0.0, 1.0);
             self.off = (self.off - 0.4).clamp(0.0, 1.0);
         } else {
-            let attack = swap_scale;
+            let attack = if legacy { 1.0 } else { swap_scale };
             let main_target = if changed[0] {
                 0.0
             } else {
@@ -562,6 +686,7 @@ impl HandSway {
     /// The degrees the hands turn about X, then Y, before either is drawn:
     /// `(viewXRot - xBob) * 0.1` and `(viewYRot - yBob) * 0.1`, the bobs
     /// interpolated as `extractRenderState` does.
+    #[horizon_mod_api_macros::replaceable]
     pub fn rotation(&self, partial: f32, view_x_rot: f32, view_y_rot: f32) -> [f32; 2] {
         let x_bob = crate::camera::lerp(partial, self.x_bob_o, self.x_bob);
         let y_bob = crate::camera::lerp(partial, self.y_bob_o, self.y_bob);
@@ -608,8 +733,12 @@ impl UseResult {
     }
 }
 pub use horizon_items::use_animation::consumable_animation;
+
 /// What the click handling reads and does in the world.
 pub trait HandWorld {
+    /// What a break keeps of the main-hand stack it began with
+    /// (`destroyingItem`): the stack itself in the game.
+    type Held: Clone + Default + PartialEq;
     fn hit(&mut self) -> Hit;
     fn is_air(&mut self, pos: [i32; 3]) -> bool;
     /// `MultiPlayerGameMode.localPlayerMode`.
@@ -646,13 +775,13 @@ pub trait HandWorld {
     fn destroy_progress(&mut self, pos: [i32; 3]) -> f32;
     /// `MultiPlayerGameMode.destroyBlock`.
     fn destroy_block(&mut self, pos: [i32; 3]) -> bool;
-    /// A key for the main-hand stack, kept as `destroyingItem`.
-    fn main_hand_key(&mut self) -> String;
+    /// The main-hand stack, kept as `destroyingItem`.
+    fn main_hand_key(&mut self) -> Self::Held;
     /// `ItemStack.isSameItemSameComponents(selected, destroyingItem)` for
-    /// the stack `main_hand_key` gave when the break started. Vanilla keeps
-    /// a reference to that stack, so it compares what it holds now.
-    fn same_destroying_item(&mut self, key: &str) -> bool {
-        self.main_hand_key() == key
+    /// what `main_hand_key` gave when the break started. Vanilla keeps a
+    /// reference to that stack, so it compares what it holds now.
+    fn same_destroying_item(&mut self, began: &Self::Held) -> bool {
+        self.main_hand_key() == *began
     }
     /// Breaking progress shown (`destroyBlockProgress`), or cleared with `None`.
     fn destroy_stage(&mut self, pos: [i32; 3], stage: Option<i32>);
@@ -674,33 +803,32 @@ pub trait HandWorld {
     fn release_using(&mut self);
 }
 
-/// `MultiPlayerGameMode`'s block breaking.
+/// `MultiPlayerGameMode`'s block breaking; `H` is the `HandWorld`'s `Held`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Destroying {
+pub struct Destroying<H = String> {
     pub delay: i32,
     pub active: bool,
     pub pos: [i32; 3],
     pub face: u8,
-    pub item: String,
+    pub item: H,
     pub progress: f32,
     pub ticks: f32,
 }
-impl Default for Destroying {
-    /// `destroyBlockPos` starts at (-1, -1, -1) and `destroyingItem` empty
-    /// (an empty key).
+impl<H: Default> Default for Destroying<H> {
+    /// `destroyBlockPos` starts at (-1, -1, -1) and `destroyingItem` empty.
     fn default() -> Self {
         Destroying {
             delay: 0,
             active: false,
             pos: [-1; 3],
             face: 0,
-            item: String::new(),
+            item: H::default(),
             progress: 0.0,
             ticks: 0.0,
         }
     }
 }
-impl Destroying {
+impl<H> Destroying<H> {
     /// `getDestroyStage`.
     pub fn stage(&self) -> i32 {
         if self.progress > 0.0 {
@@ -709,11 +837,11 @@ impl Destroying {
             -1
         }
     }
-    fn same_target(&self, w: &mut impl HandWorld, pos: [i32; 3]) -> bool {
+    fn same_target(&self, w: &mut impl HandWorld<Held = H>, pos: [i32; 3]) -> bool {
         pos == self.pos && w.same_destroying_item(&self.item)
     }
     /// `startDestroyBlock`.
-    pub fn start(&mut self, w: &mut impl HandWorld, pos: [i32; 3], face: u8) -> bool {
+    pub fn start(&mut self, w: &mut impl HandWorld<Held = H>, pos: [i32; 3], face: u8) -> bool {
         if w.block_action_restricted(pos) || !w.within_border(pos) {
             return false;
         }
@@ -740,7 +868,7 @@ impl Destroying {
         true
     }
     /// `stopDestroyBlock`.
-    pub fn stop(&mut self, w: &mut impl HandWorld) {
+    pub fn stop(&mut self, w: &mut impl HandWorld<Held = H>) {
         if self.active {
             self.active = false;
             self.progress = 0.0;
@@ -749,7 +877,12 @@ impl Destroying {
         }
     }
     /// `continueDestroyBlock`: true while the hand keeps swinging.
-    pub fn continue_destroy(&mut self, w: &mut impl HandWorld, pos: [i32; 3], face: u8) -> bool {
+    pub fn continue_destroy(
+        &mut self,
+        w: &mut impl HandWorld<Held = H>,
+        pos: [i32; 3],
+        face: u8,
+    ) -> bool {
         if self.delay > 0 {
             self.delay -= 1;
             return true;
@@ -784,15 +917,15 @@ impl Destroying {
 
 /// `Minecraft`'s attack and use handling.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Clicks {
+pub struct Clicks<H = String> {
     pub miss_time: i32,
     pub right_click_delay: i32,
-    pub destroying: Destroying,
+    pub destroying: Destroying<H>,
 }
-impl Clicks {
+impl<H> Clicks<H> {
     /// `Minecraft.startAttack`: whether the click ended the attack (broke
     /// the block outright).
-    pub fn start_attack(&mut self, w: &mut impl HandWorld) -> bool {
+    pub fn start_attack(&mut self, w: &mut impl HandWorld<Held = H>) -> bool {
         if self.miss_time > 0 || w.hands_busy() {
             return false;
         }
@@ -835,7 +968,7 @@ impl Clicks {
         end
     }
     /// `Minecraft.continueAttack`.
-    pub fn continue_attack(&mut self, w: &mut impl HandWorld, down: bool) {
+    pub fn continue_attack(&mut self, w: &mut impl HandWorld<Held = H>, down: bool) {
         if !down {
             self.miss_time = 0;
         }
@@ -853,7 +986,7 @@ impl Clicks {
         }
     }
     /// `Minecraft.startUseItem`.
-    pub fn start_use_item(&mut self, w: &mut impl HandWorld) {
+    pub fn start_use_item(&mut self, w: &mut impl HandWorld<Held = H>) {
         if self.destroying.active {
             return;
         }
@@ -915,7 +1048,7 @@ impl Clicks {
     /// the mouse grabbed.
     pub fn tick(
         &mut self,
-        w: &mut impl HandWorld,
+        w: &mut impl HandWorld<Held = H>,
         attack_clicks: u32,
         use_clicks: u32,
         attack_down: bool,
@@ -966,7 +1099,7 @@ mod tests {
                 }))
                 .unwrap(),
             );
-            models.prototypes.insert(
+            std::sync::Arc::make_mut(&mut models.prototypes).insert(
                 item.into(),
                 [("minecraft:item_model".into(), json!(item))].into(),
             );
@@ -1098,6 +1231,67 @@ mod tests {
         assert_eq!(swing_duration(d, None, None), 6);
         assert_eq!(swing_duration(d, Some(1), Some(0)), 4);
         assert_eq!(swing_duration(d, None, Some(2)), 12);
+    }
+
+    #[test]
+    fn legacy_hand_puts_a_flat_item_where_1_8_9_drew_it() {
+        use glam::{Mat4, Vec3};
+        // At rest, the item's centre (model (0.5, 0.5, 0.5)) ends where 1.8.9's chain puts it:
+        // translate(0.56, -0.52, -0.72) . rotY(45) . scale(0.4) . translate((0, 4, 2) / 16)
+        // . ... . scale(0.5) . translate(-0.5): the centre is (0, 0.25, 0.125) scaled by 0.4,
+        // turned 45 degrees about Y.
+        let pose = legacy_item_pose(false, 0.0, 0.0, ItemPose::Swing, false).unwrap();
+        let layer = modern_flat_display(false) * Mat4::from_translation(Vec3::splat(-0.5));
+        let centre = (pose * layer).transform_point3(Vec3::splat(0.5));
+        let c45 = std::f32::consts::FRAC_1_SQRT_2;
+        let expected = Vec3::new(0.56 + 0.05 * c45, -0.52 + 0.1, -0.72 + 0.05 * c45);
+        assert!(centre.abs_diff_eq(expected, 1e-4), "{centre} vs {expected}");
+        // The left arm mirrors it.
+        let left = legacy_item_pose(true, 0.0, 0.0, ItemPose::Swing, false).unwrap();
+        let left_layer = modern_flat_display(true) * Mat4::from_translation(Vec3::splat(-0.5));
+        let l = (left * left_layer).transform_point3(Vec3::splat(0.5));
+        assert!(l.abs_diff_eq(Vec3::new(-expected.x, expected.y, expected.z), 1e-4));
+        // Lowered by the equip height: 0.6 of it, straight down.
+        let low = legacy_item_pose(false, 0.5, 0.0, ItemPose::Swing, false).unwrap();
+        let c = (low * layer).transform_point3(Vec3::splat(0.5));
+        assert!(c.abs_diff_eq(expected - Vec3::new(0.0, 0.3, 0.0), 1e-4));
+        // A blocking sword sits elsewhere, and poses 1.8.9 lacked stay modern.
+        let block = legacy_item_pose(false, 0.0, 0.0, ItemPose::Using, true).unwrap();
+        assert!(
+            !(block * layer)
+                .transform_point3(Vec3::splat(0.5))
+                .abs_diff_eq(expected, 0.01)
+        );
+        let trident = ItemPose::Trident { ticks_used: 3.0 };
+        assert!(legacy_item_pose(false, 0.0, 0.0, trident, false).is_none());
+    }
+
+    #[test]
+    fn legacy_hand_does_not_dip_after_a_hit() {
+        // Just after a hit the attack strength is 0: 26.3 lowers the main hand to 0,
+        // 1.8.9 keeps it up (it only lowers on an item change).
+        let mut modern = HandHeights {
+            main: 1.0,
+            old_main: 1.0,
+            off: 1.0,
+            old_off: 1.0,
+        };
+        let mut legacy = modern;
+        modern.tick_with(false, 0.0, [false; 2], false);
+        legacy.tick_with(false, 0.0, [false; 2], true);
+        assert!((modern.main - 0.6).abs() < 1e-6, "falls 0.4 a tick");
+        assert_eq!(legacy.main, 1.0);
+        // An item change still lowers it.
+        legacy.tick_with(false, 1.0, [true, false], true);
+        assert!((legacy.main - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_flat_display_check_knows_vanillas_matrix() {
+        let m = modern_flat_display(false) * glam::Mat4::from_translation(glam::Vec3::splat(-0.5));
+        assert!(is_modern_flat_display(&m, false));
+        assert!(!is_modern_flat_display(&m, true));
+        assert!(!is_modern_flat_display(&glam::Mat4::IDENTITY, false));
     }
 }
 
@@ -1393,17 +1587,26 @@ mod action_result_tests {
         assert!(!UseResult::Success { swing: true }.should_swing(2, 3));
     }
     #[test]
-    fn consumption_pose_requires_eat_or_drink_animation() {
-        use horizon_world::consumable::UseAnimation::*;
+    fn a_consumable_names_its_use_animation() {
+        use horizon_core::use_animation::UseAnimation::*;
         assert_eq!(consumable_animation(&serde_json::json!({})), Eat);
-        assert_eq!(
-            consumable_animation(&serde_json::json!({"animation":"drink"})),
-            Drink
-        );
-        for animation in ["none", "block", "bow", "brush"] {
+        for (name, expected) in [
+            ("drink", Drink),
+            ("block", Block),
+            ("bow", Bow),
+            ("trident", Trident),
+            ("crossbow", Crossbow),
+            ("spyglass", Spyglass),
+            ("toot_horn", TootHorn),
+            ("brush", Brush),
+            ("bundle", Bundle),
+            ("spear", Spear),
+            ("none", None),
+        ] {
             assert_eq!(
-                consumable_animation(&serde_json::json!({"animation":animation})),
-                None
+                consumable_animation(&serde_json::json!({"animation":name})),
+                expected,
+                "{name}"
             );
         }
     }

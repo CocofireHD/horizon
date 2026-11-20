@@ -6,6 +6,7 @@
 //! ENDS-WHEN: the landing registry covers a mob's whole fall and this adapter is merged into crate::landing.
 use super::{DamageKind, Mob, MobEvent, MobWorld};
 use crate::collisions::SceneCollisions;
+use crate::health::DamageLevel;
 use horizon_core::{
     geometry::{Aabb, Vec3, VoxelShape},
     position::BlockPos,
@@ -21,19 +22,20 @@ use horizon_world::{
 };
 
 /// A mob mid-landing: the block under it is at `pos`, the fall was `distance`.
-pub(super) struct MobLanding<'a, 'w> {
+pub(super) struct MobLanding<'a, 'w, 'l> {
     pub mob: &'a mut Mob,
     pub w: &'a MobWorld<'w>,
+    pub level: &'a mut DamageLevel<'l>,
     pub events: &'a mut Vec<MobEvent>,
     pub pos: [i32; 3],
 }
-impl MobLanding<'_, '_> {
+impl MobLanding<'_, '_, '_> {
     fn at(&self) -> [f64; 3] {
         let p = self.mob.position;
         [p.x, p.y, p.z]
     }
 }
-impl BlockPushWorld for MobLanding<'_, '_> {
+impl BlockPushWorld for MobLanding<'_, '_, '_> {
     type Error = String;
     fn collision_shape(&mut self, state: BlockStateId, p: BlockPos) -> Result<VoxelShape, String> {
         let mut scene = SceneCollisions {
@@ -58,15 +60,18 @@ impl BlockPushWorld for MobLanding<'_, '_> {
         self.mob.bounds()
     }
     fn teleport_relative(&mut self, _: EntityIdentity, m: Vec3) -> Result<(), String> {
-        self.mob.position = Vec3::new(
-            self.mob.position.x + m.x,
-            self.mob.position.y + m.y,
-            self.mob.position.z + m.z,
+        // The lift is a position update of its own after the walk: the walk's destination is
+        // kept first, so a section crossing the walk made is told before the lift's.
+        let walked = self.mob.position;
+        super::living::teleports::set_pos(self.mob, walked);
+        super::living::teleports::set_pos(
+            self.mob,
+            Vec3::new(walked.x + m.x, walked.y + m.y, walked.z + m.z),
         );
         Ok(())
     }
 }
-impl BlockLandingWorld for MobLanding<'_, '_> {
+impl BlockLandingWorld for MobLanding<'_, '_, '_> {
     type DamageSource = DamageKind;
     /// The sound event, or none for a sound a mob's landing never makes.
     type Sound = Option<&'static str>;
@@ -89,10 +94,32 @@ impl BlockLandingWorld for MobLanding<'_, '_> {
         Ok(false)
     }
     fn mob_griefing(&mut self) -> Result<bool, String> {
-        Ok(self.w.mob_griefing)
+        Ok(self.w.can_grief(self.mob.id))
     }
     fn entity_dimensions(&self) -> (f32, f32) {
         (self.mob.width(), self.mob.height())
+    }
+    fn cancel_farmland_trample(
+        &mut self,
+        position: BlockPos,
+        state: BlockStateId,
+        distance: f64,
+    ) -> bool {
+        let mut cancel = false;
+        crate::landing::native_farmland_trample(
+            self.w.loop_context,
+            self.mob.id,
+            [position.x, position.y, position.z],
+            state.0,
+            distance,
+            &mut cancel,
+        );
+        cancel
+    }
+    /// Only a server loop's switch counts: a client replays its server.
+    fn template_suppressed(&self, state: BlockStateId) -> bool {
+        self.w.loop_context.side() != horizon_world::native_load_context::LoopSide::Client
+            && crate::block_contact::template_suppressed(self.w.registry, state)
     }
     // A mob never sneaks, so nothing suppresses a slime block's bounce.
     fn suppressing_bounce(&mut self) -> Result<bool, String> {
@@ -115,9 +142,15 @@ impl BlockLandingWorld for MobLanding<'_, '_> {
         source: DamageKind,
     ) -> Result<bool, String> {
         let contact = Some((self.w, self.pos));
-        Ok(self
-            .mob
-            .cause_fall_damage_at(distance, multiplier, self.events, contact, source))
+        Ok(self.mob.cause_fall_damage_at(
+            self.w.loop_context,
+            self.level,
+            distance,
+            multiplier,
+            self.events,
+            contact,
+            source,
+        ))
     }
     fn known_sound(&self, sound: LandingSound) -> Option<&'static str> {
         match sound {
@@ -183,7 +216,19 @@ impl BlockLandingWorld for MobLanding<'_, '_> {
             .registry
             .default_state("minecraft:air")
             .ok_or("missing air")?;
-        self.set_block(position, air, 3)
+        let broken = self.w.world.block(position.x, position.y, position.z);
+        let written = self.set_block(position, air, 3)?;
+        // `Level.destroyBlock`: a destroy that happened is followed by
+        // BLOCK_DESTROY with no source (`TurtleEggBlock.decreaseEggs`' last egg).
+        if written {
+            self.events.push(MobEvent::LandingGameEvent {
+                event: "minecraft:block_destroy",
+                at: [position.x, position.y, position.z],
+                source: None,
+                state: broken,
+            });
+        }
+        Ok(written)
     }
     fn set_block(
         &mut self,
@@ -198,13 +243,25 @@ impl BlockLandingWorld for MobLanding<'_, '_> {
         Ok(true)
     }
     // Neighbour updates and the break particles ride on the host's SetBlock.
+    // `FarmlandBlock.turnToBaseBlock` (BLOCK_CHANGE from the trampling mob) and
+    // `TurtleEggBlock.decreaseEggs` (BLOCK_DESTROY with no source) post a game
+    // event after the write.
     fn block_event(
         &mut self,
-        _: LandingEvent,
-        _: BlockPos,
-        _: BlockStateId,
-        _: bool,
+        kind: LandingEvent,
+        position: BlockPos,
+        state: BlockStateId,
+        with_entity: bool,
     ) -> Result<(), String> {
+        self.events.push(MobEvent::LandingGameEvent {
+            event: match kind {
+                LandingEvent::BlockChange => "minecraft:block_change",
+                LandingEvent::BlockDestroy => "minecraft:block_destroy",
+            },
+            at: [position.x, position.y, position.z],
+            source: with_entity.then_some(self.mob.id),
+            state,
+        });
         Ok(())
     }
     fn level_event(&mut self, _: i32, _: BlockPos, _: i32) -> Result<(), String> {

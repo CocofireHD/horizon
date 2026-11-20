@@ -1,7 +1,7 @@
 //! `cargo horizon-mod registry build|review|check|list`: the registry repository's CI
-//! (`horizon-rust/horizon-mods`, docs/api/mod-index.md). Network-free: the
+//! (`horizon-rust/horizon-mods`, docs/modding/src/reference/registry-index.md). Network-free: the
 //! workflow downloads the files and publishes what this writes.
-use horizon_mods::index::{
+use horizon_mod_package::index::{
     FILE_HOST,
     registry::{self, Sources},
 };
@@ -80,8 +80,8 @@ pub fn main(args: &[String]) -> Result<(), String> {
             };
             let author = flag(rest, "--author").ok_or(USAGE)?;
             let (base, _) = registry::load(Path::new(base)).map_err(lines)?;
-            let (head, _) = registry::load(Path::new(head)).map_err(lines)?;
-            let review = registry::review(&base, &head, author);
+            let (head, revoked) = registry::load(Path::new(head)).map_err(lines)?;
+            let review = registry::review_with_revoked(&base, &head, &revoked, author);
             if rest.iter().any(|a| a == "--json") {
                 let json = serde_json::json!({"errors": review.errors, "notes": review.notes});
                 println!("{json}");

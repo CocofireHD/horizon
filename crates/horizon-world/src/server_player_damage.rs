@@ -8,7 +8,7 @@ use crate::{
     compression::invalid,
     damage_reduction::{self, Bypass, DamageReductionWorld},
     food::FoodData,
-    living_damage::{self, DamageStat, DamageWorld},
+    living_damage::{self, DamageContainer, DamageStat, DamageWorld, MagicAbsorb},
     player_health::{PlayerAttributeHealth, PlayerFloatIds, PlayerHealthError},
     synced_floats::{DataError, Observer, SyncedFloats},
 };
@@ -63,6 +63,10 @@ pub trait ServerDamageEnvironment<A: HealthAttributes = EntityAttributes>:
     fn level_is_client(&mut self) -> Result<bool, EnvError<Self>>;
     fn record_damage(&mut self, amount: f32) -> Result<(), EnvError<Self>>;
     fn damage_event(&mut self) -> Result<(), EnvError<Self>>;
+    /// `DamageWorld::damage_pre`. The default does nothing.
+    fn damage_pre(&mut self, _container: &mut DamageContainer) -> Result<(), EnvError<Self>> {
+        Ok(())
+    }
 }
 pub struct ServerPlayerDamage<'a, E, A: HealthAttributes = EntityAttributes> {
     attributes: &'a mut A,
@@ -108,14 +112,43 @@ impl<'a, A: HealthAttributes, E: ServerDamageEnvironment<A>> ServerPlayerDamage<
         )
         .expect("validated immutable player float schema")
     }
-    pub fn apply(&mut self, damage: f32) -> Result<(), ServerDamageError<EnvError<E>, A::Error>> {
-        living_damage::actually_hurt(self, damage, true)
+    pub fn apply(
+        &mut self,
+        container: &mut DamageContainer,
+        damage: f32,
+    ) -> Result<(), ServerDamageError<EnvError<E>, A::Error>> {
+        living_damage::actually_hurt(self, container, damage, true)
     }
     pub(crate) fn apply_after_immunity_check(
         &mut self,
+        container: &mut DamageContainer,
         damage: f32,
     ) -> Result<(), ServerDamageError<EnvError<E>, A::Error>> {
-        living_damage::actually_hurt_after_immunity_check(self, damage, true)
+        living_damage::actually_hurt_after_immunity_check(self, container, damage, true)
+    }
+    pub(crate) fn apply_after_equipment(
+        &mut self,
+        container: &mut DamageContainer,
+        damage: f32,
+        bypass_armor: bool,
+    ) -> Result<(), ServerDamageError<EnvError<E>, A::Error>> {
+        use crate::damage_reduction::DamageReductionWorld;
+        let before = damage;
+        let damage = if bypass_armor {
+            damage
+        } else {
+            let armor = self.armor_value()? as f32;
+            let toughness = self.toughness_attribute()? as f32;
+            crate::combat_rules::after_armor(self, damage, armor, toughness)?
+        };
+        let damage = container.reduce(
+            crate::living_damage::Reduction::Armor,
+            before,
+            before - damage,
+            damage,
+            !bypass_armor,
+        );
+        living_damage::actually_hurt_after_armor(self, container, damage, true)
     }
 }
 impl<A: HealthAttributes, E: ServerDamageEnvironment<A>> ArmorWorld
@@ -217,7 +250,10 @@ impl<A: HealthAttributes, E: ServerDamageEnvironment<A>> DamageWorld
     fn after_armor(&mut self, v: f32) -> Result<f32, Self::Error> {
         damage_reduction::after_armor(self, v)
     }
-    fn after_magic(&mut self, v: f32) -> Result<f32, Self::Error> {
+    fn bypasses_armor(&mut self) -> Result<bool, Self::Error> {
+        self.bypasses(Bypass::Armor)
+    }
+    fn after_magic(&mut self, v: f32) -> Result<MagicAbsorb, Self::Error> {
         damage_reduction::after_magic(self, v)
     }
     fn absorption(&mut self) -> Result<f32, Self::Error> {
@@ -280,6 +316,11 @@ impl<A: HealthAttributes, E: ServerDamageEnvironment<A>> DamageWorld
     fn damage_event(&mut self) -> Result<(), Self::Error> {
         self.environment
             .damage_event()
+            .map_err(ServerDamageError::Environment)
+    }
+    fn damage_pre(&mut self, container: &mut DamageContainer) -> Result<(), Self::Error> {
+        self.environment
+            .damage_pre(container)
             .map_err(ServerDamageError::Environment)
     }
 }

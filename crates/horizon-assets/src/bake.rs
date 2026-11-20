@@ -34,6 +34,8 @@ pub struct ModelQuad {
 /// NeoForge's `render_type` names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderType {
+    /// A declared render type unknown to this baker; distinct from an absent default.
+    Unsupported,
     Solid,
     Cutout,
     CutoutMipped,
@@ -234,7 +236,10 @@ fn bake_into(
     skip_flat: bool,
     output: &mut Vec<ModelQuad>,
 ) -> Result<()> {
-    let render_type = model.render_type.as_deref().and_then(RenderType::by_name);
+    let render_type = model
+        .render_type
+        .as_deref()
+        .map(|name| RenderType::by_name(name).unwrap_or(RenderType::Unsupported));
     for element in model.elements() {
         let element = element
             .as_ref()
@@ -279,8 +284,47 @@ fn bake_into(
             hidden,
         }) => bake_obj(model, obj, *flip_v, *shade, hidden, transform, output)?,
         Some(ResolvedLoader::Obj { model: None, .. }) | None => {}
+        Some(ResolvedLoader::Registered(quads)) => {
+            for quad in quads.iter() {
+                if let Some(quad) = loader_quad(model, quad, transform, render_type)? {
+                    output.push(quad);
+                }
+            }
+        }
     }
     Ok(())
+}
+/// A registered loader's quad, moved whole by the blockstate transform as an obj face is. A
+/// texture key the model doesn't define skips the quad with a reason.
+fn loader_quad(
+    model: &ResolvedCuboidModel,
+    quad: &crate::model_loaders::LoaderQuad,
+    transform: BlockModelTransform,
+    render_type: Option<RenderType>,
+) -> Result<Option<ModelQuad>> {
+    let Some(material) = model.material(&quad.texture)?.cloned() else {
+        log::warn!(
+            "model loader quad skipped: the model has no texture {:?}",
+            quad.texture
+        );
+        return Ok(None);
+    };
+    let positions = quad.positions.map(|p| transform.position(p));
+    Ok(Some(ModelQuad {
+        positions,
+        uv: quad.uvs,
+        facing: facing(&positions).unwrap_or(Direction::Up),
+        cull: quad.cull.map(|d| transform.direction(d)),
+        material,
+        tint_index: quad.tint_index,
+        shade_direction_override: None,
+        light_emission: 0,
+        light: [0; 2],
+        color: None,
+        ambient_occlusion: None,
+        render_type,
+        shade: quad.shade,
+    }))
 }
 /// Obj faces are unculled quads in block units; the blockstate transform moves them whole.
 fn bake_obj(
@@ -292,7 +336,10 @@ fn bake_obj(
     transform: BlockModelTransform,
     output: &mut Vec<ModelQuad>,
 ) -> Result<()> {
-    let render_type = model.render_type.as_deref().and_then(RenderType::by_name);
+    let render_type = model
+        .render_type
+        .as_deref()
+        .map(|name| RenderType::by_name(name).unwrap_or(RenderType::Unsupported));
     for face in obj.faces.iter().filter(|f| !hidden.contains(&f.object)) {
         let slot = match obj.materials.get(&face.material) {
             Some(MtlTexture::Sprite(sprite)) => {

@@ -1,25 +1,27 @@
 //! Decoded block sprites kept on disk between launches (M-11): reading and
 //! decoding ~1300 small PNGs is most of `Sprites::load`. One file per resource
-//! root, valid only while the `textures` trees still have the same paths,
-//! sizes and modification times and the format version is the same; anything
+//! cache location, valid only while the resource source's textures have the
+//! same identities/change stamps (or open archive contents) and format version; anything
 //! else (missing, corrupt, stale, unwritable) means the normal decoding path.
-use crate::mipmap::Strategy;
-use std::{
-    collections::HashMap,
-    fs,
-    hash::{DefaultHasher, Hash, Hasher},
-    path::{Path, PathBuf},
-};
+use crate::{mipmap::Strategy, resource_source::ResourceRoot};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 const MAGIC: &[u8; 4] = b"HSPR";
 /// Bump when `Decoded` or the decoding in `Sprites::decode` changes.
-const VERSION: u32 = 1;
+const VERSION: u32 = 3;
 const FILE: &str = "horizon-sprites.cache";
+/// The most pixel bytes one entry's frames may hold: a full atlas, the most one decoded image
+/// may be (`hud::read_png`).
+const MAX_ENTRY_BYTES: u64 = (crate::hud::MAX_ATLAS_SIZE as u64).pow(2) * 4;
 
 /// What decoding one texture gives, before it takes a layer.
 #[derive(Clone)]
 pub(crate) struct Decoded {
+    /// The longer side of a frame: its layer's native size.
     pub side: u32,
+    /// Each frame's width and height; `frames` are this size, not squared to `side`, until
+    /// `Sprites::finish` knows the layers' size.
+    pub frame_size: [u32; 2],
     pub frames: Vec<Vec<u8>>,
     /// The `.mcmeta` `animation` value, as text.
     pub animation: Option<String>,
@@ -37,41 +39,13 @@ pub(crate) struct SpriteCache {
     dirty: bool,
 }
 
-/// Paths, sizes and modification times of every file under `assets/*/textures`,
-/// summed so the directory order does not matter.
-fn fingerprint(root: &Path) -> Option<u64> {
-    fn walk(dir: &Path, base: &Path, sum: &mut u64) -> Option<()> {
-        for entry in fs::read_dir(dir).ok()? {
-            let entry = entry.ok()?;
-            let meta = entry.metadata().ok()?;
-            if meta.is_dir() {
-                walk(&entry.path(), base, sum)?;
-                continue;
-            }
-            let mut hasher = DefaultHasher::new();
-            entry.path().strip_prefix(base).ok()?.hash(&mut hasher);
-            meta.len().hash(&mut hasher);
-            meta.modified().ok()?.hash(&mut hasher);
-            *sum = sum.wrapping_add(hasher.finish());
-        }
-        Some(())
-    }
-    let mut sum = 0;
-    for namespace in fs::read_dir(root.join("assets")).ok()? {
-        let textures = namespace.ok()?.path().join("textures");
-        if textures.is_dir() {
-            walk(&textures, root, &mut sum)?;
-        }
-    }
-    Some(sum)
-}
-
 impl SpriteCache {
     /// The cache of `root`: its stored entries when still valid, else empty.
     /// `None` when the textures cannot be fingerprinted (no caching then).
-    pub fn open(root: &Path) -> Option<Self> {
-        let fingerprint = fingerprint(root)?;
-        let path = root.join(FILE);
+    pub fn open(root: &ResourceRoot) -> Option<Self> {
+        let fingerprint = root.source().fingerprint_under("assets", &["textures"])?;
+        fs::create_dir_all(root.cache()).ok()?;
+        let path = root.cache().join(FILE);
         let entries = fs::read(&path)
             .ok()
             .and_then(|bytes| parse(&bytes, fingerprint))
@@ -116,6 +90,8 @@ fn serialize(fingerprint: u64, entries: &HashMap<String, Decoded>) -> Vec<u8> {
     for (name, d) in entries {
         put_bytes(&mut out, name.as_bytes());
         out.extend_from_slice(&d.side.to_le_bytes());
+        out.extend_from_slice(&d.frame_size[0].to_le_bytes());
+        out.extend_from_slice(&d.frame_size[1].to_le_bytes());
         out.extend_from_slice(&(d.frames.len() as u32).to_le_bytes());
         for frame in &d.frames {
             put_bytes(&mut out, frame);
@@ -150,6 +126,14 @@ impl<'a> Reader<'a> {
         self.take(n)
     }
 }
+/// Whether `count` frames of `frame_len` bytes fit both what is left of the file (each record
+/// is a 4-byte length and its bytes) and a full atlas, frame table included.
+fn frames_fit(frame_len: u128, count: u32, remaining: usize) -> bool {
+    let count = u128::from(count);
+    let table_entry = std::mem::size_of::<Vec<u8>>() as u128;
+    count * (frame_len + 4) <= remaining as u128
+        && count * (frame_len + table_entry) <= u128::from(MAX_ENTRY_BYTES)
+}
 fn parse(bytes: &[u8], fingerprint: u64) -> Option<HashMap<String, Decoded>> {
     let mut r = Reader(bytes);
     if r.take(4)? != MAGIC || r.u32()? != VERSION {
@@ -163,10 +147,26 @@ fn parse(bytes: &[u8], fingerprint: u64) -> Option<HashMap<String, Decoded>> {
     for _ in 0..count {
         let name = String::from_utf8(r.bytes()?.to_vec()).ok()?;
         let side = r.u32()?;
+        let frame_size = [r.u32()?, r.u32()?];
         let frame_count = r.u32()?;
+        // Checked before anything is copied: the shape, then the frames' total against what the
+        // file holds and against a full atlas (what one decoded image may be), counting the
+        // frame table too, which for tiny frames outweighs their pixels. The table grows only
+        // as each record's length checks out.
+        if frame_count == 0 || frame_size.contains(&0) || frame_size[0].max(frame_size[1]) != side {
+            return None;
+        }
+        let frame_len = u128::from(frame_size[0]) * u128::from(frame_size[1]) * 4;
+        if !frames_fit(frame_len, frame_count, r.0.len()) {
+            return None;
+        }
         let mut frames = Vec::new();
         for _ in 0..frame_count {
-            frames.push(r.bytes()?.to_vec());
+            let frame = r.bytes()?;
+            if frame.len() as u128 != frame_len {
+                return None;
+            }
+            frames.push(frame.to_vec());
         }
         let animation = String::from_utf8(r.bytes()?.to_vec()).ok()?;
         let has_animation = r.take(1)?[0] != 0;
@@ -180,14 +180,11 @@ fn parse(bytes: &[u8], fingerprint: u64) -> Option<HashMap<String, Decoded>> {
         };
         let alpha_cutoff_bias = f32::from_bits(r.u32()?);
         let flags = r.take(1)?[0];
-        let frame_len = (side as usize).checked_mul(side as usize)?.checked_mul(4)?;
-        if frames.is_empty() || frames.iter().any(|f| f.len() != frame_len) {
-            return None;
-        }
         entries.insert(
             name,
             Decoded {
                 side,
+                frame_size,
                 frames,
                 animation: has_animation.then_some(animation),
                 strategy,
@@ -204,10 +201,12 @@ fn parse(bytes: &[u8], fingerprint: u64) -> Option<HashMap<String, Decoded>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn sample(blue: u8, animation: Option<&str>) -> Decoded {
         Decoded {
             side: 2,
+            frame_size: [2, 2],
             frames: vec![vec![blue; 16], vec![blue + 1; 16]],
             animation: animation.map(str::to_owned),
             strategy: Strategy::Cutout,
@@ -233,8 +232,8 @@ mod tests {
         for (name, d) in &entries {
             let e = &back[name];
             assert_eq!(
-                (d.side, &d.frames, &d.animation),
-                (e.side, &e.frames, &e.animation)
+                (d.side, d.frame_size, &d.frames, &d.animation),
+                (e.side, e.frame_size, &e.frames, &e.animation)
             );
             assert_eq!(d.alpha_cutoff_bias, e.alpha_cutoff_bias);
             assert_eq!(
@@ -257,16 +256,75 @@ mod tests {
         extra.push(0);
         assert!(parse(&extra, 7).is_none());
     }
+    /// The frame table is charged with the pixels: for tiny frames it is the larger part.
+    #[test]
+    fn a_frame_table_counts_toward_the_entry_budget() {
+        let table = std::mem::size_of::<Vec<u8>>() as u128;
+        let tiny = 100_000_000;
+        // 1x1 frames: 400 MB of pixels fit a full atlas, their table does not.
+        assert!(u128::from(tiny) * 4 <= u128::from(MAX_ENTRY_BYTES));
+        assert!(u128::from(tiny) * (4 + table) > u128::from(MAX_ENTRY_BYTES));
+        assert!(!frames_fit(4, tiny, usize::MAX));
+        assert!(frames_fit(4, 1000, 8000));
+        assert!(!frames_fit(4, 1000, 7999));
+        assert!(!frames_fit(
+            u128::from(u32::MAX) * u128::from(u32::MAX) * 4,
+            u32::MAX,
+            usize::MAX
+        ));
+    }
+    /// Many 1x1 frames claimed over a short payload: a miss, with nothing reserved for them.
+    #[test]
+    fn a_huge_count_of_tiny_frames_is_a_miss() {
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        put_bytes(&mut bytes, b"a:b");
+        for field in [1u32, 1, 1, 30_000_000] {
+            bytes.extend_from_slice(&field.to_le_bytes());
+        }
+        put_bytes(&mut bytes, &[0; 4]);
+        assert!(parse(&bytes, 7).is_none());
+    }
+    /// An entry declaring far more frames than the file holds is a miss before anything is
+    /// reserved for them.
+    #[test]
+    fn a_huge_frame_count_with_a_short_payload_is_a_miss() {
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        put_bytes(&mut bytes, b"a:b");
+        for field in [16, 16, 16, u32::MAX] {
+            bytes.extend_from_slice(&field.to_le_bytes());
+        }
+        put_bytes(&mut bytes, &[0; 16 * 16 * 4]);
+        assert!(parse(&bytes, 7).is_none());
+    }
+    /// A frame size with a zero side is a miss: its texture is decoded again, never read
+    /// from empty frames.
+    #[test]
+    fn a_zero_frame_side_is_a_miss() {
+        let entry = |frame_size: [u32; 2], frames: Vec<Vec<u8>>| {
+            let mut d = sample(1, None);
+            (d.side, d.frame_size, d.frames) = (16, frame_size, frames);
+            serialize(7, &HashMap::from([("a:b".to_owned(), d)]))
+        };
+        assert!(parse(&entry([0, 16], vec![vec![]]), 7).is_none());
+        let wide = parse(&entry([16, 2], vec![vec![5; 16 * 2 * 4]]), 7).unwrap();
+        assert_eq!(wide["a:b"].frame_size, [16, 2]);
+    }
     #[test]
     fn changed_texture_invalidates_and_corrupt_file_is_ignored() {
         let root = scratch("invalidate");
         let png = root.join("assets/minecraft/textures/block/x.png");
         fs::write(&png, b"one").unwrap();
-        let mut cache = SpriteCache::open(&root).unwrap();
+        let mut cache = SpriteCache::open(&ResourceRoot::directory(root.clone())).unwrap();
         cache.insert("minecraft:block/x", sample(1, None));
         cache.save();
         assert!(
-            SpriteCache::open(&root)
+            SpriteCache::open(&ResourceRoot::directory(root.clone()))
                 .unwrap()
                 .get("minecraft:block/x")
                 .is_some()
@@ -275,18 +333,18 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         fs::write(&png, b"two").unwrap();
         assert!(
-            SpriteCache::open(&root)
+            SpriteCache::open(&ResourceRoot::directory(root.clone()))
                 .unwrap()
                 .get("minecraft:block/x")
                 .is_none()
         );
         // A new file also invalidates.
-        let mut cache = SpriteCache::open(&root).unwrap();
+        let mut cache = SpriteCache::open(&ResourceRoot::directory(root.clone())).unwrap();
         cache.insert("minecraft:block/x", sample(1, None));
         cache.save();
         fs::write(root.join("assets/minecraft/textures/block/y.png"), b"y").unwrap();
         assert!(
-            SpriteCache::open(&root)
+            SpriteCache::open(&ResourceRoot::directory(root.clone()))
                 .unwrap()
                 .get("minecraft:block/x")
                 .is_none()
@@ -294,12 +352,118 @@ mod tests {
         // Corrupt cache file: empty, no error.
         fs::write(root.join(FILE), b"HSPR junk").unwrap();
         assert!(
-            SpriteCache::open(&root)
+            SpriteCache::open(&ResourceRoot::directory(root.clone()))
                 .unwrap()
                 .get("minecraft:block/x")
                 .is_none()
         );
         let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn indexed_archive_cache_uses_the_open_snapshot_and_separate_cache_location() {
+        use crate::{
+            packs::{self, Pack, Source},
+            resource_source::ResourceSource,
+        };
+        use std::io::Write;
+        let root = scratch("archive-snapshot");
+        let base = root.join("base");
+        fs::create_dir_all(base.join("assets/minecraft/textures/block")).unwrap();
+        let name = "assets/minecraft/textures/block/x.png";
+        fs::write(base.join(name), b"base").unwrap();
+        let jar = root.join("pack.jar");
+        let archive = |path: &Path, value: &[u8]| {
+            let mut writer = zip::ZipWriter::new(fs::File::create(path).unwrap());
+            for name in [name, "assets/minecraft/textures/block/extra.png"] {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(value).unwrap();
+            }
+            writer.finish().unwrap();
+        };
+        archive(&jar, b"before");
+        let packs = [Pack::mod_layer("jar".into(), Source::Zip(jar.clone()))];
+        let source = packs::resources(ResourceSource::directory(base.clone()), &packs).unwrap();
+        let before = ResourceRoot::new(base.clone(), root.join("cache"), source);
+        let mut cache = SpriteCache::open(&before).unwrap();
+        cache.insert("minecraft:block/x", sample(1, None));
+        cache.save();
+        assert!(
+            SpriteCache::open(&before)
+                .unwrap()
+                .get("minecraft:block/x")
+                .is_some()
+        );
+        assert!(root.join("cache").join(FILE).is_file());
+        assert!(!base.join(FILE).exists());
+        assert!(
+            !base
+                .join("assets/minecraft/textures/block/extra.png")
+                .exists()
+        );
+        assert_eq!(fs::read(base.join(name)).unwrap(), b"base");
+        let times = fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&jar)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        let touched = ResourceRoot::new(
+            base.clone(),
+            root.join("cache"),
+            packs::resources(ResourceSource::directory(base.clone()), &packs).unwrap(),
+        );
+        assert!(
+            SpriteCache::open(&touched)
+                .unwrap()
+                .get("minecraft:block/x")
+                .is_some(),
+            "marking a downloaded archive used must not invalidate identical bytes"
+        );
+
+        let replacement = root.join("new.jar");
+        archive(&replacement, b"after");
+        fs::rename(&jar, root.join("old.jar")).unwrap();
+        fs::rename(replacement, &jar).unwrap();
+        let source = packs::resources(ResourceSource::directory(base.clone()), &packs).unwrap();
+        let after = ResourceRoot::new(base, root.join("cache"), source);
+        // Reopening a pathname for the fingerprint would now misidentify the
+        // old source as the new one. Both hashes must follow their open readers.
+        assert_eq!(before.source().read(name).unwrap(), b"before");
+        assert_eq!(after.source().read(name).unwrap(), b"after");
+        assert!(
+            SpriteCache::open(&before)
+                .unwrap()
+                .get("minecraft:block/x")
+                .is_some()
+        );
+        assert!(
+            SpriteCache::open(&after)
+                .unwrap()
+                .get("minecraft:block/x")
+                .is_none()
+        );
+        let mut cache = SpriteCache::open(&after).unwrap();
+        cache.insert("minecraft:block/x", sample(2, None));
+        cache.save();
+        assert!(
+            SpriteCache::open(&before)
+                .unwrap()
+                .get("minecraft:block/x")
+                .is_none()
+        );
+        assert_eq!(
+            SpriteCache::open(&after)
+                .unwrap()
+                .get("minecraft:block/x")
+                .unwrap()
+                .frames,
+            sample(2, None).frames
+        );
+        let _ = fs::remove_dir_all(root);
     }
     fn write_png(path: &Path, rgba: [u8; 4]) {
         let mut encoder = png::Encoder::new(fs::File::create(path).unwrap(), 16, 16);
@@ -313,8 +477,10 @@ mod tests {
             .unwrap();
     }
     fn sprite_pixels(root: &Path) -> Vec<u8> {
-        let mut sprites = crate::sprites::Sprites::with_disk_cache(root);
-        sprites.insert(root, "minecraft:block/x").unwrap();
+        let mut sprites = crate::sprites::Sprites::with_disk_cache(
+            &crate::resource_source::ResourceRoot::directory(root.to_owned()),
+        );
+        sprites.insert("minecraft:block/x").unwrap();
         sprites.save_disk_cache();
         sprites.finish();
         sprites.pixels

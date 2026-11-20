@@ -548,7 +548,18 @@ impl TreeFeature {
         })
     }
 
+    /// The tree, its Part lookups reading the tables published when it started.
     pub(crate) fn place<W: FeatureWorld + PlacementContext, R: RandomSource>(
+        &self,
+        world: &mut W,
+        random: &mut R,
+        origin: [i32; 3],
+        nested: &mut NestedPlacer<'_, W, R>,
+    ) -> TreeResult<bool, W::Error> {
+        crate::native_worldgen_hooks::feature(|| self.place_tree(world, random, origin, nested))
+    }
+
+    fn place_tree<W: FeatureWorld + PlacementContext, R: RandomSource>(
         &self,
         world: &mut W,
         random: &mut R,
@@ -631,10 +642,10 @@ impl TreeFeature {
         if clipped < tree_height && self.min_clipped_height.is_none_or(|min| clipped < min) {
             return Ok(false);
         }
-        if let Some(root) = &self.root_placer {
-            if !root.place_roots(run, self, origin, trunk_origin)? {
-                return Ok(false);
-            }
+        if let Some(root) = &self.root_placer
+            && !root.place_roots(run, self, origin, trunk_origin)?
+        {
+            return Ok(false);
         }
         let attachments = self
             .trunk_placer

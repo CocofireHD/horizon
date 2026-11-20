@@ -5,10 +5,12 @@ use crate::{
     combat_rules::ArmorWorld,
     damage_immunity::{self, ImmunityWorld},
     food::{Difficulty, FoodData},
-    living_hurt::{HurtState, HurtTag, HurtWorld},
+    living_damage::DamageContainer,
+    living_hurt::{self, HurtState, HurtTag, HurtWorld, PendingHurt},
     player_health::PlayerFloatIds,
     player_hurt::{
         CausingEntity, PlayerHurtWorld, ServerPlayerHurtWorld, server_player_hurt_server,
+        server_player_hurt_until_helmet,
     },
     server_player_damage::{ServerDamageEnvironment, ServerDamageError, ServerPlayerDamage},
     synced_floats::{DataError, SyncedFloats},
@@ -54,6 +56,63 @@ impl<'a, A: HealthAttributes, E: CombatEnvironment<A>> ServerPlayerCombat<'a, E,
     ) -> Result<bool, ServerDamageError<Error<E>, A::Error>> {
         server_player_hurt_server(state, self, damage)
     }
+    /// [`Self::hurt`] up to `hurtHelmet`; none for a hit refused on the way.
+    pub fn hurt_until_helmet(
+        &mut self,
+        state: &mut HurtState<E::Source>,
+        damage: f32,
+    ) -> Result<Option<PendingHurt<E::UseItem>>, ServerDamageError<Error<E>, A::Error>> {
+        server_player_hurt_until_helmet(state, self, damage)
+    }
+    /// The rest of a hit whose helmet the caller has worn.
+    pub fn hurt_after_helmet(
+        &mut self,
+        state: &mut HurtState<E::Source>,
+        hit: PendingHurt<E::UseItem>,
+    ) -> Result<bool, ServerDamageError<Error<E>, A::Error>> {
+        living_hurt::hurt_after_helmet(state, self, hit)
+    }
+    pub fn finish_selected_equipment(
+        &mut self,
+        state: &mut HurtState<E::Source>,
+        mut selected: living_hurt::SelectedHurt<E::UseItem>,
+        inner: Option<bool>,
+    ) -> Result<bool, ServerDamageError<Error<E>, A::Error>> {
+        if let Some(bypass) = inner {
+            self.apply_equipment_inner(&mut selected.hit.container, selected.damage, bypass)?;
+        }
+        living_hurt::finish_equipment_hurt(state, self, selected)
+    }
+    /// The inner immunity and armor-bypass gates precede ordinary equipment wear.
+    pub fn prepare_equipment_inner(
+        &mut self,
+    ) -> Result<Option<bool>, ServerDamageError<Error<E>, A::Error>> {
+        if damage_immunity::server_player_immunity(self.environment)
+            .map_err(ServerDamageError::Environment)?
+        {
+            return Ok(None);
+        }
+        self.environment
+            .bypasses(crate::damage_reduction::Bypass::Armor)
+            .map(Some)
+            .map_err(ServerDamageError::Environment)
+    }
+    pub fn apply_equipment_inner(
+        &mut self,
+        container: &mut DamageContainer,
+        damage: f32,
+        bypass_armor: bool,
+    ) -> Result<(), ServerDamageError<Error<E>, A::Error>> {
+        ServerPlayerDamage::new(
+            self.attributes,
+            self.data,
+            self.food,
+            self.ids,
+            self.environment,
+        )
+        .expect("validated immutable player schema")
+        .apply_after_equipment(container, damage, bypass_armor)
+    }
 }
 impl<A: HealthAttributes, E: CombatEnvironment<A>> HurtWorld for ServerPlayerCombat<'_, E, A> {
     type Error = ServerDamageError<Error<E>, A::Error>;
@@ -77,6 +136,7 @@ impl<A: HealthAttributes, E: CombatEnvironment<A>> HurtWorld for ServerPlayerCom
     fn actually_hurt(
         &mut self,
         _: &mut HurtState<Self::Source>,
+        container: &mut DamageContainer,
         damage: f32,
     ) -> Result<(), Self::Error> {
         if damage_immunity::server_player_immunity(self.environment)
@@ -92,7 +152,7 @@ impl<A: HealthAttributes, E: CombatEnvironment<A>> HurtWorld for ServerPlayerCom
             self.environment,
         )
         .expect("validated immutable player schema")
-        .apply_after_immunity_check(damage)
+        .apply_after_immunity_check(container, damage)
     }
     fn blocking_component(&mut self, item: Self::UseItem) -> Option<Self::Blocking> {
         self.environment.blocking_component(item)
@@ -117,9 +177,9 @@ impl<A: HealthAttributes, E: CombatEnvironment<A>> HurtWorld for ServerPlayerCom
     fn hurt_start(
         &mut self,
         state: &mut HurtState<Self::Source>,
-        damage: &mut f32,
+        container: &mut DamageContainer,
     ) -> Result<bool, Self::Error> {
-        HurtWorld::hurt_start(self.environment, state, damage)
+        HurtWorld::hurt_start(self.environment, state, container)
             .map_err(ServerDamageError::Environment)
     }
     fn sleeping(&mut self, state: &mut HurtState<Self::Source>) -> Result<bool, Self::Error> {
@@ -255,6 +315,14 @@ impl<A: HealthAttributes, E: CombatEnvironment<A>> HurtWorld for ServerPlayerCom
         blocked: bool,
     ) -> Result<(), Self::Error> {
         HurtWorld::attacker_criterion(self.environment, state, original, damage, blocked)
+            .map_err(ServerDamageError::Environment)
+    }
+    fn damage_post(
+        &mut self,
+        state: &mut HurtState<Self::Source>,
+        container: &DamageContainer,
+    ) -> Result<(), Self::Error> {
+        HurtWorld::damage_post(self.environment, state, container)
             .map_err(ServerDamageError::Environment)
     }
 }

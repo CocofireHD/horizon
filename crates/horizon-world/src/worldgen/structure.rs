@@ -9,12 +9,15 @@ pub mod jigsaw;
 pub mod legacy;
 pub mod mansion;
 pub mod mineshaft;
+pub mod mod_types;
 pub mod monument;
 pub mod nether_fossil;
 pub mod ocean_ruin;
 pub mod piece_limited;
 pub mod processor;
 pub mod ruined_portal;
+pub(crate) mod saved_legacy;
+pub(crate) mod saved_templates;
 pub mod simple;
 pub mod start;
 pub mod start_checks;
@@ -22,19 +25,21 @@ pub mod stronghold;
 pub mod template;
 pub mod temple;
 
-use crate::{
-    nbt::{self, Limits},
-    registry::{BlockRegistry, BlockStateId},
-};
 use horizon_core::geometry::Direction;
 use processor::ProcessorList;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
+pub mod block_entity_transform;
+
 pub use template::{BlockInfo, EntityInfo, JigsawInfo, StructureTemplate, save_nbt};
+use {
+    crate::registry::{BlockRegistry, BlockStateId},
+    horizon_core::nbt::Limits,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Rotation {
@@ -112,67 +117,6 @@ impl Mirror {
             Self::LeftRight => "LEFT_RIGHT",
             Self::FrontBack => "FRONT_BACK",
         }
-    }
-}
-
-/// Inclusive integer box (vanilla BoundingBox).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BoundingBox {
-    pub min: [i32; 3],
-    pub max: [i32; 3],
-}
-impl BoundingBox {
-    pub fn new(min: [i32; 3], max: [i32; 3]) -> Self {
-        Self { min, max }
-    }
-    pub fn from_corners(a: [i32; 3], b: [i32; 3]) -> Self {
-        Self {
-            min: std::array::from_fn(|i| a[i].min(b[i])),
-            max: std::array::from_fn(|i| a[i].max(b[i])),
-        }
-    }
-    pub fn moved(self, d: [i32; 3]) -> Self {
-        Self {
-            min: std::array::from_fn(|i| self.min[i] + d[i]),
-            max: std::array::from_fn(|i| self.max[i] + d[i]),
-        }
-    }
-    pub fn is_inside(&self, p: [i32; 3]) -> bool {
-        (0..3).all(|i| p[i] >= self.min[i] && p[i] <= self.max[i])
-    }
-    pub fn intersects(&self, other: &Self) -> bool {
-        (0..3).all(|i| self.max[i] >= other.min[i] && self.min[i] <= other.max[i])
-    }
-    pub fn encapsulate(&mut self, other: &Self) {
-        for i in 0..3 {
-            self.min[i] = self.min[i].min(other.min[i]);
-            self.max[i] = self.max[i].max(other.max[i]);
-        }
-    }
-    pub fn inflated(self, xz: i32, y: i32) -> Self {
-        Self {
-            min: [self.min[0] - xz, self.min[1] - y, self.min[2] - xz],
-            max: [self.max[0] + xz, self.max[1] + y, self.max[2] + xz],
-        }
-    }
-    pub fn span(&self) -> [i32; 3] {
-        std::array::from_fn(|i| self.max[i] - self.min[i] + 1)
-    }
-    pub fn center(&self) -> [i32; 3] {
-        std::array::from_fn(|i| self.min[i] + (self.max[i] - self.min[i] + 1) / 2)
-    }
-    pub fn corners(&self) -> [[i32; 3]; 8] {
-        let (a, b) = (self.min, self.max);
-        [
-            [a[0], a[1], a[2]],
-            [a[0], a[1], b[2]],
-            [a[0], b[1], a[2]],
-            [a[0], b[1], b[2]],
-            [b[0], a[1], a[2]],
-            [b[0], a[1], b[2]],
-            [b[0], b[1], a[2]],
-            [b[0], b[1], b[2]],
-        ]
     }
 }
 
@@ -261,6 +205,18 @@ impl StateTransforms {
                 .map_or(state, |t| BlockStateId(t[r as usize - 1])),
         }
     }
+    /// `BlockState.rotate(level, pos, rotation)` as a template places `state`, already
+    /// mirrored, at `pos` (NeoForge's `IBlockExtension.rotate`): this table's turned state, or
+    /// another state of the block its parts answer (`rotate`). Every template placement turns
+    /// its states through here.
+    pub fn rotate_at(
+        &self,
+        state: BlockStateId,
+        pos: [i32; 3],
+        rotation: Rotation,
+    ) -> BlockStateId {
+        crate::native_worldgen_hooks::rotate(state, pos, rotation, self.rotate(state, rotation))
+    }
     pub fn mirror(&self, state: BlockStateId, mirror: Mirror) -> BlockStateId {
         match mirror {
             Mirror::None => state,
@@ -278,13 +234,124 @@ impl StateTransforms {
     }
 }
 
+fn qualified(id: &str) -> String {
+    if id.contains(':') {
+        id.to_owned()
+    } else {
+        format!("minecraft:{id}")
+    }
+}
+
+/// `dir/<namespace>/<path>.nbt` for a template id, or `None` when the resolved path
+/// leaves `dir`. `Identifier` allows `.` and `/`, so a saved piece's `Template` could
+/// otherwise name `structure/../../.../foo.nbt` and read a file outside the template
+/// root (the prepared-files reader falls back to the disk). Nested paths stay valid.
+fn template_path(dir: &Path, id: &str) -> Option<PathBuf> {
+    let (namespace, path) = id.split_once(':')?;
+    let file = dir.join(namespace).join(format!("{path}.nbt"));
+    for component in file.strip_prefix(dir).ok()?.components() {
+        // A template name never contains a whole `.` or `..` segment; refusing them
+        // keeps the resolved file under the template root even when `dir` itself is
+        // relative.
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return None;
+        }
+    }
+    Some(file)
+}
+
+/// The template files and the ones loaded so far, shared by the resources and
+/// their lazy templates.
+struct TemplateStore {
+    registry: &'static BlockRegistry,
+    transforms: Arc<StateTransforms>,
+    dir: PathBuf,
+    loaded: RwLock<HashMap<String, Arc<StructureTemplate>>>,
+    /// Data packs' template files, which win over the prepared ones.
+    pack_templates: BTreeMap<String, horizon_assets::resource_source::Resource>,
+}
+impl TemplateStore {
+    fn get(&self, id: &str) -> Arc<StructureTemplate> {
+        if let Some(found) = self.loaded.read().unwrap().get(id) {
+            return found.clone();
+        }
+        let bytes = match self.pack_templates.get(id) {
+            Some(resource) => resource.read().ok(),
+            None => template_path(&self.dir, id)
+                .and_then(|file| horizon_core::prepared_files::read(&file).ok()),
+        };
+        let loaded = bytes.and_then(|bytes| {
+            let mut raw = Vec::new();
+            flate2::read::GzDecoder::new(bytes.as_slice())
+                .read_to_end(&mut raw)
+                .ok()?;
+            StructureTemplate::from_bytes(
+                &raw,
+                Limits::templates(),
+                self.registry,
+                &self.transforms,
+            )
+            .ok()
+        });
+        // StructureTemplateManager.getOrCreate: missing templates are empty.
+        let mut loaded = loaded.unwrap_or_else(StructureTemplate::empty);
+        loaded.location = id.into();
+        let loaded = Arc::new(loaded);
+        // Two threads may load the same file: every caller gets the first
+        // one kept, so templates stay comparable by pointer.
+        self.loaded
+            .write()
+            .unwrap()
+            .entry(id.to_owned())
+            .or_insert(loaded)
+            .clone()
+    }
+}
+
+/// A pool element's template, read from its file on first use.
+#[derive(Clone)]
+pub struct LazyTemplate {
+    id: String,
+    store: Option<Arc<TemplateStore>>,
+    cell: OnceLock<Arc<StructureTemplate>>,
+}
+impl LazyTemplate {
+    /// An already loaded template.
+    pub fn loaded(template: Arc<StructureTemplate>) -> Self {
+        Self {
+            id: String::new(),
+            store: None,
+            cell: OnceLock::from(template),
+        }
+    }
+    /// The template (the resources' shared one: comparable by pointer).
+    pub fn arc(&self) -> &Arc<StructureTemplate> {
+        self.cell.get_or_init(|| {
+            self.store
+                .as_ref()
+                .expect("a lazy template has its store")
+                .get(&self.id)
+        })
+    }
+}
+impl std::ops::Deref for LazyTemplate {
+    type Target = StructureTemplate;
+    fn deref(&self) -> &StructureTemplate {
+        self.arc()
+    }
+}
+impl std::fmt::Debug for LazyTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self.arc(), f)
+    }
+}
+
 /// Lazily loaded templates (`structure/<namespace>/<path>.nbt`, gzip NBT) and
 /// processor lists, shared by all generators of one resource bundle.
 pub struct StructureResources {
     pub registry: &'static BlockRegistry,
-    pub transforms: StateTransforms,
-    dir: PathBuf,
-    templates: RwLock<HashMap<String, Option<Arc<StructureTemplate>>>>,
+    pub transforms: Arc<StateTransforms>,
+    templates: Arc<TemplateStore>,
     pub processor_lists: BTreeMap<String, String>,
     jigsaw_states: BTreeMap<BlockStateId, bool>,
     pub(crate) waterlogged: HashMap<BlockStateId, BlockStateId>,
@@ -341,11 +408,17 @@ impl StructureResources {
                 }
             }
         }
+        let transforms = Arc::new(transforms);
         Self {
             registry,
-            transforms,
-            dir: dir.to_owned(),
-            templates: RwLock::new(HashMap::new()),
+            transforms: transforms.clone(),
+            templates: Arc::new(TemplateStore {
+                registry,
+                transforms,
+                dir: dir.to_owned(),
+                loaded: RwLock::new(HashMap::new()),
+                pack_templates: BTreeMap::new(),
+            }),
             processor_lists,
             jigsaw_states,
             waterlogged,
@@ -356,38 +429,47 @@ impl StructureResources {
                 .collect(),
         }
     }
+    pub fn with_templates(
+        mut self,
+        resources: BTreeMap<String, horizon_assets::resource_source::Resource>,
+    ) -> Self {
+        self.templates = Arc::new(TemplateStore {
+            registry: self.registry,
+            transforms: self.transforms.clone(),
+            dir: self.templates.dir.clone(),
+            loaded: RwLock::new(HashMap::new()),
+            pack_templates: resources,
+        });
+        self
+    }
+    /// In-memory template resources, retaining the same cache invalidation
+    /// as folder and archive sources.
+    pub fn with_pack_templates(self, templates: BTreeMap<String, Arc<[u8]>>) -> Self {
+        self.with_templates(
+            templates
+                .into_iter()
+                .map(|(id, bytes)| {
+                    (
+                        id,
+                        horizon_assets::resource_source::Resource::bytes(bytes.to_vec()),
+                    )
+                })
+                .collect(),
+        )
+    }
     /// StructureTemplateManager.getOrCreate; missing templates are empty.
     pub fn template(&self, id: &str) -> Option<Arc<StructureTemplate>> {
-        let id = if id.contains(':') {
-            id.to_owned()
-        } else {
-            format!("minecraft:{id}")
-        };
-        if let Some(found) = self.templates.read().unwrap().get(&id) {
-            return found.clone();
+        Some(self.templates.get(&qualified(id)))
+    }
+    /// A template loaded on its first use, as a pool element's
+    /// (StructureTemplateManager.getOrCreate runs when vanilla first touches
+    /// the element, not when its pool is read).
+    pub fn lazy_template(&self, id: &str) -> LazyTemplate {
+        LazyTemplate {
+            id: qualified(id),
+            store: Some(self.templates.clone()),
+            cell: OnceLock::new(),
         }
-        let (namespace, path) = id.split_once(':').unwrap();
-        let file = self.dir.join(namespace).join(format!("{path}.nbt"));
-        let loaded = horizon_core::prepared_files::read(&file)
-            .ok()
-            .and_then(|bytes| {
-                let mut raw = Vec::new();
-                flate2::read::GzDecoder::new(bytes.as_slice())
-                    .read_to_end(&mut raw)
-                    .ok()?;
-                let tag = nbt::read_named(&raw, Limits::templates()).ok()?.0.tag;
-                Some(StructureTemplate::from_nbt(
-                    &tag,
-                    self.registry,
-                    &self.transforms,
-                ))
-            });
-        // StructureTemplateManager.getOrCreate: missing templates are empty.
-        let mut loaded = loaded.unwrap_or_else(StructureTemplate::empty);
-        loaded.location = id.as_str().into();
-        let loaded = Some(Arc::new(loaded));
-        self.templates.write().unwrap().insert(id, loaded.clone());
-        loaded
     }
     /// Whether the state's fluid is a source (water/lava level 0, waterlogged).
     pub fn source_fluid(&self, state: BlockStateId) -> bool {
@@ -405,5 +487,38 @@ impl StructureResources {
     }
     pub fn is_jigsaw(&self, state: BlockStateId) -> bool {
         self.jigsaw_states.contains_key(&state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::template_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn template_paths_stay_inside_the_template_root() {
+        let root = Path::new("/templates");
+        assert_eq!(
+            template_path(root, "minecraft:shipwreck/with_mast"),
+            Some(PathBuf::from(
+                "/templates/minecraft/shipwreck/with_mast.nbt"
+            )),
+            "a valid nested path stays"
+        );
+        assert_eq!(
+            template_path(root, "modid:path/to/nested/template"),
+            Some(PathBuf::from(
+                "/templates/modid/path/to/nested/template.nbt"
+            ))
+        );
+        for escape in [
+            "minecraft:../secret",
+            "minecraft:a/../../secret",
+            "minecraft:/etc/passwd",
+            "../templates/secret",
+            "minecraft:sub/../../../secret",
+        ] {
+            assert_eq!(template_path(root, escape), None, "{escape} escapes");
+        }
     }
 }

@@ -7,11 +7,16 @@
 //! (crate::auth): the login joins the server through the session service and
 //! encrypts the connection (ClientHandshakePacketListenerImpl.handleHello).
 use crate::auth::AuthSession;
-use crate::studio::{Metadata, RecorderStatus, StudioRecorder};
+pub mod ingress;
+mod known_packs;
+use known_packs::{fill_known_entries, select_known_packs};
+#[cfg(test)]
+#[path = "net/mod_packet_tests.rs"]
+mod mod_packet_tests;
+pub(crate) mod queued_writer;
 use horizon_protocol::{
     PROTOCOL_VERSION,
-    buf::Reader,
-    connection::{ConnReader, ConnWriter, Connection, Counters},
+    connection::{ConnReader, Connection, Counters},
     crypto::{generate_secret, offline_uuid, server_hash},
     packets::{Empty, configuration as cfg, handshake, login, play},
     registry::Dynamic,
@@ -19,24 +24,62 @@ use horizon_protocol::{
     servers::parse_address,
     text::{Language, plain, translatable},
 };
-use horizon_world::nbt::{JavaString, Tag};
+use queued_writer::QueuedWriter;
+pub use queued_writer::{PreparedPacket, PreparedPayload};
+#[cfg(test)]
+use std::sync::mpsc::channel;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
-        mpsc::{Receiver, Sender, channel},
     },
     thread::JoinHandle,
     time::Duration,
 };
+use {
+    horizon_core::nbt::{JavaString, Tag},
+    horizon_world::item_defaults::ItemData,
+};
+
+use horizon_hooks::tunnel;
 
 /// `CommonListenerCookie.serverCookies`: cookies the server asked the client
 /// to store (`ClientboundStoreCookiePacket`), answered to
 /// `ClientboundCookieRequestPacket`. A `transfer` carries them to the next
 /// connection (`TransferState`), so a proxy's backend switch keeps them.
 pub type Cookies = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+/// A recording of the session's packets: the tap a replay recorder plugs into. Replay recording is a
+/// platform feature (docs/layers.md, "Controllers, splitscreen, replays and UI pages"); the engine only
+/// hands it the packets: the network thread what it receives, the game thread what the client makes for
+/// the recording itself (its own movement, pose and swings).
+pub trait PacketRecorder: Send {
+    /// Whether it still takes packets (false once stopped or failed).
+    fn is_active(&self) -> bool;
+    /// A play packet the network thread received, decoded, with its id and payload as they came.
+    /// The recorder decides what it keeps.
+    fn received(&self, packet: &play::Clientbound, id: i32, payload: &[u8]);
+    /// A packet the client made for the recording, encoded, stamped now.
+    fn record_packet(&self, id: i32, payload: &[u8]);
+    fn status(&self) -> RecorderStatus;
+    /// Finishes the recording; the file it wrote.
+    fn stop(self: Box<Self>) -> std::io::Result<PathBuf>;
+}
+
+/// Where a recording stands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecorderStatus {
+    pub active: bool,
+    pub path: PathBuf,
+    pub elapsed: Duration,
+    pub packet_count: u64,
+    pub bytes_written: u64,
+    pub error: Option<String>,
+}
+
+/// The session's recorder, shared with its network thread.
+type RecorderSlot = Arc<Mutex<Option<Box<dyn PacketRecorder>>>>;
 
 /// What the network thread reports to the game.
 pub enum Event {
@@ -46,8 +89,8 @@ pub enum Event {
     Brand(String),
     /// The server runs mods' quiet commands (`horizon_protocol::quiet`).
     QuietCommands,
-    /// The server carries mod messages (`horizon_protocol::mod_net`).
-    ModNet,
+    /// The server supports private custom recipe-book synchronization.
+    CustomBooks,
     /// The server samples far terrain for this client (`lod_net`).
     FarTerrain(crate::lod_net::Offer),
     /// ClientConfigurationPacketListenerImpl.handleEnabledFeatures.
@@ -59,6 +102,8 @@ pub enum Event {
         name: String,
     },
     Packet(Box<play::Clientbound>),
+    /// Registered application bytes, owned until the receiving root transaction ends.
+    RawPayload(Box<crate::raw_payloads::Incoming>),
     /// A packet that failed to decode (skipped, like vanilla's skippable packets).
     DecodeError(String),
     /// The server sent us back to configuration (`ClientboundStartConfigurationPacket`):
@@ -71,7 +116,7 @@ pub enum Event {
     /// ClientboundResourcePackPopPacket: one pack, or every pack.
     PackPop(Option<u128>),
     /// `show_dialog` in configuration: the dialog itself.
-    ShowDialog(horizon_world::nbt::Tag),
+    ShowDialog(horizon_core::nbt::Tag),
     /// `clear_dialog` in configuration.
     ClearDialog,
     /// ClientboundCodeOfConductPacket: the game shows it and answers with
@@ -100,9 +145,66 @@ pub enum Event {
     },
 }
 
+fn event_channel() -> (ingress::Producer<Event>, ingress::Consumer<Event>) {
+    ingress::channel(96 << 20, Event::ingress_charge).expect("positive incoming byte budget")
+}
+impl Event {
+    fn ingress_charge(&self) -> usize {
+        use horizon_protocol::retained::OwnedHeap;
+        use std::mem::{align_of, size_of};
+        let dynamic = |value: &Dynamic| {
+            size_of::<Dynamic>() + 2 * size_of::<usize>() + align_of::<Dynamic>() - 1
+                + value.fresh_owned_heap_bytes()
+        };
+        let owned = match self {
+            Self::Status(s) | Self::Brand(s) | Self::DecodeError(s) | Self::CodeOfConduct(s) => {
+                s.capacity()
+            }
+            Self::QuietCommands
+            | Self::CustomBooks
+            | Self::Reconfiguring
+            | Self::ClearDialog
+            | Self::PackPop(_) => 0,
+            Self::FarTerrain(crate::lod_net::Offer {
+                distance: _,
+                in_flight: _,
+                per_second: _,
+            }) => 0,
+            Self::Features(values) => values.owned_heap_bytes(),
+            // configure only inserts/replaces before freezing these snapshots.
+            Self::Joined {
+                registries,
+                uuid: _,
+                name,
+            } => dynamic(registries).saturating_add(name.capacity()),
+            Self::Reconfigured(registries) => dynamic(registries),
+            Self::Packet(packet) => {
+                size_of::<play::Clientbound>().saturating_add(packet.as_ref().owned_heap_bytes())
+            }
+            Self::RawPayload(incoming) => size_of::<crate::raw_payloads::Incoming>()
+                .saturating_add(incoming.owned_heap_bytes()),
+            Self::PackPush(packet) => packet.owned_heap_bytes(),
+            Self::ShowDialog(tag) => tag.owned_heap_bytes(),
+            Self::Transfer { host, port: _ } => host.capacity(),
+            Self::ServerLinks(links) => links.owned_heap_bytes(),
+            Self::Disconnected {
+                reason,
+                key,
+                from_server: _,
+            } => reason.capacity().saturating_add(key.owned_heap_bytes()),
+        };
+        // Layout-derived allowance for a frozen receiving vector, actor backlog,
+        // decoder marker and retained receipt, including vector spare capacity.
+        // Raw application buffers themselves are never multiplied.
+        owned.saturating_add(8 * size_of::<(Self, ingress::ReceiveLease<Self>, usize, usize)>())
+    }
+}
+
 pub struct Session {
-    events: Receiver<Event>,
-    writer: Arc<Mutex<Option<ConnWriter>>>,
+    events: ingress::Consumer<Event>,
+    payload_events: ingress::Producer<Event>,
+    payloads: Arc<crate::raw_payloads::Transport>,
+    writer: Arc<Mutex<Option<QueuedWriter>>>,
     /// The connection is in configuration (else in play). Changed only
     /// with `writer` locked, as the packet that switches is sent.
     configuring: Arc<AtomicBool>,
@@ -116,10 +218,41 @@ pub struct Session {
     debug: bool,
     /// The far terrain requests waiting for the server (`lod_net`).
     far: Arc<crate::lod_net::Inbox>,
-    /// Active packet recorder for Studio replay recordings.
-    pub recorder: Arc<Mutex<Option<StudioRecorder>>>,
+    /// The recording running, if any.
+    recorder: RecorderSlot,
+    /// This connection's number, new for each one ([`Session::serial`]).
+    serial: u64,
 }
+/// The next [`Session::serial`].
+static NEXT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn next_serial() -> u64 {
+    NEXT_SERIAL.fetch_add(1, Ordering::Relaxed)
+}
+use std::path::PathBuf;
+
 impl Session {
+    /// A number of its own for each connection, never 0: entity ids are per connection, so what
+    /// is kept by id goes when it changes (`horizon_hooks::players::PlayerModels::connection`).
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+    /// The negotiated wire release, once the connection has been established.
+    pub fn server_version(&self) -> horizon_protocol::adapter::ServerVersion {
+        self.writer.lock().unwrap().as_ref().map_or(
+            horizon_protocol::adapter::ServerVersion::Current,
+            QueuedWriter::server_version,
+        )
+    }
+
+    /// Secure-chat enforcement synchronized later than login on older servers.
+    pub fn legacy_secure_chat_enforcement(&self) -> Option<bool> {
+        self.writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(QueuedWriter::legacy_secure_chat_enforcement)
+    }
+
     /// Start connecting in the background, as `auth`'s account when there is one.
     pub fn connect(
         address: &str,
@@ -127,7 +260,7 @@ impl Session {
         auth: Option<Arc<AuthSession>>,
         info: cfg::ClientInformation,
         lang: Arc<Language>,
-        resources: PathBuf,
+        resources: Arc<ItemData>,
     ) -> Self {
         Self::start(
             address, name, auth, info, lang, None, None, resources, false,
@@ -142,7 +275,7 @@ impl Session {
         auth: Option<Arc<AuthSession>>,
         info: cfg::ClientInformation,
         lang: Arc<Language>,
-        resources: PathBuf,
+        resources: Arc<ItemData>,
     ) -> Self {
         Self::start(address, name, auth, info, lang, None, None, resources, true)
     }
@@ -155,7 +288,7 @@ impl Session {
         info: cfg::ClientInformation,
         lang: Arc<Language>,
         cookies: Cookies,
-        resources: PathBuf,
+        resources: Arc<ItemData>,
     ) -> Self {
         Self::start(
             address,
@@ -169,18 +302,22 @@ impl Session {
             false,
         )
     }
-    /// Join an integrated server through memory (`Connection.connectToLocalServer`).
+    /// Join an integrated server through memory (`Connection.connectToLocalServer`). The
+    /// hello still names the signed-in account (`Minecraft.handleClientLogin`'s
+    /// `ServerboundHelloPacket(getUser().getName(), getUser().getProfileId())`), so the
+    /// world's `players/data/<uuid>.dat` and `singleplayer_uuid` are the account's.
     pub fn connect_local(
         pipe: horizon_protocol::connection::Pipe,
         name: &str,
+        auth: Option<Arc<AuthSession>>,
         info: cfg::ClientInformation,
         lang: Arc<Language>,
-        resources: PathBuf,
+        resources: Arc<ItemData>,
     ) -> Self {
         Self::start(
             "local",
             name,
-            None,
+            auth,
             info,
             lang,
             Some(pipe),
@@ -188,6 +325,26 @@ impl Session {
             resources,
             false,
         )
+    }
+    /// A lightweight session for studio replay playback without background network IO.
+    pub fn replay(name: &str) -> Self {
+        let (_send, events) = event_channel();
+        Self {
+            payload_events: _send,
+            events,
+            writer: Arc::new(Mutex::new(None)),
+            configuring: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            payloads: crate::raw_payloads::Transport::empty(),
+            address: "studio-replay".to_owned(),
+            name: name.to_owned(),
+            counters: Arc::new(Mutex::new(None)),
+            cookies: Default::default(),
+            debug: false,
+            far: Arc::new(crate::lod_net::Inbox::default()),
+            recorder: Arc::new(Mutex::new(None)),
+            serial: next_serial(),
+        }
     }
     fn start(
         address: &str,
@@ -197,10 +354,18 @@ impl Session {
         lang: Arc<Language>,
         local: Option<horizon_protocol::connection::Pipe>,
         cookies: Option<Cookies>,
-        resources: PathBuf,
+        resources: Arc<ItemData>,
         lan: bool,
     ) -> Self {
-        let (send, events) = channel();
+        let (send, events) = event_channel();
+        let payload_events = send.clone();
+        let captured_payloads =
+            crate::raw_payloads::Transport::capture(crate::raw_payloads::Side::Client);
+        let payloads = captured_payloads
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|_| crate::raw_payloads::Transport::empty());
+        let thread_payloads = payloads.clone();
         let writer = Arc::new(Mutex::new(None));
         let configuring = Arc::new(AtomicBool::new(true));
         let counters = Arc::new(Mutex::new(None));
@@ -216,10 +381,11 @@ impl Session {
         let recorder = Arc::new(Mutex::new(None));
         let thread_recorder = recorder.clone();
         let (address_owned, name_owned) = (address.to_owned(), name.to_owned());
-        let thread = std::thread::Builder::new()
-            .name("horizon-net".into())
-            .spawn(move || {
-                let result = run(
+        // Payload handlers of wasm mods run on this thread (the client's network root).
+        let thread = horizon_guest_stack::spawn("horizon-net".into(), move || {
+            horizon_threads::favour_current();
+            let result = captured_payloads.map_err(Reason::plain).and_then(|_| {
+                run(
                     local,
                     &address_owned,
                     &name_owned,
@@ -236,23 +402,37 @@ impl Session {
                     &resources,
                     lan,
                     &thread_recorder,
-                );
-                thread_far.cancel();
-                let from_server = result.is_ok();
-                let why = result.unwrap_or_else(|e| e);
-                if let Some(w) = thread_writer.lock().unwrap().take() {
-                    w.shutdown();
-                }
-                let _ = send.send(Event::Disconnected {
-                    reason: why.text,
-                    key: why.key,
-                    from_server,
-                });
-            })
-            .ok();
+                    &thread_payloads,
+                )
+            });
+            thread_payloads.close();
+            thread_far.cancel();
+            let from_server = result.is_ok();
+            let why = result.unwrap_or_else(|e| e);
+            if let Some(w) = thread_writer.lock().unwrap().take() {
+                w.shutdown();
+            }
+            // Nothing else tells the game the connection ended: wait for room (#18380).
+            let _ = send.send_waiting(Event::Disconnected {
+                reason: why.text,
+                key: why.key,
+                from_server,
+            });
+        })
+        .inspect_err(|error| {
+            // No reader runs to report the end: say it here, or the session waits forever.
+            let _ = payload_events.send(Event::Disconnected {
+                reason: format!("network thread: {error}"),
+                key: None,
+                from_server: false,
+            });
+        })
+        .ok();
         let debug = std::env::var_os("HORIZON_NET_DEBUG").is_some();
         Self {
             events,
+            payload_events,
+            payloads,
             writer,
             configuring,
             thread,
@@ -263,21 +443,75 @@ impl Session {
             debug,
             far,
             recorder,
+            serial: next_serial(),
         }
     }
-    /// Everything received since the last poll.
-    pub fn poll(&self) -> Vec<Event> {
-        self.events.try_iter().collect()
-    }
-    /// Start recording network packets to `.mcpr` format at `path`.
-    pub fn start_recording(
+    /// Validate an untrusted mod packet once, reserve its physical writer credit,
+    /// and return an invisible root-publication record. This is not Session::send:
+    /// registered/engine channels must use their authority-aware service API.
+    pub fn prepare_mod_packet(
         &self,
-        path: impl Into<PathBuf>,
-        metadata: Metadata,
-    ) -> std::io::Result<()> {
-        let rec = StudioRecorder::start(path.into(), metadata)?;
-        *self.recorder.lock().unwrap() = Some(rec);
-        Ok(())
+        packet: mod_api::ServerboundPlayPacket,
+    ) -> std::result::Result<PreparedPacket, mod_api::SendPacketError> {
+        use horizon_protocol::{
+            buf::{Codec, Ident, Reader, Writer},
+            packets::custom_payload,
+        };
+        use mod_api::SendPacketError;
+        let id = match packet.id.namespace() {
+            "minecraft" => horizon_protocol::ids::play::serverbound::NAMES
+                .iter()
+                .position(|name| *name == packet.id.path()),
+            _ => None,
+        }
+        .ok_or(SendPacketError::UnknownPacket { id: packet.id })? as i32;
+        if id == horizon_protocol::ids::play::serverbound::CUSTOM_PAYLOAD {
+            // Check ownership before copying a potentially large application body.
+            // Ident is the same identifier boundary used by the packet codec.
+            let mut reader = Reader::new(&packet.body);
+            let channel = Ident::read(&mut reader).map_err(|_| SendPacketError::InvalidBody)?;
+            if self.payloads.local.owns(&channel) || custom_payload::is_reserved_channel(&channel) {
+                return Err(SendPacketError::ProtectedPayload {
+                    id: mod_api::PayloadId(channel),
+                });
+            }
+            if reader.remaining() > custom_payload::SERVERBOUND_LIMIT {
+                return Err(SendPacketError::PayloadTooLarge {
+                    size: reader.remaining() as u64,
+                    limit: custom_payload::SERVERBOUND_LIMIT as u64,
+                });
+            }
+        } else {
+            play::Serverbound::decode(id, &packet.body)
+                .map_err(|_| SendPacketError::InvalidBody)?;
+        }
+        let mut encoded = Writer::new();
+        encoded.varint(id);
+        encoded.bytes(&packet.body);
+        let writer = self
+            .writer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or(SendPacketError::NotConnected)?;
+        writer.prepare_packet(encoded.data)
+    }
+    /// The frozen receiving turn, retaining every input credit through its actor.
+    #[horizon_mod_api_macros::replaceable]
+    pub fn poll(&self) -> Vec<ingress::OwnedReceipt<Event>> {
+        self.events.take_turn()
+    }
+    /// Starts recording into `recorder`. `initialize` runs first, while the network thread
+    /// can't record, so what it writes (a snapshot of the world) comes before any live packet.
+    pub fn start_recording<R: PacketRecorder + 'static>(
+        &self,
+        recorder: R,
+        initialize: impl FnOnce(&R),
+    ) {
+        let mut slot = self.recorder.lock().unwrap();
+        initialize(&recorder);
+        *slot = Some(Box::new(recorder));
     }
     /// Stop recording and finalize the `.mcpr` archive.
     pub fn stop_recording(&self) -> Option<std::io::Result<PathBuf>> {
@@ -296,6 +530,50 @@ impl Session {
     pub fn recorder_status(&self) -> Option<RecorderStatus> {
         self.recorder.lock().unwrap().as_ref().map(|r| r.status())
     }
+    /// Record an encoded Clientbound packet into the active recording session at current elapsed time.
+    pub fn record_clientbound(&self, packet: &horizon_protocol::packets::play::Clientbound) {
+        if self.is_recording() {
+            let encoded = packet.encode();
+            let mut reader = horizon_protocol::buf::Reader::new(&encoded);
+            if let Ok(id) = reader.varint()
+                && let Some(rec) = self.recorder.lock().unwrap().as_ref()
+            {
+                rec.record_packet(id, reader.rest());
+            }
+        }
+    }
+    /// Physical reply target, preserving this session's ordered event stream.
+    pub fn payload_endpoint(&self) -> crate::raw_payloads::Endpoint {
+        crate::raw_payloads::Endpoint::client(
+            self.writer.clone(),
+            self.configuring.clone(),
+            self.payloads.clone(),
+            self.payload_events.clone(),
+        )
+    }
+    /// This physical session's frozen declarations and current epoch.
+    pub fn payload_transport(&self) -> &Arc<crate::raw_payloads::Transport> {
+        &self.payloads
+    }
+    /// Prepare a registered payload without publishing it before root commit.
+    /// The caller resolves its channel against the frozen peer table first.
+    pub fn prepare_payload(
+        &self,
+        phase: horizon_protocol::payload_negotiation::Phase,
+        body: Vec<u8>,
+        id: &mod_api::PayloadId,
+    ) -> Result<PreparedPayload, mod_api::PayloadSendError> {
+        let writer = self.writer.lock().unwrap();
+        if self.configuring.load(Ordering::Relaxed)
+            != (phase == horizon_protocol::payload_negotiation::Phase::Configuration)
+        {
+            return Err(mod_api::PayloadSendError::WrongProtocol(id.clone()));
+        }
+        writer
+            .as_ref()
+            .ok_or(mod_api::PayloadSendError::Disconnected)?
+            .prepare_payload(body, id)
+    }
     /// Send a play packet; silently dropped once the connection is gone,
     /// and while the server has the connection back in configuration (a
     /// proxy switching servers). Vanilla's `handleConfigurationStart` clears
@@ -313,12 +591,19 @@ impl Session {
         {
             eprintln!("[net] -> {packet:?}");
         }
+        let body = match packet.try_encode() {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("[net] send refused: {error}");
+                return;
+            }
+        };
         let mut writer = self.writer.lock().unwrap();
         if self.configuring.load(Ordering::Relaxed) {
             return;
         }
         if let Some(w) = writer.as_mut()
-            && w.send(&packet.encode()).is_err()
+            && w.send(&body).is_err()
         {
             w.shutdown();
         }
@@ -370,7 +655,7 @@ impl Session {
     }
     /// ServerboundCustomClickActionPacket (a dialog's answer), in whichever
     /// phase the connection is.
-    pub fn send_custom_click(&self, id: &str, payload: Option<horizon_world::nbt::Tag>) {
+    pub fn send_custom_click(&self, id: &str, payload: Option<horizon_core::nbt::Tag>) {
         let click = cfg::CustomClickAction {
             id: id.to_owned(),
             payload,
@@ -402,6 +687,7 @@ impl Session {
     /// doesn't wake a read already waiting, so joining it held the window until
     /// the server dropped the connection, many seconds later.
     pub fn disconnect(&mut self) {
+        self.payloads.close();
         if let Some(w) = self.writer.lock().unwrap().take() {
             w.shutdown();
         }
@@ -415,31 +701,52 @@ impl Drop for Session {
 }
 
 /// An address of the form `friend:K7QM-3XPD` joins a friend's world through
-/// its invite code (horizon-friends): the session goes through a tunnel the
-/// client reaches on a loopback port, so everything after is a plain join.
-pub const FRIEND: &str = horizon_friends::ADDRESS_PREFIX;
+/// its invite code (Play with Friends, through a hook's [`tunnel::Resolver`]):
+/// the session goes through a tunnel the client reaches on a loopback port, so
+/// everything after is a plain join.
+pub const FRIEND: &str = tunnel::PREFIX;
+
+/// Whether `code` is an invite code; with `full`, only a full one (a short
+/// relay code could also be a host name). Without a resolver nothing is one.
+pub fn is_invite(code: &str, full: bool) -> bool {
+    horizon_hooks::engine::tunnel().is_some_and(|r| r.is_code(code, full))
+}
+
+/// Whether an invite code can be joined: a resolver is registered (horizon-official registers
+/// horizon-friends'). The title screen's Friends icon, which opens Join a Friend, is inactive
+/// without one, as the pause menu's is without a page to share from.
+pub fn joins_friends() -> bool {
+    #[cfg(test)]
+    if JOINS_FRIENDS_IN_TEST.get() {
+        return true;
+    }
+    horizon_hooks::engine::tunnel().is_some()
+}
+#[cfg(test)]
+thread_local! {
+    /// A test's stand-in for a registered resolver: the registry is the process's and sealed.
+    pub(crate) static JOINS_FRIENDS_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// An address as players and logs see it: a friend's invite code stays
 /// out of it (its secret is in there).
 pub fn shown_address(address: &str) -> String {
     match address.strip_prefix(FRIEND) {
-        Some(code) => match horizon_friends::invite::parse(code) {
-            Some(horizon_friends::invite::Parsed::Short(c)) => {
-                format!("Friend's world ({}-****)", c.nameplate)
-            }
-            _ => "Friend's world".to_owned(),
+        Some(code) => match horizon_hooks::engine::tunnel().and_then(|r| r.nameplate(code)) {
+            Some(nameplate) => format!("Friend's world ({nameplate}-****)"),
+            None => "Friend's world".to_owned(),
         },
         None => address.to_owned(),
     }
 }
 
 /// The relay the player set (`friendsRelay` in horizon.txt, beside
-/// options.txt), else `HORIZON_RELAY_URL`. None by default.
+/// options.txt), else the resolver's (`HORIZON_RELAY_URL`). None by default.
 pub fn friends_relay_setting() -> Option<String> {
     let dir = std::env::current_dir().ok()?;
     crate::ui_theme::preference(&dir, "friendsRelay")
         .filter(|r| !r.is_empty())
-        .or_else(horizon_friends::relay_url)
+        .or_else(|| horizon_hooks::engine::tunnel().and_then(|r| r.relay_from_env()))
 }
 /// Remember the relay typed on Join a friend (empty forgets it).
 pub fn save_friends_relay(relay: &str) {
@@ -449,36 +756,39 @@ pub fn save_friends_relay(relay: &str) {
 }
 
 /// Reach the friend's world from the code (directly, or through a relay)
-/// and open the tunnel: the loopback address to connect to.
-fn join_friend(code: &str, lang: &Language, send: &Sender<Event>) -> Result<(String, u16), Reason> {
-    use horizon_friends::{
-        PathMode,
-        guest::{self, GuestConfig},
+/// and open the tunnel: the loopback address to connect to, and the token to send on it first.
+/// Without a resolver (a build without Play with Friends) the address is refused, never retried.
+fn join_friend(
+    code: &str,
+    lang: &Language,
+    send: &ingress::Producer<Event>,
+) -> Result<(String, u16, Vec<u8>), Reason> {
+    let Some(resolver) = horizon_hooks::engine::tunnel() else {
+        return Err(Reason::keyed_arg(
+            "horizon.multiplayer.invalid_address",
+            lang,
+            &shown_address(&format!("{FRIEND}{code}")),
+        ));
     };
-    status(send, &tr(lang, "horizon.multiplayer.finding_friend"));
-    let tunnel = guest::join(&GuestConfig {
-        code: code.to_owned(),
-        relay: friends_relay_setting(),
-        protocol: PROTOCOL_VERSION,
-        game: horizon_protocol::GAME_VERSION.to_owned(),
-        path: PathMode::from_env(),
-    })
-    .map_err(|e| Reason::plain(e.to_string()))?;
-    status(
-        send,
-        &if tunnel.direct {
-            tr(lang, "horizon.multiplayer.connected_friend_direct")
-        } else {
-            tr(lang, "horizon.multiplayer.connected_friend_relay")
-        },
-    );
-    let (port, _) = tunnel
-        .serve_loopback()
-        .map_err(|e| Reason::plain(e.to_string()))?;
-    Ok(("127.0.0.1".to_owned(), port))
+    let mut progress = |p: tunnel::Progress| {
+        let key = match p {
+            tunnel::Progress::Finding => "horizon.multiplayer.finding_friend",
+            tunnel::Progress::Connected { direct: true } => {
+                "horizon.multiplayer.connected_friend_direct"
+            }
+            tunnel::Progress::Connected { direct: false } => {
+                "horizon.multiplayer.connected_friend_relay"
+            }
+        };
+        status(send, &tr(lang, key));
+    };
+    let opened = resolver
+        .open(code, friends_relay_setting(), &mut progress)
+        .map_err(Reason::plain)?;
+    Ok(("127.0.0.1".to_owned(), opened.port, opened.token))
 }
 
-fn status(send: &Sender<Event>, text: &str) {
+fn status(send: &ingress::Producer<Event>, text: &str) {
     let _ = send.send(Event::Status(text.to_owned()));
 }
 
@@ -642,21 +952,22 @@ fn run(
     auth: Option<&AuthSession>,
     info: cfg::ClientInformation,
     lang: &Language,
-    send: &Sender<Event>,
-    shared_writer: &Mutex<Option<ConnWriter>>,
-    configuring: &AtomicBool,
+    send: &ingress::Producer<Event>,
+    shared_writer: &Arc<Mutex<Option<QueuedWriter>>>,
+    configuring: &Arc<AtomicBool>,
     shared_counters: &Mutex<Option<Arc<Counters>>>,
     cookies: &Cookies,
     far: &crate::lod_net::Inbox,
     transferred: bool,
-    resources: &Path,
+    resources: &ItemData,
     lan: bool,
-    recorder: &Arc<Mutex<Option<StudioRecorder>>>,
+    recorder: &RecorderSlot,
+    payloads: &Arc<crate::raw_payloads::Transport>,
 ) -> Result<Reason, Reason> {
     let (host, port, mut c) = if let Some(pipe) = local {
         (address.to_owned(), 0, Connection::local(pipe))
     } else {
-        let (host, port) = match address.strip_prefix(FRIEND) {
+        let (host, port, token) = match address.strip_prefix(FRIEND) {
             Some(code) => join_friend(code, lang, send)?,
             None => {
                 let Some(target) = parse_address(address) else {
@@ -670,12 +981,18 @@ fn run(
                 };
                 status(send, &tr(lang, "connect.connecting"));
                 log_connecting(&target.0, target.1);
-                target
+                (target.0, target.1, Vec::new())
             }
         };
         let (mut c, host, port) =
             connect_tcp(&host, port, address.starts_with(FRIEND), READ_TIMEOUT)
                 .map_err(Reason::plain)?;
+        // The tunnel's port takes only the client that sends its token first.
+        if !token.is_empty() {
+            c.writer
+                .write_raw(&token)
+                .map_err(|e| Reason::plain(e.to_string()))?;
+        }
         if !address.starts_with(FRIEND)
             && let Some(version) = older_server(address)
         {
@@ -803,13 +1120,15 @@ fn run(
             channel: "minecraft:brand".into(),
             data: brand(),
         })
-        .encode(),
+        .try_encode()
+        .map_err(e)?,
     )
     .map_err(e)?;
     c.send(&cfg::Serverbound::ClientInformation(info).encode())
         .map_err(e)?;
     let (mut reader, writer) = c.split();
-    *shared_writer.lock().unwrap() = Some(writer);
+    *shared_writer.lock().unwrap() =
+        Some(QueuedWriter::new(writer).map_err(|error| Reason::plain(error.to_string()))?);
     let registries = configure(
         &mut reader,
         shared_writer,
@@ -818,12 +1137,18 @@ fn run(
         send,
         cookies,
         resources,
+        payloads,
+        true,
     )?;
-    let _ = send.send(Event::Joined {
-        registries: Arc::new(registries),
-        uuid: profile.uuid,
-        name: profile.name,
-    });
+    deliver(
+        send,
+        lang,
+        Event::Joined {
+            registries: Arc::new(registries),
+            uuid: profile.uuid,
+            name: profile.name,
+        },
+    )?;
     receive_play(
         &mut reader,
         shared_writer,
@@ -834,27 +1159,36 @@ fn run(
         far,
         resources,
         recorder,
+        payloads,
     )
 }
 
 fn receive_play(
     reader: &mut ConnReader,
-    shared_writer: &Mutex<Option<ConnWriter>>,
-    configuring: &AtomicBool,
+    shared_writer: &Arc<Mutex<Option<QueuedWriter>>>,
+    configuring: &Arc<AtomicBool>,
     lang: &Language,
-    send: &Sender<Event>,
+    send: &ingress::Producer<Event>,
     cookies: &Cookies,
     far: &crate::lod_net::Inbox,
-    resources: &Path,
-    recorder: &Arc<Mutex<Option<StudioRecorder>>>,
+    resources: &ItemData,
+    recorder: &RecorderSlot,
+    payloads: &Arc<crate::raw_payloads::Transport>,
 ) -> Result<Reason, Reason> {
     loop {
         let (id, payload) = reader
             .recv()
             .map_err(|e| Reason::plain(connection_lost(e, lang)))?;
-        let packet = match play::Clientbound::decode(id, &payload) {
+        let packet = match play::Clientbound::decode_with_payload_codecs(
+            id,
+            &payload,
+            &payloads.local.codecs,
+        ) {
             Ok(p) => p,
             Err(err) => {
+                if id == horizon_protocol::ids::play::clientbound::CUSTOM_PAYLOAD {
+                    return Err(Reason::plain(format!("custom play payload refused: {err}")));
+                }
                 let name = horizon_protocol::ids::name(
                     horizon_protocol::State::Play,
                     horizon_protocol::Direction::Clientbound,
@@ -865,14 +1199,10 @@ fn receive_play(
                 continue;
             }
         };
-        // Only while a recording runs: the filter copies what it keeps, and re-encodes
-        // AddEntity with a fresh UUID.
         if let Some(rec) = recorder.lock().unwrap().as_ref()
             && rec.is_active()
-            && let Some((recorded_id, recorded_payload)) =
-                studio_recording_packet(&packet, id, &payload)
         {
-            rec.record_packet(recorded_id, &recorded_payload);
+            rec.received(&packet, id, &payload);
         }
         let reply = |p: play::Serverbound| {
             if let Some(w) = shared_writer.lock().unwrap().as_mut() {
@@ -889,11 +1219,29 @@ fn receive_play(
                 let _ = send.send(Event::PackPop(p.id));
             }
             play::Clientbound::StartConfiguration(_) => {
-                let _ = send.send(Event::Reconfiguring);
-                if let Some(w) = shared_writer.lock().unwrap().as_mut() {
-                    let _ = w.send(&play::Serverbound::ConfigurationAcknowledged(Empty).encode());
-                    configuring.store(true, Ordering::Relaxed);
+                payloads.begin_configuration();
+                {
+                    // The game encodes its answers by `configuring`, read under this
+                    // lock: it turns only once the acknowledgement is queued, or an
+                    // answer could reach the server as configuration while it still
+                    // reads play (#18380).
+                    let mut writer = shared_writer.lock().unwrap();
+                    #[cfg(test)]
+                    tests::observe_phase_at_acknowledgement(configuring);
+                    if let Some(w) = writer.as_mut() {
+                        w.transition_protocol(
+                            horizon_protocol::payload_negotiation::Phase::Configuration,
+                            &play::Serverbound::ConfigurationAcknowledged(Empty).encode(),
+                        )
+                        .map_err(|error| Reason::plain(connection_lost(error, lang)))?;
+                    }
+                    configuring.store(true, Ordering::Release);
                 }
+                // Past the budget rather than waiting for it: configuration's keepalives
+                // and known packs are answered on this thread, while the game is stalled
+                // too. The game still gets the notice, in order.
+                send.send_over_budget(Event::Reconfiguring)
+                    .map_err(|refused| refusal(refused, lang))?;
                 let registries = configure(
                     reader,
                     shared_writer,
@@ -902,8 +1250,10 @@ fn receive_play(
                     send,
                     cookies,
                     resources,
+                    payloads,
+                    false,
                 )?;
-                let _ = send.send(Event::Reconfigured(Arc::new(registries)));
+                deliver(send, lang, Event::Reconfigured(Arc::new(registries)))?;
             }
             // ClientCommonPacketListenerImpl.handleRequestCookie: the stored
             // cookie (or none) goes straight back.
@@ -937,58 +1287,98 @@ fn receive_play(
             play::Clientbound::CustomPayload(p) if p.channel == crate::lod_net::CHANNEL => {
                 far.deliver(p.data);
             }
-            other => {
-                if send.send(Event::Packet(Box::new(other))).is_err() {
-                    return Ok(Reason::plain("Disconnected"));
+            play::Clientbound::CustomPayload(payload) => {
+                let endpoint = crate::raw_payloads::Endpoint::client(
+                    shared_writer.clone(),
+                    configuring.clone(),
+                    payloads.clone(),
+                    send.clone(),
+                );
+                if let Some(payload) = receive_application(
+                    &endpoint,
+                    horizon_protocol::payload_negotiation::Phase::Play,
+                    payload,
+                    send,
+                )? {
+                    deliver(
+                        send,
+                        lang,
+                        Event::Packet(Box::new(play::Clientbound::CustomPayload(payload))),
+                    )?;
                 }
             }
+            other => deliver(send, lang, Event::Packet(Box::new(other)))?,
         }
     }
 }
 
-/// Return the packet bytes safe to persist in a Studio recording.
-///
-/// Unknown packets fail closed so a newly added protocol packet cannot bypass
-/// the privacy policy. `AddEntity` retains its entity id and state, but gets a
-/// fresh UUID so the recording cannot link that entity to an account UUID.
-fn studio_recording_packet<'a>(
-    packet: &play::Clientbound,
-    packet_id: i32,
-    payload: &'a [u8],
-) -> Option<(i32, std::borrow::Cow<'a, [u8]>)> {
-    use play::Clientbound as P;
-    use std::borrow::Cow;
-    match packet {
-        P::AddEntity(entity) => {
-            let mut anonymous = entity.clone();
-            anonymous.uuid = u128::from_be_bytes(generate_secret().ok()?);
-            let encoded = P::AddEntity(anonymous).encode();
-            let mut reader = Reader::new(&encoded);
-            let id = reader.varint().ok()?;
-            Some((id, Cow::Owned(reader.rest().to_vec())))
+/// Hands the game an event it must not lose (a packet, a registry snapshot). While its
+/// incoming queue is full this waits, so the connection stops being read and the
+/// server's flow control holds it back: a game that stalls (a shader pack compiling)
+/// while a world's first view streams in no longer ends the connection (#18380).
+/// Events main already dropped under pressure keep `send`, so keepalives are still
+/// answered behind them.
+fn deliver(send: &ingress::Producer<Event>, lang: &Language, event: Event) -> Result<(), Reason> {
+    send.send_waiting(event)
+        .map_err(|refused| refusal(refused, lang))
+}
+
+/// Why an event the game must get was refused. One larger than the whole incoming queue
+/// is keyed, so auto-reconnect never retries it: the next attempt would hit it again.
+fn refusal(refused: ingress::Refused<Event>, lang: &Language) -> Reason {
+    match refused.reason {
+        ingress::Refusal::Pressure => Reason::keyed_arg(
+            "horizon.multiplayer.incoming_too_large",
+            lang,
+            &refused.value.ingress_charge().to_string(),
+        ),
+        ingress::Refusal::Closed => Reason::plain("Disconnected"),
+    }
+}
+
+fn receive_application(
+    endpoint: &crate::raw_payloads::Endpoint,
+    phase: horizon_protocol::payload_negotiation::Phase,
+    payload: cfg::CustomPayload,
+    send: &ingress::Producer<Event>,
+) -> Result<Option<cfg::CustomPayload>, Reason> {
+    let classified =
+        match crate::raw_payloads::Incoming::classify(endpoint.transport(), phase, payload) {
+            Ok(classified) => classified,
+            // A Horizon server from before the negotiation may still send on a channel this
+            // side declares (attachment sync goes to every Horizon-branded client): skip it,
+            // since nothing was negotiated to read it with.
+            Err(failure) => {
+                let silent = endpoint
+                    .transport()
+                    .epoch()
+                    .filter(|epoch| epoch.peer.silent());
+                match (silent, &failure.error) {
+                    (Some(epoch), mod_api::PayloadSendError::UnsupportedPeer(_)) => {
+                        if epoch.peer.first_skip() {
+                            log::info!(
+                                "Skipping {}: the server did not negotiate it",
+                                failure.id.0
+                            );
+                        }
+                        return Ok(None);
+                    }
+                    _ => return Err(Reason::plain(failure.to_string())),
+                }
+            }
+        };
+    match classified {
+        crate::raw_payloads::Classified::Other(payload) => Ok(Some(payload)),
+        crate::raw_payloads::Classified::Application(incoming) => {
+            crate::raw_payloads::dispatch(
+                incoming,
+                endpoint.clone(),
+                crate::raw_payloads::MainQueue::Client(send.clone()),
+            );
+            Ok(None)
         }
-        P::CookieRequest(_)
-        | P::CustomChatCompletions(_)
-        | P::CustomPayload(_)
-        | P::DeleteChat(_)
-        | P::Disconnect(_)
-        | P::DisguisedChat(_)
-        | P::PlayerChat(_)
-        | P::PlayerCombatKill(_)
-        | P::PlayerInfoRemove(_)
-        | P::PlayerInfoUpdate(_)
-        | P::ResetScore(_)
-        | P::ResourcePackPush(_)
-        | P::ServerLinks(_)
-        | P::SetPlayerTeam(_)
-        | P::SetScore(_)
-        | P::StoreCookie(_)
-        | P::SystemChat(_)
-        | P::TabList(_)
-        | P::TrackedWaypoint(_)
-        | P::Transfer(_)
-        | P::Unknown(..) => None,
-        _ => Some((packet_id, Cow::Borrowed(payload))),
+        // Raw channels are server-side: a client's table has none.
+        crate::raw_payloads::Classified::Raw(_) => Ok(None),
     }
 }
 
@@ -996,52 +1386,130 @@ fn studio_recording_packet<'a>(
 /// server finishes it (ClientConfigurationPacketListenerImpl).
 fn configure(
     reader: &mut ConnReader,
-    writer: &Mutex<Option<ConnWriter>>,
-    configuring: &AtomicBool,
+    writer: &Arc<Mutex<Option<QueuedWriter>>>,
+    configuring: &Arc<AtomicBool>,
     lang: &Language,
-    send: &Sender<Event>,
+    send: &ingress::Producer<Event>,
     cookies: &Cookies,
-    resources: &Path,
+    resources: &ItemData,
+    payloads: &Arc<crate::raw_payloads::Transport>,
+    // The connection's first configuration, not a reconfiguration from play.
+    initial: bool,
 ) -> Result<Dynamic, Reason> {
     let mut registries = Dynamic::default();
     let mut content_verified = false;
+    payloads.begin_configuration();
+    let mut negotiation =
+        horizon_protocol::payload_negotiation::Negotiation::new(payloads.local.manifest.clone());
+    crate::datapack_net::clear_received();
     let reply = |p: cfg::Serverbound| -> Result<(), Reason> {
         match writer.lock().unwrap().as_mut() {
-            Some(w) => w
-                .send(&p.encode())
+            Some(w) => p
+                .try_encode_with_payload_codecs(&payloads.local.codecs)
+                .and_then(|body| w.send(&body))
                 .map_err(|e| Reason::plain(connection_lost(e, lang))),
             None => Err(Reason::plain("Disconnected")),
         }
     };
+    // The server's build, once it names it (crate::build_mismatch), and whether this end
+    // named its own: both only in the first configuration.
+    let mut server_build = None::<String>;
+    let mut build_sent = !initial;
+    // A message on horizon:payloads, after this build's name the first time.
+    let send_control = |control: horizon_protocol::payload_negotiation::Control,
+                        build_sent: &mut bool|
+     -> Result<(), Reason> {
+        if !std::mem::replace(build_sent, true) {
+            reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                channel: crate::build_mismatch::CHANNEL.into(),
+                data: crate::build_mismatch::encode(&crate::build_mismatch::this_build()),
+            }))?;
+        }
+        reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+            channel: horizon_protocol::payload_negotiation::CHANNEL.into(),
+            data: control
+                .encode()
+                .map_err(|error| Reason::plain(error.to_string()))?,
+        }))
+    };
+    // A failed negotiation names both builds when they differ.
+    let refused = |error: horizon_protocol::payload_negotiation::Error,
+                   server_build: &Option<String>| {
+        negotiation_refused(initial, server_build.as_deref(), &error.to_string())
+    };
+    // With only engine declarations the client waits for the server's query, so a vanilla
+    // server is sent nothing new.
+    if payloads.local.has_mod_declarations()
+        && let Some(control) = negotiation.initial()
+    {
+        send_control(control, &mut build_sent)?;
+    }
     loop {
         let (id, payload) = reader
             .recv()
             .map_err(|e| Reason::plain(connection_lost(e, lang)))?;
-        match cfg::Clientbound::decode(id, &payload)
+        match cfg::Clientbound::decode_with_payload_codecs(id, &payload, &payloads.local.codecs)
             .map_err(|e| Reason::plain(connection_lost(e, lang)))?
         {
             cfg::Clientbound::KeepAlive(k) => reply(cfg::Serverbound::KeepAlive(k))?,
+            cfg::Clientbound::CustomPayload(p) if p.channel == crate::build_mismatch::CHANNEL => {
+                server_build = crate::build_mismatch::decode(&p.data);
+            }
+            cfg::Clientbound::CustomPayload(p)
+                if p.channel == horizon_protocol::payload_negotiation::CHANNEL =>
+            {
+                let control = horizon_protocol::payload_negotiation::Control::decode(&p.data)
+                    .map_err(|error| refused(error, &server_build))?;
+                if let Some(control) = negotiation
+                    .receive(control)
+                    .map_err(|error| refused(error, &server_build))?
+                {
+                    send_control(control, &mut build_sent)?;
+                }
+                if let Some(accepted) = negotiation.accepted() {
+                    payloads.accept(accepted).map_err(Reason::plain)?;
+                }
+            }
             cfg::Clientbound::CustomPayload(p) if p.channel == crate::content_identity::CHANNEL => {
-                let hash = crate::content_identity::identity(resources)
-                    .map_err(|_| Reason::plain(crate::content_identity::MISMATCH.to_string()))?;
-                content_verified = p.data == hash;
+                let hash =
+                    crate::content_identity::identity(resources.root(), resources.defaults())
+                        .map_err(|_| {
+                            Reason::plain(crate::content_identity::MISMATCH.to_string())
+                        })?;
+                content_verified = crate::content_identity::decode_payload(&p.data)
+                    .map_err(|error| Reason::plain(error.to_string()))?
+                    == Some(hash);
                 reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
                     channel: crate::content_identity::CHANNEL.into(),
                     data: hash.to_vec(),
                 }))?;
             }
-            // The server names its mods; the answer is ours, and the server judges.
-            cfg::Clientbound::CustomPayload(p)
-                if p.channel == horizon_protocol::mod_list::CHANNEL =>
-            {
-                reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
-                    channel: horizon_protocol::mod_list::CHANNEL.into(),
-                    data: horizon_protocol::mod_list::encode(&horizon_protocol::mod_list::shared(
-                        &horizon_protocol::mod_list::local(),
-                    )),
-                }))?;
+            cfg::Clientbound::CustomPayload(p) if crate::viewed_levels_net::asked(&p) => {
+                reply(crate::viewed_levels_net::answer(&p.data).map_err(Reason::plain)?)?
+            }
+            cfg::Clientbound::CustomPayload(p) if crate::menu_extra_net::asked(&p) => {
+                reply(crate::menu_extra_net::answer(&p.data).map_err(Reason::plain)?)?;
+                registries.menu_extra_revision = horizon_protocol::menu_extra::REVISION;
+            }
+            cfg::Clientbound::CustomPayload(p) if p.channel == crate::datapack_net::CHANNEL => {
+                crate::datapack_net::accept_chunk(&p.data).map_err(Reason::plain)?;
             }
             cfg::Clientbound::CustomPayload(p) => {
+                let endpoint = crate::raw_payloads::Endpoint::client(
+                    writer.clone(),
+                    configuring.clone(),
+                    payloads.clone(),
+                    send.clone(),
+                );
+                let Some(p) = receive_application(
+                    &endpoint,
+                    horizon_protocol::payload_negotiation::Phase::Configuration,
+                    p,
+                    send,
+                )?
+                else {
+                    continue;
+                };
                 // Horizon servers use the client brand to negotiate their extensions.
                 // Announce those only after the server identifies itself as Horizon.
                 if p.channel == "minecraft:brand"
@@ -1051,12 +1519,30 @@ fn configure(
                         .as_deref()
                         == Some("horizon")
                 {
+                    if let Some(control) = negotiation.require_protocol() {
+                        send_control(control, &mut build_sent)?;
+                    }
                     let mut w = horizon_protocol::buf::Writer::new();
                     w.string("horizon");
                     reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
                         channel: "minecraft:brand".into(),
                         data: w.data,
                     }))?;
+                    // Announce before replying to known packs, even when the
+                    // server has no mods. Never disclose this to vanilla servers.
+                    reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                        channel: horizon_protocol::mod_list::CHANNEL.into(),
+                        data: horizon_protocol::mod_list::encode(
+                            &horizon_protocol::mod_list::local(),
+                        ),
+                    }))?;
+                    // And the mods' datapack registries it has (arismoko/horizon#811).
+                    if let Some(data) = crate::datapack_net::offer() {
+                        reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                            channel: crate::datapack_net::OFFER_CHANNEL.into(),
+                            data,
+                        }))?;
+                    }
                 }
                 receive_brand(&p, send);
             }
@@ -1070,7 +1556,7 @@ fn configure(
                 let _ = send.send(Event::Features(p.features));
             }
             cfg::Clientbound::RegistryData(mut r) => {
-                fill_known_entries(&mut r, resources);
+                fill_known_entries(&mut r, resources.root());
                 registries.add(r);
             }
             cfg::Clientbound::UpdateTags(t) => registries.add_tags(&t),
@@ -1113,12 +1599,47 @@ fn configure(
             }
             cfg::Clientbound::Disconnect(d) => return Err(Reason::tag(&d.reason, lang)),
             cfg::Clientbound::FinishConfiguration(_) => {
+                // A Horizon server that never sent on horizon:payloads predates the
+                // negotiation: play on with nothing negotiated, as on a vanilla server.
+                // Only on the first configuration: a server that goes silent when it
+                // reconfigures is refused as before.
+                let silent = if initial {
+                    negotiation.finish_allowing_silent_peer()
+                } else {
+                    negotiation.finish_without_offer().map(|()| false)
+                }
+                .map_err(|error| refused(error, &server_build))?;
+                if silent {
+                    log::info!(
+                        "The server did not answer horizon:payloads: Horizon's negotiated extensions are off"
+                    );
+                }
+                if payloads.epoch().is_none() {
+                    let accepted = negotiation
+                        .accepted()
+                        .expect("configuration barrier freezes negotiation");
+                    if silent {
+                        payloads.accept_from_silent_server(accepted)
+                    } else {
+                        payloads.accept(accepted)
+                    }
+                    .map_err(Reason::plain)?;
+                }
+                crate::datapack_net::finish_transfer().map_err(Reason::plain)?;
                 registries.custom_components = content_verified;
-                let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-                let w = w.as_mut().ok_or_else(|| Reason::plain("Disconnected"))?;
-                w.send(&cfg::Serverbound::FinishConfiguration(Empty).encode())
-                    .map_err(|e| Reason::plain(connection_lost(e, lang)))?;
-                configuring.store(false, Ordering::Relaxed);
+                payloads
+                    .finish_configuration_with(|| {
+                        let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+                        let w = w.as_mut().ok_or_else(|| "Disconnected".to_owned())?;
+                        w.transition_protocol(
+                            horizon_protocol::payload_negotiation::Phase::Play,
+                            &cfg::Serverbound::FinishConfiguration(Empty).encode(),
+                        )
+                        .map_err(|e| connection_lost(e, lang))?;
+                        configuring.store(false, Ordering::Release);
+                        Ok(())
+                    })
+                    .map_err(Reason::plain)?;
                 return Ok(registries);
             }
             _ => {}
@@ -1126,59 +1647,33 @@ fn configure(
     }
 }
 
-/// `KnownPacksManager.trySelectingPacks`: the packs of the server's list the
-/// client has too. Horizon carries vanilla's core pack (the prepared
-/// resources' `data/`), so it names that one when the server offers it, and
-/// the server leaves that pack's entries' data out (`fill_known_entries`).
-fn select_known_packs(offered: Vec<cfg::KnownPack>) -> Vec<cfg::KnownPack> {
-    let (namespace, id, version) = crate::lan::data::CORE_PACK;
-    offered
-        .into_iter()
-        .filter(|p| p.namespace == namespace && p.id == id && p.version == version)
-        .collect()
-}
-
-/// `RegistryDataCollector`: an entry of a pack both sides know comes without
-/// its data, which the client reads from its own copy of the pack
-/// (`data/<namespace>/<registry path>/<path>.json`, `Registries.elementsDirPath`).
-fn fill_known_entries(r: &mut cfg::RegistryData, resources: &Path) {
-    let (registry_ns, registry_path) = r
-        .registry
-        .split_once(':')
-        .unwrap_or(("minecraft", r.registry.as_str()));
-    let dir = if registry_ns == "minecraft" {
-        registry_path.to_owned()
-    } else {
-        format!("{registry_ns}/{registry_path}")
-    };
-    for entry in r.entries.iter_mut().filter(|e| e.data.is_none()) {
-        let (ns, path) = entry
-            .id
-            .split_once(':')
-            .unwrap_or(("minecraft", entry.id.as_str()));
-        let file = resources
-            .join("data")
-            .join(ns)
-            .join(&dir)
-            .join(format!("{path}.json"));
-        let json = std::fs::read(&file)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-        if let Some(json) = json {
-            entry.data = Some(crate::lan::data::json_to_nbt(&json));
-        }
+/// A failed `horizon:payloads` negotiation. In the first configuration it names the server's
+/// build (`None`: one from before builds were named, so older) and this one, unless they are the
+/// same; a reconfiguration keeps the negotiation's own error.
+fn negotiation_refused(initial: bool, server_build: Option<&str>, error: &str) -> Reason {
+    let this = crate::build_mismatch::this_build();
+    match initial
+        .then(|| crate::build_mismatch::refusal(server_build, Some(&this), error))
+        .flatten()
+    {
+        Some(text) => Reason {
+            text: text.plain(),
+            key: Some(crate::build_mismatch::KEY.to_owned()),
+        },
+        None => Reason::plain(error),
     }
 }
 
-fn receive_brand(payload: &cfg::CustomPayload, send: &Sender<Event>) {
+#[horizon_mod_api_macros::replaceable]
+fn receive_brand(payload: &cfg::CustomPayload, send: &ingress::Producer<Event>) {
     if payload.channel == "minecraft:brand"
         && let Ok(brand) = horizon_protocol::buf::Reader::new(&payload.data).string(32767)
     {
         let _ = send.send(Event::Brand(brand));
     } else if payload.channel == horizon_protocol::quiet::CHANNEL {
         let _ = send.send(Event::QuietCommands);
-    } else if payload.channel == horizon_protocol::mod_net::CHANNEL {
-        let _ = send.send(Event::ModNet);
+    } else if payload.channel == horizon_protocol::custom_book::CHANNEL {
+        let _ = send.send(Event::CustomBooks);
     } else if payload.channel == crate::lod_net::CHANNEL
         && let Some(offer) = crate::lod_net::Offer::decode(&payload.data)
     {
@@ -1194,13 +1689,31 @@ fn brand() -> Vec<u8> {
 }
 
 /// Flatten a JSON chat component (login disconnects are JSON).
+/// At most `horizon_protocol::text::MAX_TEXT` bytes, as `plain`: a login-phase reason from a
+/// server is any JSON it likes.
 pub fn json_text(v: &serde_json::Value, lang: &Language) -> String {
+    use horizon_protocol::text::{MAX_TEXT, push_capped};
     match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(a) => a.iter().map(|e| json_text(e, lang)).collect(),
+        serde_json::Value::String(s) => {
+            let mut out = String::new();
+            push_capped(&mut out, s);
+            out
+        }
+        serde_json::Value::Array(a) => {
+            let mut out = String::new();
+            for e in a {
+                if out.len() >= MAX_TEXT {
+                    break;
+                }
+                push_capped(&mut out, &json_text(e, lang));
+            }
+            out
+        }
         serde_json::Value::Object(o) => {
             let mut out = if let Some(t) = o.get("text").and_then(|t| t.as_str()) {
-                t.to_owned()
+                let mut out = String::new();
+                push_capped(&mut out, t);
+                out
             } else if let Some(key) = o.get("translate").and_then(|t| t.as_str()) {
                 let args: Vec<String> = o
                     .get("with")
@@ -1222,7 +1735,10 @@ pub fn json_text(v: &serde_json::Value, lang: &Language) -> String {
             };
             if let Some(extra) = o.get("extra").and_then(|e| e.as_array()) {
                 for e in extra {
-                    out.push_str(&json_text(e, lang));
+                    if out.len() >= MAX_TEXT {
+                        break;
+                    }
+                    push_capped(&mut out, &json_text(e, lang));
                 }
             }
             out
@@ -1376,6 +1892,404 @@ fn continues_after_failed_join(lan: bool, signed_in: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use horizon_world::native_load_context::DataLoadOrigin;
+
+    fn empty_item_data(name: &str) -> (PathBuf, Arc<ItemData>) {
+        let root =
+            std::env::temp_dir().join(format!("horizon-net-data-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("items.json"), "{}").unwrap();
+        let data = crate::test_resources::item_data(&root, DataLoadOrigin::ClientPreload).unwrap();
+        (root, data)
+    }
+
+    /// A Horizon-branded server's configuration: the brand, then `negotiation` on
+    /// `horizon:payloads`, then FinishConfiguration. Returns the client's result, its
+    /// transport (with the engine's declarations) and the pieces to receive play payloads.
+    fn configure_with_horizon_server(
+        name: &str,
+        negotiation: &[Vec<u8>],
+    ) -> (
+        Result<Dynamic, Reason>,
+        crate::raw_payloads::Endpoint,
+        ingress::Producer<Event>,
+    ) {
+        let payloads =
+            crate::raw_payloads::Transport::capture(crate::raw_payloads::Side::Client).unwrap();
+        configure_on(name, &payloads, true, negotiation)
+    }
+
+    /// One configuration pass of `payloads`' connection: `initial` for the first, else a
+    /// reconfiguration from play.
+    fn configure_on(
+        name: &str,
+        payloads: &Arc<crate::raw_payloads::Transport>,
+        initial: bool,
+        negotiation: &[Vec<u8>],
+    ) -> (
+        Result<Dynamic, Reason>,
+        crate::raw_payloads::Endpoint,
+        ingress::Producer<Event>,
+    ) {
+        configure_announced(name, payloads, initial, None, negotiation)
+    }
+
+    /// [`configure_on`] with a server that names its `build` before negotiating, as one
+    /// does since crate::build_mismatch.
+    fn configure_announced(
+        name: &str,
+        payloads: &Arc<crate::raw_payloads::Transport>,
+        initial: bool,
+        build: Option<&str>,
+        negotiation: &[Vec<u8>],
+    ) -> (
+        Result<Dynamic, Reason>,
+        crate::raw_payloads::Endpoint,
+        ingress::Producer<Event>,
+    ) {
+        let (root, data) = empty_item_data(name);
+        let (client, server) = horizon_protocol::connection::Pipe::pair();
+        let (mut reader, writer) = Connection::local(client).split();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let writer = Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap())));
+        let configuring = Arc::new(AtomicBool::new(true));
+        let payloads = payloads.clone();
+        let (send, _events) = event_channel();
+        let thread = std::thread::spawn({
+            let (writer, configuring, payloads, send) = (
+                writer.clone(),
+                configuring.clone(),
+                payloads.clone(),
+                send.clone(),
+            );
+            move || {
+                configure(
+                    &mut reader,
+                    &writer,
+                    &configuring,
+                    &Language::new(),
+                    &send,
+                    &Cookies::default(),
+                    &data,
+                    &payloads,
+                    initial,
+                )
+            }
+        });
+        let mut server = Connection::local(server);
+        let mut brand = horizon_protocol::buf::Writer::new();
+        brand.string("horizon");
+        let custom = |channel: &str, data: Vec<u8>| {
+            cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                channel: channel.into(),
+                data,
+            })
+            .encode()
+        };
+        server.send(&custom("minecraft:brand", brand.data)).unwrap();
+        if let Some(build) = build {
+            server
+                .send(&custom(
+                    crate::build_mismatch::CHANNEL,
+                    crate::build_mismatch::encode(build),
+                ))
+                .unwrap();
+        }
+        // The client may already have refused and hung up: later sends can fail.
+        for control in negotiation {
+            let _ = server.send(&custom(
+                horizon_protocol::payload_negotiation::CHANNEL,
+                control.clone(),
+            ));
+        }
+        let _ = server.send(&cfg::Clientbound::FinishConfiguration(Empty).encode());
+        let result = thread.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        let endpoint =
+            crate::raw_payloads::Endpoint::client(writer, configuring, payloads, send.clone());
+        (result, endpoint, send)
+    }
+
+    fn attachment_sync() -> cfg::CustomPayload {
+        cfg::CustomPayload {
+            channel: horizon_protocol::attachment_sync::CHANNEL.into(),
+            data: vec![0],
+        }
+    }
+
+    /// #17892: a Horizon server from before the negotiation never sends on horizon:payloads.
+    #[test]
+    fn a_horizon_server_that_never_negotiates_is_joined_with_nothing_negotiated() {
+        let (result, endpoint, send) = configure_with_horizon_server("raw-protocol-silent", &[]);
+        if let Err(error) = result {
+            panic!("older Horizon server refused: {}", error.text);
+        }
+        let epoch = endpoint.transport().epoch().unwrap();
+        assert!(epoch.peer.silent());
+        // Attachment sync is clientbound: this client must not receive it.
+        assert!(!epoch.peer.engine_receives(
+            horizon_protocol::payload_negotiation::Phase::Play,
+            horizon_protocol::attachment_sync::CHANNEL
+        ));
+        // Such a server still sends attachment sync to Horizon-branded clients: skipped.
+        for _ in 0..2 {
+            assert!(matches!(
+                receive_application(
+                    &endpoint,
+                    horizon_protocol::payload_negotiation::Phase::Play,
+                    attachment_sync(),
+                    &send,
+                ),
+                Ok(None)
+            ));
+        }
+    }
+
+    /// The fallback is for the first configuration only: a negotiated connection whose
+    /// server sends the brand again on reconfiguration and then nothing is refused.
+    #[test]
+    fn a_negotiated_connection_that_reconfigures_silently_is_refused() {
+        use horizon_protocol::payload_negotiation::{Control, Manifest};
+        let payloads =
+            crate::raw_payloads::Transport::capture(crate::raw_payloads::Side::Client).unwrap();
+        let (result, ..) = configure_on(
+            "raw-protocol-reconfigure-first",
+            &payloads,
+            true,
+            &[Control::Offer(Manifest::default()).encode().unwrap()],
+        );
+        if let Err(error) = result {
+            panic!("current Horizon server refused: {}", error.text);
+        }
+        let (result, ..) = configure_on("raw-protocol-reconfigure-silent", &payloads, false, &[]);
+        assert!(result.err().unwrap().text.contains("missing response"));
+    }
+
+    /// A Horizon server of another build that can't negotiate: the refusal names both builds, and
+    /// one that never named its build is older. Never retried.
+    #[test]
+    fn a_failed_negotiation_names_both_builds() {
+        use horizon_protocol::payload_negotiation::RAW_PROTOCOL;
+        let this = crate::build_mismatch::this_build();
+        for (server, shown) in [
+            (
+                Some("Nightly 2000-01-01 · 0000000"),
+                "Horizon Nightly 2000-01-01 · 0000000",
+            ),
+            (None, "an older Horizon build"),
+        ] {
+            let payloads =
+                crate::raw_payloads::Transport::capture(crate::raw_payloads::Side::Client).unwrap();
+            let (result, ..) = configure_announced(
+                "build-mismatch",
+                &payloads,
+                true,
+                server,
+                &[vec![0, RAW_PROTOCOL + 1]],
+            );
+            let error = result.err().unwrap();
+            assert!(
+                error.text.starts_with(&format!(
+                    "This server runs {shown}; your game is Horizon {this}."
+                )),
+                "{}",
+                error.text
+            );
+            if server.is_none() {
+                assert!(
+                    error
+                        .text
+                        .contains("The server needs updating to match your game.")
+                );
+            }
+            assert!(error.text.contains("protocol version"));
+            assert!(!crate::reconnect::allowed(
+                &error.text,
+                error.key.as_deref(),
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn a_horizon_server_that_answers_keeps_every_check() {
+        use horizon_protocol::payload_negotiation::{Control, Manifest, RAW_PROTOCOL};
+        let (result, ..) = configure_with_horizon_server(
+            "raw-protocol-wrong-version",
+            &[vec![0, RAW_PROTOCOL + 1]],
+        );
+        assert!(result.err().unwrap().text.contains("protocol version"));
+        // A Query without its Offer is an answer that never finished.
+        let (result, ..) = configure_with_horizon_server(
+            "raw-protocol-query-only",
+            &[Control::Query.encode().unwrap()],
+        );
+        assert!(result.err().unwrap().text.contains("missing response"));
+        // A server that offered without attachment sync and sends it anyway is refused.
+        let (result, endpoint, send) = configure_with_horizon_server(
+            "raw-protocol-answered",
+            &[Control::Offer(Manifest::default()).encode().unwrap()],
+        );
+        if let Err(error) = result {
+            panic!("current Horizon server refused: {}", error.text);
+        }
+        assert!(!endpoint.transport().epoch().unwrap().peer.silent());
+        let Err(error) = receive_application(
+            &endpoint,
+            horizon_protocol::payload_negotiation::Phase::Play,
+            attachment_sync(),
+            &send,
+        ) else {
+            panic!("unnegotiated payload admitted from a server that answered");
+        };
+        assert!(error.text.contains("UnsupportedPeer"));
+    }
+
+    #[test]
+    fn configuration_keeps_mod_lists_private_until_the_server_identifies_as_horizon() {
+        for server_brand in ["vanilla", "horizon"] {
+            let (root, data) = empty_item_data(&format!("mod-list-{server_brand}"));
+            let (client, server) = horizon_protocol::connection::Pipe::pair();
+            let (mut reader, writer) = Connection::local(client).split();
+            reader
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            // configure queues its final ACK asynchronously. Keep its writer alive
+            // until the peer has received that ACK, just as the real connection
+            // retains it for play; dropping the last owner closes the pipe.
+            let shared_writer = Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap())));
+            let client_writer = shared_writer.clone();
+            let thread = std::thread::spawn(move || {
+                let (send, _events) = event_channel();
+                configure(
+                    &mut reader,
+                    &client_writer,
+                    &Arc::new(AtomicBool::new(true)),
+                    &Language::new(),
+                    &send,
+                    &Cookies::default(),
+                    &data,
+                    &crate::raw_payloads::Transport::empty(),
+                    true,
+                )
+            });
+            let mut server = Connection::local(server);
+            server
+                .reader
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            // A payload alone must not solicit private identities.
+            server
+                .send(
+                    &cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                        channel: horizon_protocol::mod_list::CHANNEL.into(),
+                        data: horizon_protocol::mod_list::encode(&[]),
+                    })
+                    .encode(),
+                )
+                .unwrap();
+            server
+                .send(&cfg::Clientbound::Ping(cfg::Ping { id: 17 }).encode())
+                .unwrap();
+            let (id, body) = server.recv().unwrap();
+            assert_eq!(
+                cfg::Serverbound::decode(id, &body).unwrap(),
+                cfg::Serverbound::Pong(cfg::Ping { id: 17 }),
+                "an unidentified server received a mod announcement"
+            );
+            let mut brand = horizon_protocol::buf::Writer::new();
+            brand.string(server_brand);
+            server
+                .send(
+                    &cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                        channel: "minecraft:brand".into(),
+                        data: brand.data,
+                    })
+                    .encode(),
+                )
+                .unwrap();
+            if server_brand == "horizon" {
+                use horizon_protocol::payload_negotiation::{CHANNEL, Control};
+                server
+                    .send(
+                        &cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                            channel: CHANNEL.into(),
+                            data: Control::Query.encode().unwrap(),
+                        })
+                        .encode(),
+                    )
+                    .unwrap();
+            }
+            server
+                .send(
+                    &cfg::Clientbound::SelectKnownPacks(cfg::SelectKnownPacks { packs: vec![] })
+                        .encode(),
+                )
+                .unwrap();
+            let mut declared_mods = false;
+            let mut saw_offer = false;
+            loop {
+                let (id, body) = server.recv().unwrap();
+                match cfg::Serverbound::decode(id, &body).unwrap() {
+                    cfg::Serverbound::CustomPayload(p)
+                        if p.channel == horizon_protocol::payload_negotiation::CHANNEL =>
+                    {
+                        use horizon_protocol::payload_negotiation::{CHANNEL, Control, Manifest};
+                        if Control::decode(&p.data).unwrap() == Control::Query {
+                            server
+                                .send(
+                                    &cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                                        channel: CHANNEL.into(),
+                                        data: Control::Offer(Manifest::default()).encode().unwrap(),
+                                    })
+                                    .encode(),
+                                )
+                                .unwrap();
+                        } else {
+                            saw_offer = true;
+                        }
+                    }
+                    cfg::Serverbound::CustomPayload(p)
+                        if p.channel == horizon_protocol::mod_list::CHANNEL =>
+                    {
+                        declared_mods = true;
+                    }
+                    cfg::Serverbound::SelectKnownPacks(_) => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(declared_mods, server_brand == "horizon");
+            assert_eq!(saw_offer, server_brand == "horizon");
+            server
+                .send(&cfg::Clientbound::FinishConfiguration(Empty).encode())
+                .unwrap();
+            let (id, body) = server.recv().unwrap();
+            assert_eq!(
+                cfg::Serverbound::decode(id, &body).unwrap(),
+                cfg::Serverbound::FinishConfiguration(Empty)
+            );
+            thread
+                .join()
+                .unwrap()
+                .unwrap_or_else(|reason| panic!("configuration failed: {}", reason.text));
+            drop(shared_writer);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_login_reason_repeating_its_argument_stays_bounded() {
+        let pattern = "%1$s".repeat(16_000);
+        let mut v = serde_json::json!({ "text": "A" });
+        for _ in 0..3 {
+            v = serde_json::json!({ "translate": "x.unknown", "fallback": pattern, "with": [v] });
+        }
+        let v = serde_json::json!({ "text": "", "extra": [v.clone(), v] });
+        let text = json_text(&v, &Language::default());
+        assert!(text.len() <= horizon_protocol::text::MAX_TEXT);
+    }
 
     fn pack(namespace: &str, id: &str, version: &str) -> cfg::KnownPack {
         cfg::KnownPack {
@@ -1469,171 +2383,9 @@ mod tests {
     }
 
     #[test]
-    fn studio_recording_drops_packets_with_direct_player_identity_or_private_text() {
-        use horizon_protocol::packets::configuration::{
-            ResourcePackPush, ServerLink, ServerLinkKind, ServerLinks, StoreCookie, Transfer,
-        };
-        use play::{
-            ChatTypeBound, Clientbound as P, CustomChatCompletions, PlayerInfo, PlayerInfoRemove,
-            PlayerInfoUpdate, ResetScore, SetPlayerTeam, SetScore, TrackedWaypoint, WaypointId,
-            WaypointTarget,
-        };
-
-        let packets = [
-            P::CookieRequest(cfg::CookieRequest {
-                key: "private_cookie".into(),
-            }),
-            P::CustomChatCompletions(CustomChatCompletions {
-                action: 2,
-                entries: vec!["/msg PlayerName private text".into()],
-            }),
-            P::CustomPayload(cfg::CustomPayload {
-                channel: "private:channel".into(),
-                data: b"private payload".to_vec(),
-            }),
-            P::DeleteChat(play::DeleteChat {
-                signature: (3, Some(vec![1, 2, 3])),
-            }),
-            P::DisguisedChat(play::DisguisedChat {
-                message: Tag::String("private message".into()),
-                chat_type: ChatTypeBound {
-                    chat_type: 0,
-                    name: Tag::String("PlayerName".into()),
-                    target: None,
-                },
-            }),
-            P::PlayerCombatKill(play::PlayerCombatKill {
-                id: 7,
-                message: Tag::String("PlayerName was slain".into()),
-            }),
-            P::PlayerChat(play::PlayerChat {
-                global_index: 1,
-                sender: 7,
-                index: 2,
-                signature: None,
-                content: "private message".into(),
-                timestamp: 3,
-                salt: 4,
-                last_seen: vec![],
-                unsigned_content: None,
-                filter: (0, vec![]),
-                chat_type: ChatTypeBound {
-                    chat_type: 0,
-                    name: Tag::String("PlayerName".into()),
-                    target: None,
-                },
-            }),
-            P::ResetScore(ResetScore {
-                owner: "PlayerName".into(),
-                objective: Some("deaths".into()),
-            }),
-            P::SetScore(SetScore {
-                owner: "PlayerName".into(),
-                objective: "deaths".into(),
-                score: 1,
-                display: None,
-                number_format: None,
-            }),
-            P::PlayerInfoRemove(PlayerInfoRemove { uuids: vec![7] }),
-            P::PlayerInfoUpdate(PlayerInfoUpdate {
-                actions: 1,
-                entries: vec![PlayerInfo {
-                    uuid: 7,
-                    name: Some("PlayerName".into()),
-                    ..PlayerInfo::default()
-                }],
-            }),
-            P::ResourcePackPush(ResourcePackPush {
-                id: 8,
-                url: "https://private.example/pack.zip".into(),
-                hash: "hash".into(),
-                required: false,
-                prompt: None,
-            }),
-            P::ServerLinks(ServerLinks {
-                links: vec![ServerLink {
-                    kind: ServerLinkKind::Known(0),
-                    link: "https://private.example".into(),
-                }],
-            }),
-            P::SetPlayerTeam(SetPlayerTeam {
-                name: "red".into(),
-                method: 3,
-                parameters: None,
-                players: vec!["PlayerName".into()],
-            }),
-            P::StoreCookie(StoreCookie {
-                key: "private_cookie".into(),
-                payload: b"secret".to_vec(),
-            }),
-            P::SystemChat(play::SystemChat {
-                content: Tag::String("private message".into()),
-                overlay: false,
-            }),
-            P::TabList(play::TabList {
-                header: Tag::String("PlayerName".into()),
-                footer: Tag::End,
-            }),
-            P::TrackedWaypoint(TrackedWaypoint {
-                operation: play::waypoint_operation::TRACK,
-                id: WaypointId::Uuid(7),
-                style: "minecraft:default".into(),
-                color: None,
-                target: WaypointTarget::Empty,
-            }),
-            P::Transfer(Transfer {
-                host: "private.example".into(),
-                port: 25565,
-            }),
-            P::Disconnect(cfg::Disconnect {
-                reason: Tag::String("PlayerName was disconnected".into()),
-            }),
-            P::Unknown(999, b"unclassified private payload".to_vec()),
-        ];
-
-        for packet in packets {
-            assert!(
-                studio_recording_packet(&packet, packet.id(), b"raw packet payload").is_none(),
-                "{} should be excluded from recordings",
-                packet.name()
-            );
-        }
-    }
-
-    #[test]
-    fn studio_recording_replaces_entity_uuids_but_keeps_entity_state() {
-        let original = play::AddEntity {
-            id: 18,
-            uuid: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
-            kind: 42,
-            position: [1.0, 64.0, -2.0],
-            velocity: [0.0, 0.0, 0.0],
-            pitch: 1,
-            yaw: 2,
-            head_yaw: 3,
-            data: 4,
-        };
-        let packet = play::Clientbound::AddEntity(original.clone());
-        let (id, payload) = studio_recording_packet(&packet, packet.id(), b"unused").unwrap();
-        let play::Clientbound::AddEntity(recorded) =
-            play::Clientbound::decode(id, &payload).unwrap()
-        else {
-            panic!("sanitized packet changed type")
-        };
-
-        assert_ne!(recorded.uuid, original.uuid);
-        assert_eq!(recorded.id, original.id);
-        assert_eq!(recorded.kind, original.kind);
-        assert_eq!(recorded.position, original.position);
-        assert_eq!(recorded.velocity, original.velocity);
-        assert_eq!(recorded.pitch, original.pitch);
-        assert_eq!(recorded.yaw, original.yaw);
-        assert_eq!(recorded.head_yaw, original.head_yaw);
-        assert_eq!(recorded.data, original.data);
-    }
-
-    #[test]
+    #[ignore = "daily"]
     fn direct_login_preserves_hostname_and_negotiates_brand() {
+        let (root, data) = empty_item_data("brand");
         for server_brand in [
             b"\x07vanilla".as_slice(),
             b"\x07horizon",
@@ -1648,7 +2400,7 @@ mod tests {
                 None,
                 cfg::ClientInformation::new(8),
                 Arc::new(Language::new()),
-                PathBuf::new(),
+                Arc::clone(&data),
             );
             let (stream, _) = listener.accept().unwrap();
             stream
@@ -1705,6 +2457,26 @@ mod tests {
                     .encode(),
                 )
                 .unwrap();
+            if server_brand == b"\xff" {
+                // A registered brand uses its own string codec: malformed
+                // bytes fail the session rather than continuing negotiation.
+                assert!(server.recv().unwrap_err().is_end_of_stream());
+                drop(server);
+                drop(session);
+                continue;
+            }
+            if server_brand == b"\x07horizon" {
+                use horizon_protocol::payload_negotiation::{CHANNEL, Control};
+                server
+                    .send(
+                        &cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                            channel: CHANNEL.into(),
+                            data: Control::Query.encode().unwrap(),
+                        })
+                        .encode(),
+                    )
+                    .unwrap();
+            }
             server
                 .send(
                     &cfg::Clientbound::SelectKnownPacks(cfg::SelectKnownPacks { packs: vec![] })
@@ -1712,6 +2484,24 @@ mod tests {
                 )
                 .unwrap();
             if server_brand == b"\x07horizon" {
+                use horizon_protocol::payload_negotiation::{CHANNEL, Control, Manifest};
+                let (id, body) = server.recv().unwrap();
+                assert_eq!(
+                    cfg::Serverbound::decode(id, &body).unwrap(),
+                    cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                        channel: CHANNEL.into(),
+                        data: Control::Query.encode().unwrap(),
+                    })
+                );
+                server
+                    .send(
+                        &cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                            channel: CHANNEL.into(),
+                            data: Control::Offer(Manifest::default()).encode().unwrap(),
+                        })
+                        .encode(),
+                    )
+                    .unwrap();
                 let (id, body) = server.recv().unwrap();
                 assert_eq!(
                     cfg::Serverbound::decode(id, &body).unwrap(),
@@ -1721,16 +2511,39 @@ mod tests {
                     })
                 );
             }
-            // The response to the pack query proves any brand reply precedes it.
-            // Non-Horizon servers must receive no additional brand announcement.
-            let (id, body) = server.recv().unwrap();
-            assert_eq!(
-                cfg::Serverbound::decode(id, &body).unwrap(),
-                cfg::Serverbound::SelectKnownPacks(cfg::SelectKnownPacks { packs: vec![] })
-            );
+            // Wait for the pack reply without pinning unrelated extension payloads.
+            // The negotiated brand must not be announced a second time.
+            let mut saw_protocol_offer = false;
+            loop {
+                let (id, body) = server.recv().unwrap();
+                match cfg::Serverbound::decode(id, &body).unwrap() {
+                    cfg::Serverbound::SelectKnownPacks(_) => break,
+                    cfg::Serverbound::CustomPayload(p) => {
+                        assert_ne!(p.channel, "minecraft:brand");
+                        if p.channel == horizon_protocol::payload_negotiation::CHANNEL {
+                            use horizon_protocol::payload_negotiation::Control;
+                            // A client with no mods offers the engine's declarations.
+                            let local = crate::raw_payloads::Local::capture(
+                                crate::raw_payloads::Side::Client,
+                            )
+                            .unwrap();
+                            assert!(!local.has_mod_declarations());
+                            assert_eq!(
+                                Control::decode(&p.data).unwrap(),
+                                Control::Offer(local.manifest.clone())
+                            );
+                            assert!(!saw_protocol_offer, "duplicate protocol offer");
+                            saw_protocol_offer = true;
+                        }
+                    }
+                    packet => panic!("unexpected configuration reply: {packet:?}"),
+                }
+            }
+            assert_eq!(saw_protocol_offer, server_brand == b"\x07horizon");
             drop(server);
             drop(session);
         }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1783,6 +2596,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_server_that_stops_answering_times_out() {
         // The server accepts and then sends nothing, like a frozen server
         // or a network gone without a reset.
@@ -1792,19 +2606,21 @@ mod tests {
         let (c, _, _) = connect_tcp("127.0.0.1", port, true, Duration::from_millis(300)).unwrap();
         let _server = held.join().unwrap().unwrap();
         let (mut reader, writer) = c.split();
+        let (root, data) = empty_item_data("timeout");
         let (done, result) = channel();
         std::thread::spawn(move || {
-            let (send, _events) = channel();
+            let (send, _events) = event_channel();
             let _ = done.send(receive_play(
                 &mut reader,
-                &Mutex::new(Some(writer)),
-                &AtomicBool::new(false),
+                &Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap()))),
+                &Arc::new(AtomicBool::new(false)),
                 &disconnect_language(),
                 &send,
                 &Cookies::default(),
                 &crate::lod_net::Inbox::default(),
-                Path::new("."),
+                &data,
                 &Arc::new(Mutex::new(None)),
+                &crate::raw_payloads::Transport::empty(),
             ));
         });
         let ended = result
@@ -1814,6 +2630,7 @@ mod tests {
             ended.map(|r| r.text).map_err(|r| r.text),
             Err("Timed out".to_owned())
         );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1831,6 +2648,108 @@ mod tests {
         );
     }
 
+    /// arismoko/horizon#3716: a client asked about viewed levels answers in configuration, before its
+    /// acknowledgement, that it views two levels besides its own.
+    #[test]
+    fn configuration_answers_the_viewed_levels_query_with_its_cap() {
+        let (root, data) = empty_item_data("viewed-levels");
+        let (client, server) = horizon_protocol::connection::Pipe::pair();
+        let (mut reader, writer) = Connection::local(client).split();
+        let writer = Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap())));
+        let client_writer = writer.clone();
+        let thread = std::thread::spawn(move || {
+            let (send, _events) = event_channel();
+            configure(
+                &mut reader,
+                &client_writer,
+                &Arc::new(AtomicBool::new(true)),
+                &Language::new(),
+                &send,
+                &Cookies::default(),
+                &data,
+                &crate::raw_payloads::Transport::empty(),
+                true,
+            )
+        });
+        let mut server = Connection::local(server);
+        for packet in [
+            cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                channel: "horizon:levels".into(),
+                data: horizon_protocol::viewed_levels::query(),
+            }),
+            cfg::Clientbound::FinishConfiguration(Empty),
+        ] {
+            server.send(&packet.encode()).unwrap();
+        }
+        for expected in [
+            cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                channel: "horizon:levels".into(),
+                data: horizon_protocol::viewed_levels::answer(2),
+            }),
+            cfg::Serverbound::FinishConfiguration(Empty),
+        ] {
+            let (id, body) = server.recv().unwrap();
+            assert_eq!(cfg::Serverbound::decode(id, &body).unwrap(), expected);
+        }
+        assert!(thread.join().unwrap().is_ok());
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// arismoko/horizon#3384: a client asked which `horizon:menu_extra` layout it reads answers its revision
+    /// in configuration, and keeps it for play (a server that never asked serves the legacy layout).
+    #[test]
+    fn configuration_answers_the_menu_extra_revision_query() {
+        let (root, data) = empty_item_data("menu-extra-revision");
+        let (client, server) = horizon_protocol::connection::Pipe::pair();
+        let (mut reader, writer) = Connection::local(client).split();
+        let writer = Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap())));
+        let client_writer = writer.clone();
+        let thread = std::thread::spawn(move || {
+            let (send, _events) = event_channel();
+            configure(
+                &mut reader,
+                &client_writer,
+                &Arc::new(AtomicBool::new(true)),
+                &Language::new(),
+                &send,
+                &Cookies::default(),
+                &data,
+                &crate::raw_payloads::Transport::empty(),
+                true,
+            )
+        });
+        let mut server = Connection::local(server);
+        for packet in [
+            cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                channel: "horizon:menu_extra".into(),
+                data: horizon_protocol::menu_extra::query(),
+            }),
+            cfg::Clientbound::FinishConfiguration(Empty),
+        ] {
+            server.send(&packet.encode()).unwrap();
+        }
+        for expected in [
+            cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                channel: "horizon:menu_extra".into(),
+                data: horizon_protocol::menu_extra::answer(),
+            }),
+            cfg::Serverbound::FinishConfiguration(Empty),
+        ] {
+            let (id, body) = server.recv().unwrap();
+            assert_eq!(cfg::Serverbound::decode(id, &body).unwrap(), expected);
+        }
+        // A failure reads as 0 and fails the assertion below.
+        let revision = thread
+            .join()
+            .unwrap()
+            .map(|registries| registries.menu_extra_revision)
+            .unwrap_or(0);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(revision, horizon_protocol::menu_extra::REVISION);
+    }
+
     #[test]
     fn configuration_answers_the_content_identity_challenge() {
         let root =
@@ -1841,20 +2760,27 @@ mod tests {
             br#"{"states":[["minecraft:stone",false,false,"Block{minecraft:stone}",{"id":"minecraft:stone"}]]}"#,
         )
         .unwrap();
-        let expected = crate::content_identity::identity(&root).unwrap();
+        std::fs::write(root.join("items.json"), "{}").unwrap();
+        let data = crate::test_resources::item_data(&root, DataLoadOrigin::ClientPreload).unwrap();
+        let expected = crate::content_identity::identity(&root, data.defaults()).unwrap();
         let (client, server) = horizon_protocol::connection::Pipe::pair();
         let (mut reader, writer) = Connection::local(client).split();
-        let writer = Mutex::new(Some(writer));
+        let writer = Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap())));
+        // Keep the connection owner alive until the peer receives the queued
+        // finish ACK, as a real Session does when configure returns to play.
+        let client_writer = writer.clone();
         let thread = std::thread::spawn(move || {
-            let (send, _events) = channel();
+            let (send, _events) = event_channel();
             configure(
                 &mut reader,
-                &writer,
-                &AtomicBool::new(true),
+                &client_writer,
+                &Arc::new(AtomicBool::new(true)),
                 &Language::new(),
                 &send,
                 &Cookies::default(),
-                &root,
+                &data,
+                &crate::raw_payloads::Transport::empty(),
+                true,
             )
         });
         let mut server = Connection::local(server);
@@ -1892,6 +2818,7 @@ mod tests {
             cfg::Serverbound::FinishConfiguration(Empty)
         );
         assert!(thread.join().unwrap().is_ok());
+        drop(writer);
         std::fs::remove_dir_all(
             std::env::temp_dir().join(format!("horizon-content-identity-{}", std::process::id())),
         )
@@ -1905,8 +2832,8 @@ mod tests {
         for explicit_disconnect in [true, false] {
             let (client, _server) = horizon_protocol::connection::Pipe::pair();
             let (_reader, writer) = Connection::local(client).split();
-            let writer = Arc::new(Mutex::new(Some(writer)));
-            let (_send, events) = channel();
+            let writer = Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap())));
+            let (_send, events) = event_channel();
             let (release, stalled) = channel();
             let (finished, completed) = channel();
             let thread = std::thread::spawn(move || {
@@ -1915,6 +2842,8 @@ mod tests {
             });
             let mut session = Session {
                 events,
+                payload_events: event_channel().0,
+                payloads: crate::raw_payloads::Transport::empty(),
                 writer: writer.clone(),
                 configuring: Arc::new(AtomicBool::new(false)),
                 thread: Some(thread),
@@ -1925,6 +2854,7 @@ mod tests {
                 debug: false,
                 far: Arc::default(),
                 recorder: Arc::new(Mutex::new(None)),
+                serial: next_serial(),
             };
             let started = std::time::Instant::now();
             if explicit_disconnect {
@@ -1959,22 +2889,24 @@ mod tests {
 
     #[test]
     fn pings_wait_behind_teleports_but_keepalives_do_not_wait_for_the_game() {
+        let (root, data) = empty_item_data("pings");
         let (client, server) = horizon_protocol::connection::Pipe::pair();
         let (mut reader, writer) = Connection::local(client).split();
-        let writer = Arc::new(Mutex::new(Some(writer)));
-        let (send, events) = channel();
+        let writer = Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap())));
+        let (send, events) = event_channel();
         let thread_writer = writer.clone();
         let thread = std::thread::spawn(move || {
             receive_play(
                 &mut reader,
                 &thread_writer,
-                &AtomicBool::new(false),
+                &Arc::new(AtomicBool::new(false)),
                 &Language::new(),
                 &send,
                 &Cookies::default(),
                 &crate::lod_net::Inbox::default(),
-                Path::new("."),
+                &data,
                 &Arc::new(Mutex::new(None)),
+                &crate::raw_payloads::Transport::empty(),
             )
         });
         let mut server = Connection::local(server);
@@ -2001,24 +2933,250 @@ mod tests {
             play::Serverbound::KeepAlive(cfg::KeepAlive { id: 9 })
         );
         let timeout = Duration::from_secs(5);
+        let (event, _teleport_credit) = events.recv_timeout_owned(timeout).unwrap().into_parts();
+        assert!(matches!(event, Event::Packet(p) if *p == teleport));
+        let (event, _ping_credit) = events.recv_timeout_owned(timeout).unwrap().into_parts();
         assert!(
-            matches!(events.recv_timeout(timeout).unwrap(), Event::Packet(p) if *p == teleport)
-        );
-        assert!(
-            matches!(events.recv_timeout(timeout).unwrap(), Event::Packet(p) if *p == play::Clientbound::Ping(cfg::Ping { id: 7 }))
+            matches!(event, Event::Packet(p) if *p == play::Clientbound::Ping(cfg::Ping { id: 7 }))
         );
         writer.lock().unwrap().take().unwrap().shutdown();
         assert!(thread.join().unwrap().is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// #18380: the play loop over a pipe, handing its packets to an incoming queue.
+    struct PlayLoop {
+        events: ingress::Consumer<Event>,
+        /// The server's end, which gives up on a read after [`WAIT`].
+        server: Connection,
+        writer: Arc<Mutex<Option<QueuedWriter>>>,
+        configuring: Arc<AtomicBool>,
+        /// How the loop ended, once it has.
+        ended: std::sync::mpsc::Receiver<Result<Reason, Reason>>,
+        /// What `configuring` read on this loop's thread each time a reconfiguration's
+        /// acknowledgement was about to be queued.
+        phase_at_acknowledgement: std::sync::mpsc::Receiver<bool>,
+        root: PathBuf,
+    }
+
+    /// How long a test waits for anything, so a missed wakeup fails instead of hanging.
+    const WAIT: Duration = Duration::from_secs(5);
+
+    impl PlayLoop {
+        fn start(name: &str, budget: usize) -> Self {
+            let (root, data) = empty_item_data(name);
+            let (client, server) = horizon_protocol::connection::Pipe::pair();
+            let (mut reader, writer) = Connection::local(client).split();
+            let writer = Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap())));
+            let configuring = Arc::new(AtomicBool::new(false));
+            let (send, events) = ingress::channel(budget, Event::ingress_charge).unwrap();
+            let (thread_writer, thread_configuring) = (writer.clone(), configuring.clone());
+            let (done, ended) = channel();
+            let (probe, phase_at_acknowledgement) = channel();
+            std::thread::spawn(move || {
+                PHASE_PROBE.set(Some(probe));
+                let _ = done.send(receive_play(
+                    &mut reader,
+                    &thread_writer,
+                    &thread_configuring,
+                    &Language::new(),
+                    &send,
+                    &Cookies::default(),
+                    &crate::lod_net::Inbox::default(),
+                    &data,
+                    &Arc::new(Mutex::new(None)),
+                    &crate::raw_payloads::Transport::empty(),
+                ));
+            });
+            let server = Connection::local(server);
+            server.reader.set_read_timeout(Some(WAIT)).unwrap();
+            Self {
+                events,
+                server,
+                writer,
+                configuring,
+                ended,
+                phase_at_acknowledgement,
+                root,
+            }
+        }
+        fn send(&mut self, packet: play::Clientbound) {
+            self.server.send(&packet.encode()).unwrap();
+        }
+        fn reply(&mut self) -> play::Serverbound {
+            let (id, body) = self.server.recv().expect("no reply in time");
+            play::Serverbound::decode(id, &body).unwrap()
+        }
+        fn configuration_reply(&mut self) -> cfg::Serverbound {
+            let (id, body) = self.server.recv().expect("no reply in time");
+            cfg::Serverbound::decode(id, &body).unwrap()
+        }
+        fn running(&self) -> bool {
+            matches!(
+                self.ended.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            )
+        }
+        /// The reason the loop ended with, as its text and key: `Ok` from the server,
+        /// `Err` from this side.
+        fn end(self) -> Result<(String, Option<String>), (String, Option<String>)> {
+            let ended = self.ended.recv_timeout(WAIT).expect("the loop never ended");
+            std::fs::remove_dir_all(&self.root).unwrap();
+            let parts = |reason: Reason| (reason.text, reason.key);
+            ended.map(parts).map_err(parts)
+        }
+        fn shut(self) -> Result<(String, Option<String>), (String, Option<String>)> {
+            if let Some(writer) = self.writer.lock().unwrap().take() {
+                writer.shutdown();
+            }
+            self.end()
+        }
+    }
+
+    thread_local! {
+        /// Set only on a [`PlayLoop`]'s own thread: where it hears what `configuring`
+        /// read as a reconfiguration's acknowledgement was about to be queued.
+        static PHASE_PROBE: std::cell::RefCell<Option<std::sync::mpsc::Sender<bool>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called under the writer lock, right before the acknowledgement is queued.
+    pub(super) fn observe_phase_at_acknowledgement(configuring: &AtomicBool) {
+        PHASE_PROBE.with_borrow(|probe| {
+            if let Some(probe) = probe {
+                let _ = probe.send(configuring.load(Ordering::Acquire));
+            }
+        });
+    }
+
+    fn ping(id: i32) -> play::Clientbound {
+        play::Clientbound::Ping(cfg::Ping { id })
+    }
+
+    fn keepalive(id: i64) -> play::Clientbound {
+        play::Clientbound::KeepAlive(cfg::KeepAlive { id })
+    }
+
+    /// The bytes one queued ping holds in the incoming queue.
+    fn ping_charge() -> usize {
+        Event::Packet(Box::new(ping(0))).ingress_charge()
+            + horizon_mod_runtime::byte_channel::message_overhead::<Event>()
+    }
+
+    /// #18380: a game that stalls (a shader pack compiling) while a world's first view
+    /// streams in fills its incoming queue. The connection waits for it instead of ending.
+    #[test]
+    fn a_full_incoming_queue_waits_for_a_slow_game_instead_of_disconnecting() {
+        let mut play = PlayLoop::start("ingress-stall", 2 * ping_charge());
+        for id in 0..20 {
+            play.send(ping(id));
+        }
+        for id in 0..20 {
+            let (event, credit) = play.events.recv_timeout_owned(WAIT).unwrap().into_parts();
+            assert!(matches!(event, Event::Packet(p) if *p == ping(id)));
+            // The game holds each packet's charge for a while, as its backlog does.
+            std::thread::sleep(Duration::from_millis(10));
+            drop(credit);
+        }
+        play.send(keepalive(9));
+        assert_eq!(
+            play.reply(),
+            play::Serverbound::KeepAlive(cfg::KeepAlive { id: 9 })
+        );
+        assert!(play.running());
+        assert!(play.shut().is_err());
+    }
+
+    /// #18380: what main dropped under pressure (a pack pop) is still dropped, not waited
+    /// for, so keepalives behind it are answered while the game is stalled.
+    #[test]
+    fn a_full_queue_still_answers_keepalives_behind_a_best_effort_event() {
+        let mut play = PlayLoop::start("ingress-best-effort", ping_charge());
+        play.send(ping(1));
+        play.send(play::Clientbound::ResourcePackPop(cfg::ResourcePackPop {
+            id: None,
+        }));
+        play.send(keepalive(9));
+        assert_eq!(
+            play.reply(),
+            play::Serverbound::KeepAlive(cfg::KeepAlive { id: 9 })
+        );
+        assert!(play.running());
+        assert!(play.shut().is_err());
+    }
+
+    /// #18380: a reconfiguration turns the game's answers to configuration only once the
+    /// acknowledgement is queued, or an answer to a play packet the game still holds
+    /// reaches a server that reads it as play. And a stalled game doesn't hold up
+    /// configuration: its keepalives are answered while the queue is still full.
+    #[test]
+    fn a_reconfiguration_is_acknowledged_first_and_answered_while_the_game_stalls() {
+        let mut play = PlayLoop::start("ingress-reconfigure", ping_charge());
+        play.send(ping(1));
+        play.send(play::Clientbound::StartConfiguration(Empty));
+        assert_eq!(
+            play.reply(),
+            play::Serverbound::ConfigurationAcknowledged(Empty)
+        );
+        // The acknowledgement is on the wire, so the probe before it has reported.
+        let seen: Vec<bool> = play.phase_at_acknowledgement.try_iter().collect();
+        assert_eq!(
+            seen,
+            [false],
+            "configuring turned before the acknowledgement"
+        );
+        assert!(play.configuring.load(Ordering::Acquire));
+        play.server
+            .send(&cfg::Clientbound::KeepAlive(cfg::KeepAlive { id: 5 }).encode())
+            .unwrap();
+        assert_eq!(
+            play.configuration_reply(),
+            cfg::Serverbound::KeepAlive(cfg::KeepAlive { id: 5 })
+        );
+        assert!(play.running());
+        let (event, credit) = play.events.recv_timeout_owned(WAIT).unwrap().into_parts();
+        assert!(matches!(event, Event::Packet(p) if *p == ping(1)));
+        drop(credit);
+        let (event, _credit) = play.events.recv_timeout_owned(WAIT).unwrap().into_parts();
+        assert!(matches!(event, Event::Reconfiguring));
+        assert!(play.shut().is_err());
+    }
+
+    /// #18380: waiting for room ends when the game drops its end, and a packet that could
+    /// never fit is refused with that reason instead of a bare "Disconnected".
+    #[test]
+    fn a_waiting_connection_ends_on_a_closed_queue_or_a_packet_larger_than_it() {
+        let mut play = PlayLoop::start("ingress-closed", ping_charge());
+        play.send(ping(1));
+        play.send(ping(2));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(play.running(), "the full queue ended the connection");
+        drop(std::mem::replace(&mut play.events, event_channel().1));
+        assert_eq!(play.end(), Err(("Disconnected".to_owned(), None)));
+
+        let mut play = PlayLoop::start("ingress-oversize", ping_charge() - 1);
+        play.send(ping(1));
+        let Err((text, key)) = play.end() else {
+            panic!("a packet larger than the queue was taken");
+        };
+        assert_eq!(
+            key.as_deref(),
+            Some("horizon.multiplayer.incoming_too_large")
+        );
+        // A permanent refusal: the next attempt would hit it again.
+        assert!(!crate::reconnect::allowed(&text, key.as_deref(), false));
     }
 
     #[test]
-    fn play_packets_wait_out_a_reconfiguration() {
+    fn local_send_rejects_unknown_oversize_payload_before_writing() {
         let (client, server) = horizon_protocol::connection::Pipe::pair();
-        let (mut reader, writer) = Connection::local(client).split();
-        let (send, events) = channel();
+        let (_, writer) = Connection::local(client).split();
+        let (_, events) = event_channel();
         let session = Session {
             events,
-            writer: Arc::new(Mutex::new(Some(writer))),
+            payload_events: event_channel().0,
+            payloads: crate::raw_payloads::Transport::empty(),
+            writer: Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap()))),
             configuring: Arc::new(AtomicBool::new(false)),
             thread: None,
             address: "local".into(),
@@ -2028,6 +3186,51 @@ mod tests {
             debug: false,
             far: Arc::default(),
             recorder: Arc::new(Mutex::new(None)),
+            serial: next_serial(),
+        };
+        let mut server = Connection::local(server);
+        let payload = |size| {
+            play::Serverbound::CustomPayload(cfg::CustomPayload {
+                channel: "test:opaque".into(),
+                data: vec![0x83; size],
+            })
+        };
+        session.send(payload(32_767));
+        let (id, bytes) = server.recv().unwrap();
+        assert_eq!(
+            play::Serverbound::decode(id, &bytes).unwrap(),
+            payload(32_767)
+        );
+        session.send(payload(32_768));
+        session.send(play::Serverbound::ClientTickEnd(Empty));
+        let (id, bytes) = server.recv().unwrap();
+        assert_eq!(
+            play::Serverbound::decode(id, &bytes).unwrap(),
+            play::Serverbound::ClientTickEnd(Empty)
+        );
+    }
+
+    #[test]
+    fn play_packets_wait_out_a_reconfiguration() {
+        let (root, data) = empty_item_data("reconfiguration");
+        let (client, server) = horizon_protocol::connection::Pipe::pair();
+        let (mut reader, writer) = Connection::local(client).split();
+        let (send, events) = event_channel();
+        let session = Session {
+            events,
+            payload_events: event_channel().0,
+            payloads: crate::raw_payloads::Transport::empty(),
+            writer: Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap()))),
+            configuring: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            address: "local".into(),
+            name: "Player".into(),
+            counters: Arc::new(Mutex::new(None)),
+            cookies: Cookies::default(),
+            debug: false,
+            far: Arc::default(),
+            recorder: Arc::new(Mutex::new(None)),
+            serial: next_serial(),
         };
         let (thread_writer, thread_configuring, thread_recorder) = (
             session.writer.clone(),
@@ -2043,8 +3246,9 @@ mod tests {
                 &send,
                 &Cookies::default(),
                 &crate::lod_net::Inbox::default(),
-                Path::new("."),
+                &data,
                 &thread_recorder,
+                &crate::raw_payloads::Transport::empty(),
             )
         });
         let mut server = Connection::local(server);
@@ -2073,27 +3277,30 @@ mod tests {
         assert_eq!(play::Serverbound::decode(id, &body).unwrap(), tick_end);
         drop(session);
         assert!(thread.join().unwrap().is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn play_answers_cookie_requests_from_stored_cookies_and_follows_transfers() {
+        let (root, data) = empty_item_data("cookies");
         let (client, server) = horizon_protocol::connection::Pipe::pair();
         let (mut reader, writer) = Connection::local(client).split();
-        let writer = Arc::new(Mutex::new(Some(writer)));
-        let (send, events) = channel();
+        let writer = Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap())));
+        let (send, events) = event_channel();
         let cookies = Cookies::default();
         let (thread_writer, thread_cookies) = (writer.clone(), cookies.clone());
         let thread = std::thread::spawn(move || {
             receive_play(
                 &mut reader,
                 &thread_writer,
-                &AtomicBool::new(false),
+                &Arc::new(AtomicBool::new(false)),
                 &Language::new(),
                 &send,
                 &thread_cookies,
                 &crate::lod_net::Inbox::default(),
-                Path::new("."),
+                &data,
                 &Arc::new(Mutex::new(None)),
+                &crate::raw_payloads::Transport::empty(),
             )
         });
         let mut server = Connection::local(server);
@@ -2129,20 +3336,26 @@ mod tests {
         });
         server.send(&transfer.encode()).unwrap();
         assert!(thread.join().unwrap().is_ok());
+        let turn: Vec<_> = events
+            .take_turn()
+            .into_iter()
+            .map(ingress::OwnedReceipt::into_parts)
+            .collect();
         assert!(matches!(
-            events.try_iter().last(),
-            Some(Event::Transfer { host, port: 25566 }) if host == "example.net"
+            turn.last(),
+            Some((Event::Transfer { host, port: 25566 }, _credit)) if host == "example.net"
         ));
         // The stored cookie stays for the next connection (TransferState).
         assert_eq!(
             cookies.lock().unwrap().get("proxy:session"),
             Some(&vec![1, 2, 3])
         );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn server_brand_payload_is_decoded_and_invalid_or_unrelated_payloads_are_ignored() {
-        let (send, events) = channel();
+        let (send, events) = event_channel();
         let mut writer = horizon_protocol::buf::Writer::new();
         writer.string("vanilla");
         let mut payload = cfg::CustomPayload {
@@ -2150,19 +3363,22 @@ mod tests {
             data: writer.data,
         };
         receive_brand(&payload, &send);
-        assert!(matches!(events.try_recv(), Ok(Event::Brand(brand)) if brand == "vanilla"));
+        let (event, _credit) = events.try_recv_owned().unwrap().into_parts();
+        assert!(matches!(event, Event::Brand(brand) if brand == "vanilla"));
         payload.channel = "example:other".into();
         receive_brand(&payload, &send);
-        assert!(events.try_recv().is_err());
+        assert!(events.try_recv_owned().is_err());
         payload.channel = "minecraft:brand".into();
         payload.data = vec![0xff];
         receive_brand(&payload, &send);
-        assert!(events.try_recv().is_err());
+        assert!(events.try_recv_owned().is_err());
     }
     /// No account never joins; the signed-in rule is compared with the real
     /// client login listener by test_lan_auth_parity.py.
     #[test]
+    #[ignore = "daily"]
     fn lan_login_continues_after_authentication_failure() {
+        let (root, data) = empty_item_data("lan-auth");
         for lan in [true, false] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -2229,15 +3445,16 @@ mod tests {
                 None,
                 cfg::ClientInformation::new(8),
                 Arc::new(lang),
-                PathBuf::new(),
+                Arc::clone(&data),
             );
-            let reason = loop {
-                if let Event::Disconnected { reason, .. } = session
+            let (reason, _credit) = loop {
+                let (event, credit) = session
                     .events
-                    .recv_timeout(Duration::from_secs(60))
+                    .recv_timeout_owned(Duration::from_secs(60))
                     .unwrap()
-                {
-                    break reason;
+                    .into_parts();
+                if let Event::Disconnected { reason, .. } = event {
+                    break (reason, credit);
                 }
             };
             // Without an account nothing joins, LAN or not.
@@ -2255,16 +3472,57 @@ mod tests {
                 !goes_on
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A recorder that keeps what reaches it, as (id, payload).
+    #[derive(Clone, Default)]
+    struct TestRecorder(Arc<Mutex<Vec<(i32, Vec<u8>)>>>);
+    impl PacketRecorder for TestRecorder {
+        fn is_active(&self) -> bool {
+            true
+        }
+        fn received(&self, _packet: &play::Clientbound, id: i32, payload: &[u8]) {
+            self.0.lock().unwrap().push((id, payload.to_vec()));
+        }
+        fn record_packet(&self, id: i32, payload: &[u8]) {
+            self.0.lock().unwrap().push((id, payload.to_vec()));
+        }
+        fn status(&self) -> RecorderStatus {
+            RecorderStatus {
+                active: true,
+                path: PathBuf::from("test.mcpr"),
+                elapsed: Duration::ZERO,
+                packet_count: self.0.lock().unwrap().len() as u64,
+                bytes_written: 0,
+                error: None,
+            }
+        }
+        fn stop(self: Box<Self>) -> std::io::Result<PathBuf> {
+            Ok(PathBuf::from("test.mcpr"))
+        }
+    }
+    impl TestRecorder {
+        fn decoded(&self) -> Vec<play::Clientbound> {
+            let packets = self.0.lock().unwrap();
+            packets
+                .iter()
+                .map(|(id, payload)| play::Clientbound::decode(*id, payload).unwrap())
+                .collect()
+        }
     }
 
     #[test]
-    fn session_studio_recording_tap_records_packets_to_mcpr() {
+    fn session_recorder_gets_the_play_packets_the_network_thread_receives() {
+        let (root, data) = empty_item_data("studio_recording");
         let (client, server) = horizon_protocol::connection::Pipe::pair();
         let (mut reader, writer) = Connection::local(client).split();
-        let (send, events) = channel();
+        let (send, events) = event_channel();
         let session = Session {
             events,
-            writer: Arc::new(Mutex::new(Some(writer))),
+            payload_events: event_channel().0,
+            payloads: crate::raw_payloads::Transport::empty(),
+            writer: Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap()))),
             configuring: Arc::new(AtomicBool::new(false)),
             thread: None,
             address: "local".into(),
@@ -2274,21 +3532,10 @@ mod tests {
             debug: false,
             far: Arc::default(),
             recorder: Arc::new(Mutex::new(None)),
+            serial: next_serial(),
         };
-
-        let temp_dir = std::env::temp_dir().join(format!(
-            "horizon-studio-test-{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let mcpr_path = temp_dir.join("test_tap.mcpr");
-
-        let meta = Metadata::new("Singleplayer World".into(), true, "26.3".into());
-        session.start_recording(&mcpr_path, meta).unwrap();
+        let recorder = TestRecorder::default();
+        session.start_recording(recorder.clone(), |_| {});
         assert!(session.is_recording());
 
         let (thread_writer, thread_configuring, thread_recorder) = (
@@ -2305,8 +3552,9 @@ mod tests {
                 &send,
                 &Cookies::default(),
                 &crate::lod_net::Inbox::default(),
-                Path::new("."),
+                &data,
                 &thread_recorder,
+                &crate::raw_payloads::Transport::empty(),
             )
         });
 
@@ -2320,32 +3568,109 @@ mod tests {
             relatives: 0,
         });
         server.send(&pos_pkt.encode()).unwrap();
-
-        // Disconnect ends receive_play loop
+        // Disconnect ends receive_play's loop.
         let disc_pkt = play::Clientbound::Disconnect(cfg::Disconnect {
             reason: Tag::String("Replay tap test completed".into()),
         });
         server.send(&disc_pkt.encode()).unwrap();
-
         let _ = thread.join().unwrap();
 
-        let saved_path = session.stop_recording().unwrap().unwrap();
-        assert_eq!(saved_path, mcpr_path);
+        assert_eq!(
+            session.stop_recording().unwrap().unwrap(),
+            PathBuf::from("test.mcpr")
+        );
         assert!(!session.is_recording());
-        assert!(mcpr_path.exists());
+        // The recorder is handed both; what a recording keeps is the recorder's choice.
+        assert_eq!(recorder.decoded(), [pos_pkt, disc_pkt]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
-        // Verify that the recording archive contains the clientbound packets.
-        let mut recording = crate::studio::McprReader::open(&mcpr_path).unwrap();
-        assert_eq!(recording.total_packets(), 1);
-        assert_eq!(recording.metadata.server_name, "Singleplayer World");
-        assert!(recording.metadata.singleplayer);
-        assert!(recording.metadata.players.is_empty());
+    #[test]
+    fn session_recorder_gets_the_packets_the_client_makes() {
+        use horizon_protocol::entity_data::{Value, serializer};
 
-        let packet1 = recording.next_packet().unwrap().unwrap();
-        assert!(recording.next_packet().unwrap().is_none());
+        let session = Session::replay("StudioTester");
+        session.record_clientbound(&play::Clientbound::SwingAnimation(play::SwingAnimation {
+            id: 1,
+            hand: 0,
+            kind: 0,
+            duration: 6,
+        }));
+        let recorder = TestRecorder::default();
+        // What `initialize` writes comes first.
+        let snapshot = play::Clientbound::PlayerPosition(play::PlayerPosition {
+            teleport: 0,
+            position: [12.5, 64.0, -88.5],
+            delta: [0.0; 3],
+            yaw: 90.0,
+            pitch: 15.0,
+            relatives: 0,
+        });
+        session.start_recording(recorder.clone(), |rec| {
+            let encoded = snapshot.encode();
+            let mut reader = horizon_protocol::buf::Reader::new(&encoded);
+            let id = reader.varint().unwrap();
+            rec.record_packet(id, reader.rest());
+        });
+        let swing_pkt = play::Clientbound::SwingAnimation(play::SwingAnimation {
+            id: 42,
+            hand: 0,
+            kind: 1,
+            duration: 6,
+        });
+        session.record_clientbound(&swing_pkt);
+        let data_pkt = play::Clientbound::SetEntityData(play::SetEntityData {
+            id: 42,
+            values: vec![
+                (0, serializer::BYTE, Value::Byte(0x02)),
+                (6, serializer::POSE, Value::Id(5)),
+            ],
+        });
+        session.record_clientbound(&data_pkt);
+        assert_eq!(session.recorder_status().unwrap().packet_count, 3);
+        session.stop_recording().unwrap().unwrap();
+        // Nothing reaches a stopped recording.
+        session.record_clientbound(&swing_pkt);
 
-        let decoded1 = play::Clientbound::decode(packet1.id, &packet1.payload).unwrap();
-        assert_eq!(decoded1, pos_pkt);
+        assert_eq!(recorder.decoded(), [snapshot, swing_pkt, data_pkt]);
+    }
+
+    #[test]
+    fn fill_known_entries_rejects_path_traversal_and_reads_valid_entries() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("horizon-net-reg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let resources = temp_dir.join("res");
+        let valid_dir = resources.join("data/minecraft/worldgen/biome");
+        std::fs::create_dir_all(&valid_dir).unwrap();
+        std::fs::write(
+            valid_dir.join("plains.json"),
+            br#"{"has_precipitation":true}"#,
+        )
+        .unwrap();
+        std::fs::write(temp_dir.join("secret.json"), br#"{"leaked":true}"#).unwrap();
+
+        let mut reg = cfg::RegistryData {
+            registry: "minecraft:worldgen/biome".into(),
+            entries: vec![
+                cfg::RegistryEntry {
+                    id: "minecraft:plains".into(),
+                    data: None,
+                },
+                cfg::RegistryEntry {
+                    id: "minecraft:../../../../secret".into(),
+                    data: None,
+                },
+                cfg::RegistryEntry {
+                    id: "..:plains".into(),
+                    data: None,
+                },
+            ],
+        };
+        fill_known_entries(&mut reg, &resources);
+        assert!(reg.entries[0].data.is_some());
+        assert!(reg.entries[1].data.is_none());
+        assert!(reg.entries[2].data.is_none());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

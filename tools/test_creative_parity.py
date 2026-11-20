@@ -12,10 +12,15 @@ horizon_client::creative::Creative. The tabs it shows (id, title, icon,
 position, every stack with its components), the search tab's stacks and the
 results of every query must agree. The queries are QUERIES below, then every
 search stack's item path and tooltip lines, every item tag with and without
-"#", and half of each as a prefix. Both run twice: as a player without
-permissions, then as an operator with the Operator Items Tab option on
+"#", and half of each as a prefix. A second set runs after switching to
+French to check that the search follows translated tooltip text. Both run
+twice: as a player without permissions, then as an operator with the Operator Items Tab option on
 (CreativeModeInventoryScreen.hasPermissions), where the operator tab and its
 stacks in the search tab appear.
+
+Middle-click also copies a plain display stack and stacks with different
+max_stack_size components through each client's display-slot click handler.
+An explicitly removed max_stack_size component remains a known difference.
 
   test_creative_parity.py [--detail N]
 """
@@ -38,13 +43,24 @@ PARITY = lab.ROOT / 'mods/horizon/src/test/java/dev/horizonlab/parity'
 # functional tab, case, spaces, colons and tag searches.
 QUERIES = ['', 'anvil', 'Anvil', 'ANVIL', 'crafting', 'crafting table', 'smithing', 'smithing table', 'table', 'chest',
            'furnace', 'bed', 'sign', 'banner', 'ominous', 'painting', 'loom', 'grindstone', 'lectern', 'stone', 'oak',
-           'a', 'e', ' ', '  ', 'xyz', 'potion', 'healing', 'splash', 'sharpness', 'enchanted', 'book', 'mending',
+           'a', 'e', ' ', '  ', 'xyz', 'potion', 'healing', 'splash', 'sharpness', 'enchanted', 'book', 'mending', 'channeling',
            'goat horn', 'ponder', 'firework', 'flight', 'music disc', 'disc', 'spawn egg', 'egg', 'stew', 'arrow',
            'tipped', 'light gray', 'red ', ' red', 'minecraft:', 'minecraft:anvil', 'minecraft:table', 'mine:craft',
            ':anvil', ':', 'anvil:', 'minecraft: anvil', ' minecraft : anvil ', 'diamond_sword', 'diamond sword',
            'attack', 'when in main hand', '+', '-3', 'command', 'barrier', 'debug', 'light', 'structure', 'jigsaw',
            '#', '#logs', '#minecraft:logs', '#minecraft:', '#:planks', '#wool', '#LOGS', '#swords', '#anvil', '#xyz',
            '#minecraft', '#enchantable/', 'é', 'İ', 'Σ']
+FRENCH_QUERIES = ['canalisation', 'CANALISATION', 'minecraft:canalisation', 'canalisation i', 'channeling',
+                  'tranchant', 'tranchant v', 'raccommodage', 'mending', 'livre enchanté', '#logs']
+
+DISPLAY_COUNTS = {
+    '{id:"minecraft:stone",count:1}': 64,
+    '{id:"minecraft:ender_pearl",count:1}': 16,
+    '{id:"minecraft:totem_of_undying",count:1}': 1,
+    '{id:"minecraft:stone",count:1,components:{"minecraft:max_stack_size":16}}': 16,
+    '{id:"minecraft:stone",count:1,components:{"minecraft:max_stack_size":99}}': 99,
+}
+REMOVED_STACK_LIMIT = '{id:"minecraft:stone",count:1,components:{"!minecraft:max_stack_size":{}}}'
 
 
 def main():
@@ -54,7 +70,9 @@ def main():
     lock, jars, _ = base.verify_artifacts()
     libraries = baking.client_libraries()
     build = lab.LOCAL / 'creative-parity'; build.mkdir(parents=True, exist_ok=True)
-    queries = build / 'queries.json'; queries.write_text(json.dumps(QUERIES))
+    queries = build / 'queries.json'
+    queries.write_text(json.dumps({'english': QUERIES, 'french': FRENCH_QUERIES,
+                                   'displayStacks': [*DISPLAY_COUNTS, REMOVED_STACK_LIMIT]}), encoding='utf-8')
     classes = build / 'classes'; classes.mkdir(exist_ok=True)
     dependencies = os.pathsep.join(map(str, [jars['client'], *libraries]))
 
@@ -78,12 +96,13 @@ def main():
 def compare(args, build, classes, dependencies, queries, run, mode):
     suffix = '-' + mode if mode else ''
     run(['java', '-Xmx2G', '-cp', str(classes) + os.pathsep + dependencies, 'dev.horizonlab.parity.VanillaCreativeSearchOracle',
-         queries, build / 'creative-inventory.json', build / f'vanilla{suffix}.json', *([mode] if mode else [])],
+         queries, build / 'creative-inventory.json', build / f'vanilla{suffix}.json', lib.RESOURCES,
+         *([mode] if mode else [])],
         'vanilla' + suffix)
     lib.cargo_example('horizon-client', 'creative_search_fixture', lib.RESOURCES, build / 'creative-inventory.json',
                       build / f'vanilla{suffix}.json', build / f'rust{suffix}.json', *([mode] if mode else []))
-    vanilla = json.loads((build / f'vanilla{suffix}.json').read_text())
-    rust = json.loads((build / f'rust{suffix}.json').read_text())
+    vanilla = json.loads((build / f'vanilla{suffix}.json').read_text(encoding='utf-8'))
+    rust = json.loads((build / f'rust{suffix}.json').read_text(encoding='utf-8'))
     bad = 0
     shown = [{k: t[k] for k in ('id', 'title', 'icon', 'row', 'column', 'items')} for t in vanilla['tabs'] if t['shown']]
     if [t['id'] for t in shown] != [t['id'] for t in rust['tabs']]:
@@ -101,21 +120,51 @@ def compare(args, build, classes, dependencies, queries, run, mode):
             print('   horizon', r['items'][i] if i < len(r['items']) else None)
         print(f'  {v["id"]}: {len(v["items"])} stacks')
     search = next(t['items'] for t in vanilla['tabs'] if t['type'] == 'SEARCH')
+    channeling = next(q['results'] for q in vanilla['frenchSearches'] if q['query'] == 'canalisation')
+    expected_book = '{components:{minecraft:stored_enchantments:{minecraft:channeling:1}},count:1,id:"minecraft:enchanted_book"}'
+    if [search[i] for i in channeling] != [expected_book]:
+        sys.exit('Vanilla did not find the Channeling book in French; check the prepared fr_fr language file')
     if search != rust['search']:
         bad += 1; print(f'SEARCH TAB: {len(search)} vanilla stacks, {len(rust["search"])} horizon')
-    wrong = [(v, r) for v, r in zip(vanilla['searches'], rust['searches']) if v != r]
-    for v, r in wrong[:args.detail]:
-        missing = [search[i] for i in v['results'] if i not in r['results']][:3]
-        extra = [search[i] for i in r['results'] if i not in v['results']][:3]
-        print(f'SEARCH {v["query"]!r}: vanilla {len(v["results"])} results, horizon {len(r["results"])}; '
-              f'missing {missing} extra {extra}')
-    bad += len(wrong) + abs(len(vanilla['searches']) - len(rust['searches']))
+    for label, key in [('English', 'searches'), ('French', 'frenchSearches')]:
+        expected, actual = vanilla[key], rust[key]
+        wrong = [(v, r) for v, r in zip(expected, actual) if v != r]
+        for v, r in wrong[:args.detail]:
+            missing = [search[i] for i in v['results'] if i not in r['results']][:3]
+            extra = [search[i] for i in r['results'] if i not in v['results']][:3]
+            print(f'{label} SEARCH {v["query"]!r}: vanilla {len(v["results"])} results, horizon {len(r["results"])}; '
+                  f'missing {missing} extra {extra}')
+        bad += len(wrong) + abs(len(expected) - len(actual))
+        print(f'{len(expected) - len(wrong)}/{len(expected)} {label} searches match')
     for q in ('anvil', 'crafting', 'smithing'):
         hits = next(v['results'] for v in vanilla['searches'] if v['query'] == q)
         print(f'  search {q!r}: {len(hits)} results, ' + ', '.join(json.loads('"' + search[i].split('id:"')[1].split('"')[0] + '"')
                                                                       for i in hits[:6]))
-    print(f'{len(vanilla["searches"]) - len(wrong)}/{len(vanilla["searches"])} searches match; {len(shown)} tabs, '
-          f'{len(search)} search stacks')
+    print(f'{len(shown)} tabs, {len(search)} search stacks')
+    return bad + compare_display_copies(vanilla['displayCopies'], rust['displayCopies'])
+
+
+def compare_display_copies(vanilla, rust):
+    """Check the input sequence, vanilla counts and complete canonical copies."""
+    stacks = [*DISPLAY_COUNTS, REMOVED_STACK_LIMIT]
+    if [v['stack'] for v in vanilla] != stacks or [r['stack'] for r in rust] != stacks:
+        print('DISPLAY COPIES: the probes did not replay all display stacks in order')
+        return 1
+    bad = 0
+    for v, r in zip(vanilla, rust):
+        stack = v['stack']
+        if stack == REMOVED_STACK_LIMIT:
+            if v['count'] != 1:
+                print(f'REMOVED STACK LIMIT: expected vanilla fallback 1, got {v["count"]}')
+                bad += 1
+            elif r != v:
+                print(f'REMOVED STACK LIMIT: vanilla {v["copy"]}, Horizon {r["copy"]} (known gap)')
+            continue
+        if v['count'] != DISPLAY_COUNTS[stack] or v != r:
+            print(f'DISPLAY COPY {stack}: vanilla {v["copy"]}, Horizon {r["copy"]}, expected count {DISPLAY_COUNTS[stack]}')
+            bad += 1
+    if not bad:
+        print(f'{len(DISPLAY_COUNTS)} display copies match')
     return bad
 
 

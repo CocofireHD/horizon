@@ -8,7 +8,7 @@ use super::fixes_a::attributes_rename_legacy;
 use super::fixes_b::advancements_rename;
 use super::schema::{Key, Ty, key};
 use super::{Cx, FixFn, id_is, renamer};
-use crate::nbt::{Compound, JavaString, Tag};
+use horizon_core::nbt::{Compound, JavaString, Tag};
 
 pub(super) fn register(out: &mut Vec<(Key, FixFn)>) {
     out.push((key(1800, 0), |cx| {
@@ -925,7 +925,7 @@ const ATTRIBUTES: &[(&str, &str)] = &[
 /// `BitStorageAlignFix.addPadding`: values stored without crossing longs.
 pub(super) fn add_padding(size: usize, bits: usize, data: &[i64]) -> Vec<i64> {
     let length = data.len();
-    if length == 0 {
+    if length == 0 || bits == 0 || bits >= 64 {
         return Vec::new();
     }
     let mask = (1i64 << bits) - 1;

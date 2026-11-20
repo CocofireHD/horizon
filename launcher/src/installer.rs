@@ -13,6 +13,7 @@
 //! `horizon-launcher-setup.exe` (window), `... setup --quiet [--dir <folder>] [--desktop-shortcut]`,
 //! `horizon-launcher.exe uninstall` (window), `... uninstall --quiet [--remove-data]`.
 use crate::backend;
+use crate::data_location::{self, Roots};
 use crate::shortcut;
 use std::fs;
 use std::io;
@@ -23,7 +24,7 @@ use winreg::RegKey;
 pub const APP_NAME: &str = "Horizon Launcher";
 const BINARY: &str = "horizon-launcher.exe";
 const PUBLISHER: &str = "Horizon";
-const ABOUT_URL: &str = "https://playhorizon.dev";
+const ABOUT_URL: &str = horizon_addresses::LAUNCHER_ABOUT;
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\HorizonLauncher";
 const OWN_KEY: &str = r"Software\Horizon\Launcher";
 const ASIDE_PREFIX: &str = "horizon-launcher-uninstall-";
@@ -193,6 +194,8 @@ fn place(src: &Path, dest: &Path) -> io::Result<()> {
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no folder"))?;
     let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    // The same lock as a self-update: the startup cleanup leaves this one's files alone.
+    let _lock = backend::lock_update(&backend::update_lock_file(dest)).map_err(io::Error::other)?;
     let pid = std::process::id();
     let temp = dir.join(format!("{name}.update-{pid}"));
     // A leftover from an earlier run (the same pid, a crash) must not stop the rename.
@@ -418,6 +421,36 @@ fn close_running_launchers(progress: &impl Fn(Step, f32)) {
     std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
+/// The data location the player moved the launcher's data to (Settings > Data folder), when
+/// [`backend::data_dir`] follows it: not under `HORIZON_LAUNCHER_HOME`, which comes first.
+fn moved_location() -> Option<Roots> {
+    if std::env::var_os("HORIZON_LAUNCHER_HOME").is_some_and(|p| !p.is_empty()) {
+        return None;
+    }
+    data_location::configured_roots().ok().flatten()
+}
+
+fn named(path: &Path, name: &str) -> bool {
+    let Some(last) = path.file_name() else {
+        return false;
+    };
+    last.eq_ignore_ascii_case(name)
+}
+
+/// Whether `data`, the folder [`backend::data_dir`] names, is one the launcher made, so that
+/// `--remove-data` may delete it: the default `horizon-launcher` folder, or the `launcher` folder
+/// of a moved data location, which the move lays out as `<folder>\launcher`, `\game` and `\build`.
+fn made_by_launcher(data: &Path, location: Option<&Roots>) -> bool {
+    let laid_out = location.is_some_and(|r| r.launcher == data && named(&r.launcher, "launcher"));
+    named(data, "horizon-launcher") || laid_out
+}
+
+/// Whether `builds`, [`backend::build_dir`], goes with a data folder the launcher made. In a moved
+/// location it is `<folder>\build` or inside the launcher folder; elsewhere it is always ours.
+fn builds_are_launchers(builds: &Path, data: &Path, location: Option<&Roots>) -> bool {
+    location.is_none() || builds.starts_with(data) || named(builds, "build")
+}
+
 /// Takes the install away. Returns what could not be removed (a file in use, say).
 pub fn uninstall(remove_data: bool, progress: impl Fn(Step, f32)) -> Result<Vec<String>, String> {
     let dir = registered()
@@ -493,16 +526,21 @@ pub fn uninstall(remove_data: bool, progress: impl Fn(Step, f32)) -> Result<Vec<
     if remove_data {
         progress(Step::Data, 0.8);
         let data = backend::data_dir();
-        // Only the folder the launcher itself names: `HORIZON_LAUNCHER_HOME` may point anywhere.
-        if data
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("horizon-launcher"))
-        {
+        let location = moved_location();
+        // Only a folder the launcher made: `HORIZON_LAUNCHER_HOME` may point anywhere.
+        if made_by_launcher(&data, location.as_ref()) {
             remove_all(&data, &mut left);
             // A profile whose name isn't ASCII keeps the build folder in %ProgramData%
             // (`backend::build_dir`); it is the launcher's too. Already gone with `data` otherwise.
             let builds = backend::build_dir();
-            remove_all(&builds, &mut left);
+            if builds_are_launchers(&builds, &data, location.as_ref()) {
+                remove_all(&builds, &mut left);
+            } else {
+                left.push(format!(
+                    "{} (not the launcher's own folder)",
+                    builds.display()
+                ));
+            }
         } else {
             left.push(format!(
                 "{} (not the launcher's own folder)",
@@ -594,6 +632,56 @@ mod tests {
             folder_for(Path::new(r"C:\Games\horizon launcher")),
             PathBuf::from(r"C:\Games\horizon launcher")
         );
+    }
+
+    fn moved_to(folder: &str) -> Roots {
+        let folder = PathBuf::from(folder);
+        Roots {
+            launcher: folder.join("launcher"),
+            game: folder.join("game"),
+            build: folder.join("build"),
+        }
+    }
+
+    #[test]
+    fn uninstall_deletes_only_folders_the_launcher_made() {
+        // The default folder, and one `HORIZON_LAUNCHER_HOME` names the same.
+        let default = Path::new(r"C:\Users\p\AppData\Roaming\horizon-launcher");
+        assert!(made_by_launcher(default, None));
+        assert!(builds_are_launchers(default, default, None));
+        assert!(!made_by_launcher(Path::new(r"D:\Documents"), None));
+        assert!(!made_by_launcher(Path::new(r"D:\Games\launcher"), None));
+
+        // Data moved to D:\Horizon (`data_location::layout`): its launcher and build folders go,
+        // the game folder never.
+        let moved = moved_to(r"D:\Horizon");
+        assert!(made_by_launcher(&moved.launcher, Some(&moved)));
+        assert!(builds_are_launchers(
+            &moved.build,
+            &moved.launcher,
+            Some(&moved)
+        ));
+        assert!(!made_by_launcher(&moved.game, Some(&moved)));
+        // A build folder inside the launcher folder goes with it.
+        let inside = Path::new(r"D:\Horizon\launcher\build");
+        assert!(builds_are_launchers(inside, &moved.launcher, Some(&moved)));
+
+        // Not what a move lays out (a location file edited by hand): left alone.
+        let odd = Roots {
+            launcher: PathBuf::from(r"D:\Documents"),
+            ..moved.clone()
+        };
+        assert!(!made_by_launcher(&odd.launcher, Some(&odd)));
+        let odd = Roots {
+            build: PathBuf::from(r"D:\Documents"),
+            ..moved.clone()
+        };
+        assert!(!builds_are_launchers(&odd.build, &odd.launcher, Some(&odd)));
+        // Another folder called `launcher` than the configured one.
+        assert!(!made_by_launcher(
+            Path::new(r"D:\Elsewhere\launcher"),
+            Some(&moved)
+        ));
     }
 
     /// What the shell itself reads as the shortcut's target: the field Explorer starts from.

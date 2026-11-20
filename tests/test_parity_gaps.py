@@ -4,7 +4,7 @@ from pathlib import Path
 
 from tools import parity_gaps as pg
 
-README = Path(__file__).resolve().parents[1] / "README.md"
+README = Path(__file__).resolve().parents[1] / "docs" / "status.md"
 
 
 def lists(*opens):
@@ -30,28 +30,46 @@ class ReadmeTests(unittest.TestCase):
         self.assertEqual(pg.written(block), (25, [20, 5, 0]))
 
     def test_rewrite_replaces_the_block_and_the_badge(self):
-        text = ("<p>\n  <img src=\"https://img.shields.io/badge/vanilla%20parity-100%25-F0795A\" alt=\"x\">\n</p>\n\n"
-                "## Project status\n\nThe table.\n")
+        text = ("<p align=\"center\">\n  <img src=\"https://img.shields.io/badge/other-1-F0795A\" alt=\"x\">\n</p>\n\n"
+                "# Horizon\n\n## Project status\n\nThe table.\n")
         once = pg.rewrite(text, pg.block(lists(7)), 7)
         self.assertIn("player--visible%20gaps-7%20open-", once)
+        self.assertLess(once.index("badge/other-1"), once.index("player--visible%20gaps-7"))
+        self.assertLess(once.index("player--visible%20gaps-7"), once.index("</p>\n\n# Horizon"))
         self.assertIn("## Project status\n\n**Player-visible gaps: 7 open**", once)
         twice = pg.rewrite(once, pg.block(lists(3)), 3)
         self.assertEqual(twice.count("**Player-visible gaps:"), 1)
         self.assertIn("player--visible%20gaps-3%20open-", twice)
         self.assertEqual(pg.written(twice)[0], 3)
 
+    def test_rewrite_adds_a_badge_without_the_canonical_title(self):
+        text = ("# Status page\n\n## Project status\n\n"
+                "**Player-visible gaps: 42 open** of the gaps.\n\nSome prose.\n")
+        out = pg.rewrite(text, "**Player-visible gaps: 5 open** of the gaps.", 5)
+        self.assertIn("**Player-visible gaps: 5 open**", out)
+        self.assertIn("player--visible%20gaps-5%20open-", out)
+        self.assertIn("img.shields.io/badge", out)
+        self.assertLess(out.index("img.shields.io/badge"), out.index("## Project status"))
+        self.assertEqual(pg.written(out)[0], 5)
+
+    def test_rewrite_fails_loudly_when_no_badge_placement_exists(self):
+        text = "Just some prose with no status section.\n"
+        with self.assertRaises(ValueError) as ctx:
+            pg.rewrite(text, "**Player-visible gaps: 5 open** of the gaps.", 5)
+        self.assertIn("could not place the player-visible gaps badge", str(ctx.exception))
+
     def test_the_readme_agrees_with_itself(self):
         text = README.read_text(encoding="utf-8")
         total, counts = pg.written(text)
         self.assertEqual(len(counts), len(pg.ISSUES))
-        self.assertEqual(total, sum(counts), "the README's gap total is the sum of its areas")
+        self.assertEqual(total, sum(counts), "the status page's gap total is the sum of its areas")
         badge = pg.BADGE.search(text)
-        self.assertIsNotNone(badge, "the README's gap badge is missing")
+        self.assertIsNotNone(badge, "the status page's gap badge is missing")
         self.assertEqual(int(badge.group(2)), total, "the gap badge must match the block")
         status = text.split("## Project status", 1)[1]
         self.assertTrue(status.lstrip().startswith("**Player-visible gaps:"), "the gaps come first under Project status")
         self.assertNotIn("<!--", status.split("###", 1)[0], "the website prints HTML comments of this intro")
-        self.assertTrue(re.search(r"^### Java parity: \d+%$", status, re.M), "the site still reads this heading")
+        self.assertNotRegex(text, r"(?im)^#+ .*parity[^\n]*\d%", "no parity percentage heading (decided 2026-11-09)")
 
 
 if __name__ == "__main__":

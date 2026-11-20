@@ -137,7 +137,7 @@ if most of the work moves to parallel phases.
 
 ### 3.1 One server, in this repo
 
-Single player runs on the server thread (`game/integrated.rs`, since #1514), so the integrated server, LAN
+Single player runs on the server thread (`game/world/integrated.rs`, since arismoko/horizon#1514), so the integrated server, LAN
 hosts and `--dedicated` share every line of server code: the tick, the levels, the hub, the entity tracker,
 saving. A separate server repo would fork that code or pin it across repos, and either way two copies would
 drift. Gameplay is about 420 000 lines (`game/` 133 k, `mobs/` 62 k, `lan/` 15 k, the flat lib 90 k, and
@@ -145,12 +145,12 @@ drift. Gameplay is about 420 000 lines (`game/` 133 k, `mobs/` 62 k, `lan/` 15 k
 
 | Part | Where | Shared by |
 |---|---|---|
-| Parallel tick (section 4) | `game/levels.rs`, `game/integrated.rs`, `game/dedicated.rs`, and the scheduler as a new module beside them | integrated server, LAN, dedicated |
+| Parallel tick (section 4) | `game/world/levels.rs`, `game/world/integrated.rs`, `game/interface/dedicated/mod.rs`, and the scheduler as a new module beside them | integrated server, LAN, dedicated |
 | Network front (5) | the hub, `lan/` (`conn.rs`, `hub.rs`, `chunks.rs`, `tracking.rs`); framing in `horizon-protocol` | LAN, Play with Friends, dedicated, the integrated server's memory connection where it applies |
-| Saving and light off the tick thread (5.5) | `game/saving.rs`, `save.rs`, `horizon-world` | everyone |
+| Saving and light off the tick thread (5.5) | `game/world/saving.rs`, `save.rs`, `horizon-world` | everyone |
 | Fast path (8) | `horizon-protocol` (the `horizon:hello` payloads), `lan/conn.rs` (server), `net.rs` and `game/remote*.rs` (client) | every Horizon client against every Horizon server |
 | Operations (9.2) | `crates/horizon-server` (supervisor, panel, control API, MCP), `crates/horizon-server-files` | dedicated |
-| Plugin API (W9) | `crates/horizon-mods` and the server hooks from #3706 and #3878 | integrated server, LAN, dedicated |
+| Plugin API (W9) | `crates/horizon-mod-package` and the server hooks from arismoko/horizon#3706 and arismoko/horizon#3878 | integrated server, LAN, dedicated |
 | Bench (W0) | `tools/server_bench.py`, `crates/horizon-bots`, `benchmarks/` | — |
 
 What changes for single player: it gets the exact parallel phases (4.1, 4.2 `tick = "vanilla"`), the cheaper
@@ -182,7 +182,7 @@ connections). Inside a level it ticks in a fixed order:
 6. entities, in list order;
 7. block entities, in list order.
 
-Horizon follows the same order (`game/levels.rs` `tick_server`, which swaps each level into the one `Game`).
+Horizon follows the same order (`game/world/levels.rs` `tick_server`, which swaps each level into the one `Game`).
 
 ### 4.1 Levels in parallel (exact)
 
@@ -292,7 +292,7 @@ per server start and sent as prepared frames. The first chunks around the spawn 
 ### 5.4 Entity tracking as deltas
 
 - Today the tracker rebuilds each tracked entity's state per tick (`lan/entity.rs` `Entities::tick`,
-  `game/lan.rs` `mob_meta` ~3 % of the tick thread).
+  `game/network/lan/mod.rs` `mob_meta` ~3 % of the tick thread).
 - Instead, the engine writes a change log as it changes an entity (position, rotation, metadata index, equipment,
   passengers). The tracker turns each changed entity into packets once, and sends them to every player who
   sees it.
@@ -366,6 +366,11 @@ Each step below is one or more PRs. Each one is measured with the bench on three
    shrink back after the last one leaves. Their stacks are sized to what they use.
 6. **Give memory back.** After the last player leaves, unloaded chunks and caches are freed, and the allocator
    returns pages to the OS. The bench checks that RSS drops back under the target 60 s after the last leave.
+   - Done: 5 s and 30 s after the last player leaves, the chunk send caches are dropped and every pool thread
+     (terrain workers, chunk encoders, network threads, save compressors) hands its heap's free pages back. After
+     ten bots explored for two minutes, an empty server holds 506 MB instead of 659 MB; a fresh one holds 356-369 MB.
+   - Left: the structure starts the generator keeps (they also hold starts read from saved chunks, about 25 MB)
+     and pages the allocator can't return while a few small allocations still use them (about 75 MB).
 7. **Start < 0.1 s.** With steps 1 to 4, nothing heavy runs before the listener opens: read `server.properties`
    and the lists, map `server.pack`, read `level.dat`, bind. A startup span log times each step, and the bench
    fails a PR that makes any of them slower.
@@ -430,48 +435,4 @@ the supervisor (a missing feature, or no need), so that the supervisor covers wh
 
 ### 9.3 Issues anyone can take
 
-- **S-1 (#3971) bots: a `fight` behaviour.** Bots in survival that attack the nearest mob and each other.
-  Today's bench has no combat.
-- **S-2 (#3972) bench: Pumpkin and vanilla runs in `tools/server_bench.py`**, with `time query gametime` for
-  TPS, a `--pre-generated` world copy, and a Markdown table from the JSON.
-- **S-3 (#3973) bench: bots on another machine**, with the report recording where they ran.
-- **S-4 (#3974) the download repo's release workflow** (W8), now that no code lives there.
-- **S-5 (#3975) docs: an owner's page** comparing `server.properties` to `server.toml`: done, [owners.md](owners.md).
-- **S-6 (#3976) bots: report bytes and join time**, so the bench doesn't need `nettop`.
-
-## Appendix A. Open horizon PRs on the server's theme (2026-10-29)
-
-A snapshot of that day, not kept up to date: a PR's state now is on GitHub.
-
-Each one is **use** (what the server takes from it), **covered** (by what), or **not for the server**. ★ marks
-the ones that should land in horizon first: the server builds on them, so triage should prove them first.
-
-| PR | Author | Verdict |
-|---|---|---|
-| ★ #3815, ★ #3847 | ludovic111 | **use**: tick-thread costs (section 1). In the merger; #3834 merged |
-| ★ #3036 | hectoreccles | **use**: chunk batch bodies on helper threads, the base of W1 (5.3) |
-| ★ #2608 | FusselTV | **use**: nothing kept around spawn while nobody is on. It cuts idle CPU, idle RAM and start time, two of the three numbers where Pumpkin leads. It conflicts since `streaming.rs` moved to `horizon-client-render`; triage carries it if needed, as #2698 did |
-| ★ #3756 | ludovic111 | **use**: the server names itself `horizon`, which the fast path (8) builds on |
-| ★ #3441 | xKumorio | **use**: guests' known movement as vanilla's; server players' gameplay |
-| ★ #3873 | DUzzL | **use**: breeding statistics and advancements credited on the server thread |
-| ★ #3300, ★ #3802 | masa-masa-0314, ThatCakeIsAPie | **use**: a world's data packs reach recipes, loot, advancements, tags and block state providers. Servers run packs |
-| ★ #2698 (carries #2544, #2586) | FusselTV | **use**: structure mobs and generation animals as vanilla's |
-| ★ #2872 | levzzz5154 | **use**: forced chunks get vanilla's rings (`/forceload` farms) |
-| #3480–#3490 | ThatCakeIsAPie | **use**: each level's height from its dimension type (tall-world packs), local and over the network. #3489 (uniform sections shared) also feeds the memory target (7). It's a long stack, so it lands at its own pace |
-| #3491–#3494 | ThatCakeIsAPie | **use**: data-pack biomes, including the biome registry a server sends (#3493) |
-| #3366 | ThatCakeIsAPie | **use**: faster surface rules, i.e. more chunks generated a second for exploring players |
-| #3706, #3878 | arismoko | **use** (W9): read-only native world and server-tick hooks, the base of the plugin API |
-| #3827 | abit-foggy | **use if proven on the server bench**: incremental tick-chunk membership and random-tick bounds touch `tick_blocks` on the server too. It needs the bench and parity, not only the client's frame times |
-| #3868 | spidercraft | **covered** for the server: the dedicated server already runs online mode with the session check. The PR is for LAN and Play with Friends |
-| #3750, #3851 | leifiyoo, DUzzL | **use**: block entities replaced as vanilla does; the axolotl test fix (main's failing `pr_ready` test) |
-| #3369–#3374 | ThatCakeIsAPie | not for the server core: upgrading 26.2 data packs is an owner's tool, which the supervisor can call later |
-| #3201 | damnurmum | not for the server: packet translation for client mods |
-| #3276 | dan4ikx | not for the server now: client audio, UDP and mod payloads. Its client-to-server mod channels are a starting point for W9's plugin channels, and must not collide with `horizon:hello` (8) |
-| #3869, #3724, #3023 | spidercraft, aangeraakt, Web-mc1 | not for the server: Play with Friends codes, client skins, the launcher's ViaProxy |
-| #3669, #3841, #3865, #3881 | various | not for the server: client-side fixes |
-
-**Server parity fixes from contributors** land on their own merits: they are already the server's code: #3716, #3645, #3686, #2990, #2987, #2577, #3401, #3621, #3675, #3748, #3875, #3908.
-
-**Closed without merging in the last two weeks**, with a server idea: #628 (packets a second and the server
-line on F3) is the client half of the fast path's `server-stats` capability. The other 16 have no server idea, or are against
-Mojang's rules (#3537, #3681: offline play, other account providers).
+Open issues on the server's theme: `gh issue list --search 'is:open server in:title no:assignee'`.

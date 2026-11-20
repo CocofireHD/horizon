@@ -8,11 +8,10 @@
 //! sleep overlay and the subtitles (`SubtitleOverlay`).
 use crate::{
     font::Font,
-    hud_layout::{
-        Blend, GuiDraw, PoseOp, color_from_float, fill, hsv_to_argb, multiply, white, width,
-    },
+    hud_layout::{Blend, GuiDraw, PoseOp, color_from_float, fill, multiply, white, width},
     text::{Style, Text},
 };
+use horizon_core::color::hsv_to_argb;
 use std::{borrow::Cow, cmp::Ordering};
 
 /// `graphics.text`: dropped when fully transparent.
@@ -39,21 +38,27 @@ pub fn text_with_backdrop(
     background: u32,
 ) {
     if background != 0 {
+        // GuiGraphicsExtractor.textWithBackdrop adds two pixels around the
+        // text's advance and the font's nine-pixel line height.
         out.push(fill(
             x - 2,
             y - 2,
             x + w + 2,
-            y + 9 + 2,
+            y + 11,
             multiply(background, color),
         ));
     }
     text(out, t, x, y, color, true);
 }
 
-/// `Arrays.sort(T[], Comparator)` for the short arrays the HUD sorts: Java's
-/// TimSort below `MIN_MERGE` (a natural run, then binary insertion), which
-/// matters when the comparator is not a total order. Longer arrays fall back
-/// to a stable sort.
+/// `Arrays.sort(T[], Comparator)` for the short arrays the HUD sorts. Its Javadoc
+/// says it is adapted from Tim Peters's list sort for Python, and for fewer than 32
+/// elements that sort is one run plus binary insertion, as Tim Peters describes it
+/// in `listsort.txt` (CPython's `Objects/listsort.txt`): take the run at the start,
+/// reversed in place when it is strictly descending, then insert each remaining
+/// element by binary search after the elements equal to it, so the sort is stable.
+/// The order of the comparisons matters because vanilla's comparator here is not a
+/// total order. Longer arrays fall back to a stable sort.
 pub fn java_sort<T>(a: &mut [T], cmp: impl Fn(&T, &T) -> Ordering) {
     let n = a.len();
     if n < 2 {
@@ -63,7 +68,7 @@ pub fn java_sort<T>(a: &mut [T], cmp: impl Fn(&T, &T) -> Ordering) {
         a.sort_by(cmp);
         return;
     }
-    // countRunAndMakeAscending.
+    // The run at the start: strictly descending (then reversed) or non-descending.
     let mut run = 2;
     if cmp(&a[1], &a[0]) == Ordering::Less {
         while run < n && cmp(&a[run], &a[run - 1]) == Ordering::Less {
@@ -75,7 +80,7 @@ pub fn java_sort<T>(a: &mut [T], cmp: impl Fn(&T, &T) -> Ordering) {
             run += 1;
         }
     }
-    // binarySort.
+    // Binary insertion of the rest, each element after the last one not greater.
     for start in run..n {
         let (mut left, mut right) = (0, start);
         while left < right {
@@ -97,8 +102,9 @@ pub struct EffectIcon {
     pub id: String,
     /// `MobEffect.isBeneficial`.
     pub beneficial: bool,
-    /// `MobEffect.getColor`.
-    pub color: i32,
+    /// `IMobEffectExtension.getSortOrder`: `MobEffect.getColor` unless a content mod declared
+    /// an order.
+    pub sort_order: i32,
     pub ambient: bool,
     /// Remaining ticks, -1 for infinite.
     pub duration: i32,
@@ -112,25 +118,26 @@ impl From<&crate::effects::EffectInstance> for EffectIcon {
             id: effect.id.to_owned(),
             beneficial: def
                 .is_some_and(|d| d.category == horizon_client_core::potions::Category::Beneficial),
-            color: def.map_or(0, |d| d.color as i32),
+            sort_order: def.map_or(0, |d| d.sort_order),
             ambient: effect.ambient,
             duration: effect.duration,
-            // Horizon keeps no showIcon flag: every effect shows its icon.
-            show_icon: true,
+            show_icon: effect.show_icon,
         }
     }
 }
 
-/// `MobEffectInstance.compareTo`.
+/// `MobEffectInstance.compareTo`, with NeoForge's sort order in the colour's place.
 pub(crate) fn compare_effects(a: &EffectIcon, o: &EffectIcon) -> Ordering {
     if (a.duration <= 32147 || o.duration <= 32147) && !(a.ambient && o.ambient) {
         a.ambient
             .cmp(&o.ambient)
             .then((a.duration == -1).cmp(&(o.duration == -1)))
             .then(a.duration.cmp(&o.duration))
-            .then(a.color.cmp(&o.color))
+            .then(a.sort_order.cmp(&o.sort_order))
     } else {
-        a.ambient.cmp(&o.ambient).then(a.color.cmp(&o.color))
+        a.ambient
+            .cmp(&o.ambient)
+            .then(a.sort_order.cmp(&o.sort_order))
     }
 }
 
@@ -323,13 +330,12 @@ impl Titles {
             }
         }
     }
-    /// `Hud.extractOverlayMessage`; `bar_height` is
-    /// `max(leftHeight, rightHeight)`.
+    /// `Hud.extractOverlayMessage`: the action bar keeps its place however
+    /// tall the health, food, air and mount rows above the hotbar are.
     pub fn overlay_message(
         &self,
         w: i32,
         h: i32,
-        bar_height: i32,
         partial: f32,
         font: &Font,
         background: u32,
@@ -345,12 +351,11 @@ impl Titles {
         let alpha = ((t * 255.0 / 20.0) as i32).min(255);
         if alpha > 0 {
             let message = message.resolve_legacy();
-            // The bars' height plus the gap between the item name (59) and the
-            // overlay (68), at least the default level.
-            let y_shift = bar_height + (68 - 59);
+            // `Hud.extractOverlayMessage` translates to `guiHeight - 68`, a
+            // constant the bars above the hotbar never move.
             out.push(GuiDraw::Push(vec![PoseOp::Translate(
                 (w / 2) as f32,
-                (h - y_shift.max(68)) as f32,
+                (h - 68) as f32,
             )]));
             let color = if self.overlay_animated {
                 hsv_to_argb(t / 50.0, 0.7, 0.6, alpha as u32)
@@ -440,12 +445,29 @@ pub struct HeldName {
     /// The stack has `CUSTOM_NAME`.
     pub custom_name: bool,
 }
+impl HeldName {
+    /// The name as `Hud.extractSelectedItemName` draws it: the hover name in
+    /// its rarity colour, italic when the stack has a custom name.
+    pub fn styled(&self) -> Text {
+        let name = self.hover_name.clone().with_color(self.rarity_color);
+        if !self.custom_name {
+            return name;
+        }
+        name.with_style(&Style {
+            italic: Some(true),
+            ..Style::default()
+        })
+    }
+}
 
 /// `Hud.toolHighlightTimer` and `lastToolHighlight`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ToolHighlight {
     pub timer: i32,
     pub last: Option<HeldName>,
+    /// A part's `highlight_tip` for `last`, asked each tick the name shows:
+    /// drawn in place of `last`'s styled name. It never restarts the timer.
+    pub tip: Option<Text>,
 }
 impl ToolHighlight {
     /// The selected-item part of `Hud.tick`; `display_time` is the
@@ -468,13 +490,13 @@ impl ToolHighlight {
         self.last = selected;
     }
     /// `Hud.extractSelectedItemName`; `can_hurt` is
-    /// `gameMode.canHurtPlayer()` (survival and adventure) and `bar_height`
-    /// is `max(leftHeight, rightHeight)`.
+    /// `gameMode.canHurtPlayer()` (survival and adventure). The name sits 59
+    /// pixels above the bottom edge whatever the bars above the hotbar do,
+    /// and 14 lower when the mode cannot hurt the player.
     pub fn draw(
         &self,
         w: i32,
         h: i32,
-        bar_height: i32,
         can_hurt: bool,
         font: &Font,
         background: u32,
@@ -486,16 +508,10 @@ impl ToolHighlight {
         if self.timer <= 0 {
             return out;
         }
-        let mut name = last.hover_name.clone().with_color(last.rarity_color);
-        if last.custom_name {
-            name = name.with_style(&Style {
-                italic: Some(true),
-                ..Style::default()
-            });
-        }
+        let name = self.tip.clone().unwrap_or_else(|| last.styled());
         let str_width = width(font, &name);
         let x = (w - str_width) / 2;
-        let mut y = h - bar_height.max(59);
+        let mut y = h - 59;
         if !can_hurt {
             y += 14;
         }
@@ -528,50 +544,114 @@ const BOSS_OVERLAYS: [&str; 5] = [
     "notched_20",
 ];
 
+/// Where one boss bar is drawn: its top-left corner and the spacing to the
+/// next bar's `y`, as `boss_overlay` asks its `place` callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BossBarPlace {
+    pub x: i32,
+    pub y: i32,
+    pub increment: i32,
+}
+
 /// `BossHealthOverlay.extractRenderState`: the bars in event order, 19 pixels
-/// apart from y = 12 until a third of the screen height.
-pub fn boss_overlay(w: i32, h: i32, bars: &[BossBar], font: &Font) -> Vec<GuiDraw> {
+/// apart from y = 12 until a third of the screen height. `place` is asked for
+/// each bar (its index in `bars`) and may move it or change the spacing to the
+/// next; it returns false to skip drawing it, the spacing still applied.
+pub fn boss_overlay(
+    w: i32,
+    h: i32,
+    bars: &[BossBar],
+    font: &Font,
+    mut place: impl FnMut(usize, &mut BossBarPlace) -> bool,
+) -> Vec<GuiDraw> {
     let mut out = Vec::new();
     let mut y_offset = 12;
-    for bar in bars {
-        let x_left = w / 2 - 91;
-        let part = |out: &mut Vec<GuiDraw>, width: i32, kind: &str| {
-            let sprite = |name: String| GuiDraw::Sprite {
-                sprite: Cow::Owned(format!("boss_bar/{name}_{kind}")),
-                x: x_left,
-                y: y_offset,
-                w: width,
-                h: 5,
-                region: Some([182, 5, 0, 0]),
-                color: crate::hud_layout::WHITE,
-                blend: crate::hud_layout::Blend::Textured,
-            };
-            out.push(sprite(BOSS_COLORS[bar.color].to_owned()));
-            if bar.overlay != 0 {
-                out.push(sprite(BOSS_OVERLAYS[bar.overlay].to_owned()));
-            }
+    for (index, bar) in bars.iter().enumerate() {
+        let mut at = BossBarPlace {
+            x: w / 2 - 91,
+            y: y_offset,
+            increment: 10 + 9,
         };
-        part(&mut out, 182, "background");
-        let progress = crate::hud_layout::lerp_discrete(bar.progress, 0, 182);
-        if progress > 0 {
-            part(&mut out, progress, "progress");
+        if place(index, &mut at) {
+            let (x_left, y) = (at.x, at.y);
+            let part = |out: &mut Vec<GuiDraw>, width: i32, kind: &str| {
+                let sprite = |name: String| GuiDraw::Sprite {
+                    sprite: Cow::Owned(format!("boss_bar/{name}_{kind}")),
+                    x: x_left,
+                    y,
+                    w: width,
+                    h: 5,
+                    region: Some([182, 5, 0, 0]),
+                    color: crate::hud_layout::WHITE,
+                    blend: crate::hud_layout::Blend::Textured,
+                };
+                out.push(sprite(BOSS_COLORS[bar.color].to_owned()));
+                if bar.overlay != 0 {
+                    out.push(sprite(BOSS_OVERLAYS[bar.overlay].to_owned()));
+                }
+            };
+            part(&mut out, 182, "background");
+            let progress = crate::hud_layout::lerp_discrete(bar.progress, 0, 182);
+            if progress > 0 {
+                part(&mut out, progress, "progress");
+            }
+            let name = bar.name.resolve_legacy();
+            let width = width(font, &name);
+            // The title stays centred over the bar wherever it is moved. A mod may
+            // have written any i32, so saturate rather than overflow.
+            text(
+                &mut out,
+                name,
+                x_left.saturating_add(91).saturating_sub(width / 2),
+                y.saturating_sub(9),
+                crate::hud_layout::WHITE,
+                true,
+            );
         }
-        let name = bar.name.resolve_legacy();
-        let width = width(font, &name);
-        text(
-            &mut out,
-            name,
-            w / 2 - width / 2,
-            y_offset - 9,
-            crate::hud_layout::WHITE,
-            true,
-        );
-        y_offset += 10 + 9;
+        y_offset = y_offset.saturating_add(at.increment);
         if y_offset >= h / 3 {
             break;
         }
     }
     out
+}
+
+/// `BossHealthOverlay`'s first bar's top edge, in GUI px (its name sits 9 px above).
+pub const BOSS_BAR_TOP: i32 = 12;
+/// `BossHealthOverlay`'s step from one bar to the next, in GUI px (`10 + 9`).
+pub const BOSS_BAR_STEP: i32 = 10 + 9;
+/// A boss bar's sprite height, in GUI px.
+pub const BOSS_BAR_HEIGHT: i32 = 5;
+/// A boss bar's sprite width, in GUI px; it is centred on the view.
+pub const BOSS_BAR_WIDTH: i32 = 182;
+/// Half the hotbar's width, in GUI px (`Hud`'s `screenWidth / 2 - 91`): the status rows above it
+/// span the same.
+pub const HOTBAR_HALF_WIDTH: i32 = 91;
+
+/// How many of `n` boss bars `BossHealthOverlay.extractRenderState` draws on a view `h` GUI px
+/// tall: it stops once the next bar's top reaches a third of the height (integer division,
+/// as vanilla's `guiHeight() / 3`), but always draws the first.
+pub fn boss_bars_drawn(h: i32, n: usize) -> usize {
+    let mut drawn = 0;
+    let mut y = BOSS_BAR_TOP;
+    while drawn < n {
+        drawn += 1;
+        y += BOSS_BAR_STEP;
+        if y >= h / 3 {
+            break;
+        }
+    }
+    drawn
+}
+
+/// The bottom edge, in GUI px from the view's top, of the last of `n` boss bars a view `h` GUI
+/// px tall shows (`boss_overlay`'s layout); 0 when there are none. Names sit above their bar,
+/// so nothing of the overlay reaches below this.
+pub fn boss_bars_bottom(h: i32, n: usize) -> i32 {
+    match boss_bars_drawn(h, n) {
+        0 => 0,
+        k => BOSS_BAR_TOP + BOSS_BAR_STEP * (k as i32 - 1) + BOSS_BAR_HEIGHT,
+    }
 }
 
 /// `JumpableVehicleBar.extractBackground`: `cooldown` is the mount's jump
@@ -725,14 +805,7 @@ pub struct ItemDecorations {
 
 /// `Item.getBarWidth` and `getBarColor` for a damaged stack (`isDamaged`).
 pub fn damage_bar(damage: i32, max_damage: i32) -> Option<(i32, u32)> {
-    if max_damage <= 0 || damage <= 0 {
-        return None;
-    }
-    let width = (13.0 - damage as f32 * 13.0 / max_damage as f32)
-        .round()
-        .clamp(0.0, 13.0) as i32;
-    let health = ((max_damage as f32 - damage as f32) / max_damage as f32).max(0.0);
-    Some((width, hsv_to_argb(health / 3.0, 1.0, 1.0, 0)))
+    horizon_items::properties::damage_bar(damage, max_damage).map(|bar| (bar.width, bar.color))
 }
 
 /// `GuiGraphicsExtractor.itemDecorations` for a non-empty stack at (x, y):
@@ -1255,6 +1328,96 @@ impl SubtitleOverlay {
 }
 
 #[cfg(test)]
+mod boss_overlay_tests {
+    use super::*;
+    use crate::hud::Rect;
+    use std::collections::HashMap;
+
+    fn font() -> Font {
+        // The missing-glyph metrics let these tests run without game assets.
+        Font::load(
+            &horizon_assets::resource_source::ResourceSource::default(),
+            &HashMap::new(),
+            &[],
+            (1, 1),
+            (0, 0),
+            Rect {
+                u0: 0.0,
+                v0: 0.0,
+                u1: 1.0,
+                v1: 1.0,
+                w: 1,
+                h: 1,
+            },
+        )
+    }
+
+    fn bars(n: usize) -> Vec<BossBar> {
+        (0..n)
+            .map(|_| BossBar {
+                name: Text::literal("Boss"),
+                progress: 1.0,
+                color: 0,
+                overlay: 0,
+            })
+            .collect()
+    }
+
+    /// The top-left corner of each bar's background sprite, in draw order.
+    fn backgrounds(draws: &[GuiDraw]) -> Vec<(i32, i32)> {
+        draws
+            .iter()
+            .filter_map(|d| match d {
+                GuiDraw::Sprite { sprite, x, y, .. } if sprite.ends_with("_background") => {
+                    Some((*x, *y))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bars_stack_19_apart_from_12_and_cancelled_bars_keep_their_spacing() {
+        let font = font();
+        let none = boss_overlay(400, 300, &bars(3), &font, |_, _| true);
+        assert_eq!(backgrounds(&none), [(109, 12), (109, 31), (109, 50)]);
+        // Moving one bar's y doesn't move the next; cancelling one keeps its spacing.
+        let moved = boss_overlay(400, 300, &bars(3), &font, |i, at| {
+            if i == 0 {
+                at.y = 100;
+            }
+            i != 1
+        });
+        assert_eq!(backgrounds(&moved), [(109, 100), (109, 50)]);
+    }
+
+    /// Values a mod may legally write at the extremes of `i32` lay out without overflow
+    /// (Developer builds check overflow and would panic).
+    #[test]
+    fn extreme_positions_and_spacing_saturate() {
+        let font = font();
+        let draws = boss_overlay(400, 300, &bars(2), &font, |i, at| {
+            if i == 0 {
+                at.x = i32::MAX;
+                at.y = i32::MIN;
+            }
+            true
+        });
+        assert_eq!(backgrounds(&draws), [(i32::MAX, i32::MIN), (109, 31)]);
+        let draws = boss_overlay(400, 300, &bars(2), &font, |_, at| {
+            at.increment = i32::MAX;
+            false
+        });
+        assert!(draws.is_empty());
+        let draws = boss_overlay(400, 300, &bars(3), &font, |i, at| {
+            at.increment = if i == 0 { i32::MIN } else { 19 };
+            true
+        });
+        assert_eq!(backgrounds(&draws).len(), 3);
+    }
+}
+
+#[cfg(test)]
 mod subtitle_tests {
     use super::*;
 
@@ -1293,5 +1456,273 @@ mod subtitle_tests {
         assert_eq!(o.subtitles.len(), 1);
         assert_eq!(o.subtitles[0].played.len(), 2);
         assert!(!o.listening());
+    }
+}
+
+#[cfg(test)]
+mod text_position_tests {
+    use super::*;
+    use crate::{font::Font, hud::Rect};
+    use std::collections::HashMap;
+
+    /// The missing-glyph metrics let these tests run without game assets.
+    fn font() -> Font {
+        Font::load(
+            &horizon_assets::resource_source::ResourceSource::default(),
+            &HashMap::new(),
+            &[],
+            (1, 1),
+            (0, 0),
+            Rect {
+                u0: 0.0,
+                v0: 0.0,
+                u1: 1.0,
+                v1: 1.0,
+                w: 1,
+                h: 1,
+            },
+        )
+    }
+
+    fn held() -> HeldName {
+        HeldName {
+            item: "minecraft:stone".into(),
+            hover_name: Text::literal("Stone"),
+            rarity_color: 0xFFFF_FFFF,
+            custom_name: false,
+        }
+    }
+
+    fn text_top(draws: &[GuiDraw]) -> Option<i32> {
+        draws.iter().find_map(|d| match d {
+            GuiDraw::Text { y, .. } => Some(*y),
+            _ => None,
+        })
+    }
+
+    /// `Hud.extractSelectedItemName`: `guiHeight - 59`, then `+ 14` when the
+    /// game mode cannot hurt the player. The health, food, air and mount rows
+    /// above the hotbar never move it: with armor and a second row of hearts
+    /// they reach 69 pixels, and the name stays where vanilla draws it.
+    #[test]
+    fn the_selected_item_name_sits_fifty_nine_above_the_bottom_edge() {
+        let mut highlight = ToolHighlight {
+            last: Some(held()),
+            timer: 40,
+            tip: None,
+        };
+        let f = font();
+        let draws = highlight.draw(320, 240, true, &f, 0);
+        assert_eq!(text_top(&draws), Some(240 - 59));
+        // Creative and spectator add the fourteen pixels the experience bar
+        // and the food row would have taken.
+        let draws = highlight.draw(320, 240, false, &f, 0);
+        assert_eq!(text_top(&draws), Some(240 - 59 + 14));
+        // No timer, no name.
+        highlight.timer = 0;
+        assert!(highlight.draw(320, 240, true, &f, 0).is_empty());
+    }
+
+    /// A part's `highlight_tip` is drawn as it is in place of the styled
+    /// name, centred on its own width; without one, a renamed item is italic.
+    #[test]
+    fn a_highlight_tip_is_drawn_in_place_of_the_name() {
+        let f = font();
+        let drawn = |highlight: &ToolHighlight| {
+            highlight
+                .draw(320, 240, true, &f, 0)
+                .into_iter()
+                .find_map(|d| match d {
+                    GuiDraw::Text { text, x, .. } => Some((text, x)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let tip = Text::literal("Charge: 5");
+        let mut highlight = ToolHighlight {
+            last: Some(held()),
+            timer: 40,
+            tip: Some(tip.clone()),
+        };
+        assert_eq!(
+            drawn(&highlight),
+            (tip.clone(), (320 - width(&f, &tip)) / 2)
+        );
+        highlight.tip = None;
+        let mut renamed = held();
+        renamed.custom_name = true;
+        highlight.last = Some(renamed.clone());
+        assert_eq!(drawn(&highlight).0, renamed.styled());
+    }
+
+    /// `Hud.extractOverlayMessage`: the action bar and its text translate to
+    /// `guiHeight - 68` and `-4`, again wherever the bars above the hotbar
+    /// reach.
+    #[test]
+    fn the_action_bar_sits_sixty_eight_above_the_bottom_edge() {
+        let mut titles = Titles::default();
+        titles.set_overlay(Text::literal("Action bar"), false);
+        let f = font();
+        let draws = titles.overlay_message(320, 240, 0.0, &f, 0);
+        let translate = draws.iter().find_map(|d| match d {
+            GuiDraw::Push(ops) => ops.iter().find_map(|op| match op {
+                PoseOp::Translate(_, y) => Some(*y),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(translate, Some((240 - 68) as f32));
+        // The text is drawn four pixels below that origin, as vanilla's is.
+        let relative = draws.iter().find_map(|d| match d {
+            GuiDraw::Text { y, .. } => Some(*y),
+            _ => None,
+        });
+        assert_eq!(relative, Some(-4));
+    }
+}
+
+#[cfg(test)]
+mod boss_bar_room_tests {
+    use super::*;
+
+    /// `BossHealthOverlay.extractRenderState` worked by hand: bars at y 12, 31, 50, 69, 88...,
+    /// each 5 tall, until the next top reaches `guiHeight() / 3`.
+    #[test]
+    fn boss_bars_end_where_vanillas_overlay_stops() {
+        assert_eq!(boss_bars_bottom(300, 0), 0);
+        assert_eq!(boss_bars_bottom(300, 1), 17);
+        assert_eq!(boss_bars_bottom(300, 2), 36);
+        assert_eq!(boss_bars_bottom(300, 3), 55);
+        // A third of 300 is 100: the fifth bar is the last (its next top would be 107).
+        assert_eq!(boss_bars_drawn(300, 9), 5);
+        assert_eq!(boss_bars_bottom(300, 9), 93);
+        // A short view still draws the first.
+        assert_eq!(boss_bars_bottom(60, 3), 17);
+        // `guiHeight() / 3` is integer division: 152 / 3 = 50 stops at two, 153 / 3 = 51 not.
+        assert_eq!(boss_bars_drawn(152, 3), 2);
+        assert_eq!(boss_bars_drawn(153, 3), 3);
+    }
+
+    #[test]
+    fn boss_bars_bottom_is_below_every_drawn_bar() {
+        // The missing-glyph metrics: no game assets needed.
+        let font = Font::load(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                "/nonexistent-horizon-hud-test-resources".into(),
+            ),
+            &std::collections::HashMap::new(),
+            &[],
+            (1, 1),
+            (0, 0),
+            crate::hud::Rect {
+                u0: 0.0,
+                v0: 0.0,
+                u1: 1.0,
+                v1: 1.0,
+                w: 1,
+                h: 1,
+            },
+        );
+        let bars: Vec<BossBar> = (0..6)
+            .map(|_| BossBar {
+                name: Text::literal(""),
+                progress: 1.0,
+                color: 0,
+                overlay: 0,
+            })
+            .collect();
+        for h in [60, 120, 152, 153, 240, 300, 600] {
+            let bottom = boss_overlay(400, h, &bars, &font, |_, _| true)
+                .iter()
+                .filter_map(|d| match d {
+                    GuiDraw::Sprite { y, h, .. } => Some(y + h),
+                    _ => None,
+                })
+                .max();
+            assert_eq!(bottom, Some(boss_bars_bottom(h, bars.len())), "height {h}");
+        }
+    }
+}
+#[cfg(test)]
+mod backdrop_tests {
+    use super::*;
+
+    /// `GuiGraphicsExtractor.textWithBackdrop`: two pixels around the advance
+    /// and the nine-pixel font line, independently of glyph-background drawing.
+    #[test]
+    fn the_backdrop_frames_the_text_by_two_pixels() {
+        let mut out = Vec::new();
+        text_with_backdrop(
+            &mut out,
+            Text::literal("X"),
+            10,
+            20,
+            6,
+            u32::MAX,
+            0xFF00_0000,
+        );
+        let Some(GuiDraw::Fill { x0, y0, x1, y1, .. }) = out.first() else {
+            panic!("a backdrop is a fill first");
+        };
+        assert_eq!((*x0, *y0, *x1, *y1), (8, 18, 18, 31));
+    }
+}
+
+#[cfg(test)]
+mod effect_order_tests {
+    use super::*;
+
+    fn icon(sort_order: i32, ambient: bool, duration: i32) -> EffectIcon {
+        EffectIcon {
+            id: "speed".to_owned(),
+            beneficial: true,
+            sort_order,
+            ambient,
+            duration,
+            show_icon: true,
+        }
+    }
+
+    /// Short effects order by their time left first and the sort order last; two long ones, or two
+    /// ambient ones, order by the sort order alone.
+    #[test]
+    fn both_comparator_branches_use_the_sort_order() {
+        assert_eq!(
+            compare_effects(&icon(9, false, 100), &icon(1, false, 200)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_effects(&icon(9, false, 100), &icon(1, false, 100)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_effects(&icon(9, false, 40_000), &icon(1, false, 50_000)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_effects(&icon(9, true, 100), &icon(1, true, 200)),
+            Ordering::Greater
+        );
+    }
+
+    /// The HUD lists the highest sort order nearest the corner, and the extremes of `i32` compare
+    /// without wrapping.
+    #[test]
+    fn the_hud_lists_the_highest_sort_order_first() {
+        let icons = [
+            icon(i32::MIN, false, -1),
+            icon(i32::MAX, false, -1),
+            icon(0, false, -1),
+        ];
+        let corners: Vec<(i32, i32)> = effects(200, false, &icons)
+            .iter()
+            .filter_map(|d| match d {
+                GuiDraw::Sprite { sprite, x, y, .. } if sprite == "hud/effect_background" => {
+                    Some((*x, *y))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(corners, [(175, 1), (150, 1), (125, 1)]);
     }
 }

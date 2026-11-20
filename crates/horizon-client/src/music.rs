@@ -6,6 +6,7 @@ use crate::options_ui::{MusicGroup, MusicTrack};
 use crate::sound_engine::{InstanceId, MUSIC, PlayResult, SoundEngine, SoundInstance, Sounds};
 use crate::sound_events::{Sentinel, SoundRegistry};
 use horizon_core::random::{LegacyRandom, RandomSource};
+pub use mod_api::client::music::{Music, MusicLayer};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -13,76 +14,6 @@ use std::{
     path::Path,
 };
 
-/// `Music`: a sound event and the delay range (ticks) before it starts.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Music {
-    pub sound: String,
-    pub min_delay: i32,
-    pub max_delay: i32,
-    pub replace_current_music: bool,
-}
-impl Music {
-    pub fn new(sound: &str, min_delay: i32, max_delay: i32, replace_current_music: bool) -> Self {
-        Self {
-            sound: sound.to_owned(),
-            min_delay,
-            max_delay,
-            replace_current_music,
-        }
-    }
-    /// `Musics.MENU`.
-    pub fn menu() -> Self {
-        Self::new("minecraft:music.menu", 20, 600, true)
-    }
-    /// `Musics.CREDITS`.
-    pub fn credits() -> Self {
-        Self::new("minecraft:music.credits", 0, 0, true)
-    }
-    /// `Musics.END_BOSS`.
-    pub fn end_boss() -> Self {
-        Self::new("minecraft:music.dragon", 0, 0, true)
-    }
-    /// `Musics.CREATIVE`.
-    pub fn creative() -> Self {
-        Self::new("minecraft:music.creative", 12000, 24000, false)
-    }
-    /// `Musics.END`.
-    pub fn end() -> Self {
-        Self::new("minecraft:music.end", 6000, 24000, true)
-    }
-    /// `Musics.UNDER_WATER`.
-    pub fn under_water() -> Self {
-        Self::new("minecraft:music.under_water", 12000, 24000, false)
-    }
-    /// `Musics.GAME`.
-    pub fn game() -> Self {
-        Self::new("minecraft:music.game", 12000, 24000, false)
-    }
-    /// The built-in situations the Music page lists, in its order: the lang key
-    /// of the heading the page's group shows and the music that situation plays.
-    pub fn builtin() -> [(&'static str, Music); 7] {
-        [
-            ("horizon.pages.music.menu", Self::menu()),
-            ("horizon.pages.music.overworld", Self::game()),
-            ("horizon.pages.music.creative", Self::creative()),
-            ("horizon.pages.music.underwater", Self::under_water()),
-            ("horizon.pages.music.end", Self::end()),
-            ("horizon.pages.music.boss", Self::end_boss()),
-            ("horizon.pages.music.credits", Self::credits()),
-        ]
-    }
-    /// `Music.CODEC`.
-    fn parse(v: &Value) -> Option<Self> {
-        let sound = v["sound"].as_str()?;
-        let int = |k: &str| v[k].as_i64().unwrap_or(0) as i32;
-        Some(Self::new(
-            sound,
-            int("min_delay"),
-            int("max_delay"),
-            v["replace_current_music"].as_bool().unwrap_or(false),
-        ))
-    }
-}
 /// The Music page's groups: each built-in situation's own tracks first, then
 /// every other `music.` event's tracks that no earlier group listed, under
 /// its dimension's biomes. A track several pools share is listed once, from
@@ -291,6 +222,28 @@ impl MusicTables {
             .or_else(|| self.dimensions.get(dimension).and_then(|l| l.volume))
             .unwrap_or(1.0)
     }
+    /// `background` and `volume` in a biome a data pack gave (`pack`, its
+    /// file) or the built-in biome `biome`.
+    pub fn at(&self, dimension: &str, biome: &str, pack: Option<&Value>) -> (BackgroundMusic, f32) {
+        let Some(json) = pack else {
+            return (
+                self.background(dimension, biome),
+                self.volume(dimension, biome),
+            );
+        };
+        let layer = Layer::parse(json);
+        let dimension = self.dimensions.get(dimension);
+        (
+            layer
+                .music
+                .or_else(|| dimension.and_then(|l| l.music.clone()))
+                .unwrap_or_default(),
+            layer
+                .volume
+                .or_else(|| dimension.and_then(|l| l.volume))
+                .unwrap_or(1.0),
+        )
+    }
 }
 /// `MusicManager.MusicFrequency` (the `musicFrequency` option).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -334,13 +287,6 @@ fn next_int(random: &mut LegacyRandom, min: i32, max: i32) -> i32 {
     } else {
         random.next_int_bound(max - min + 1).unwrap_or(0) + min
     }
-}
-/// A track a native mod plays over or instead of the music
-/// (`native_music_layers`): a sound event and its volume, 0 to 1.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MusicLayer {
-    pub sound: String,
-    pub volume: f32,
 }
 
 /// The layers playing: each a looping music-source instance whose volume
@@ -391,7 +337,7 @@ impl MusicLayers {
             if w.sound.is_empty() || self.playing.iter().any(|l| l.sound == w.sound) {
                 continue;
             }
-            let instance = SoundInstance::for_music_layer(&w.sound, SoundEngine::unseeded());
+            let instance = SoundInstance::for_music_layer(&w.sound, crate::random_source::create());
             let (id, _) = sounds.play_instance(instance, true);
             self.playing.push(PlayingLayer {
                 sound: w.sound.clone(),
@@ -452,7 +398,7 @@ pub struct MusicManager {
 impl Default for MusicManager {
     fn default() -> Self {
         // RandomSource.create(): seeded from the clock, not the world.
-        Self::new(crate::sound_engine::unique_seed())
+        Self::new(crate::random_source::unique_seed())
     }
 }
 impl MusicManager {
@@ -573,7 +519,7 @@ impl MusicManager {
         only: Option<&str>,
         sounds: &mut impl Sounds,
     ) -> bool {
-        let mut instance = SoundInstance::for_music(&music.sound, SoundEngine::unseeded());
+        let mut instance = SoundInstance::for_music(&music.sound, crate::random_source::create());
         // No track off and no row to play: vanilla's startPlaying as it is.
         // `resolve` picks the track, and an event with nothing to play (or no
         // event) is still the current music, with the delay at its maximum.
@@ -725,6 +671,44 @@ mod tests {
             &|_, _| true,
         );
         SoundEngine::new(registry)
+    }
+
+    /// A data pack's biome file replaces the built-in biome's attributes:
+    /// what it leaves out comes from the dimension, not the built-in biome.
+    #[test]
+    fn a_pack_biome_reads_its_own_file_over_the_dimension() {
+        let layer_of = |json: serde_json::Value| Layer::parse(&json);
+        let tables = MusicTables {
+            dimensions: HashMap::from([(
+                "minecraft:overworld".to_owned(),
+                layer_of(serde_json::json!({"attributes": {
+                    "minecraft:audio/background_music": {"default": {"sound": "minecraft:music.game"}},
+                    "minecraft:audio/music_volume": 0.8
+                }})),
+            )]),
+            biomes: HashMap::from([(
+                "minecraft:plains".to_owned(),
+                layer_of(serde_json::json!({"attributes": {
+                    "minecraft:audio/background_music": {"default": {"sound": "minecraft:music.overworld.meadow"}},
+                    "minecraft:audio/music_volume": 0.3
+                }})),
+            )]),
+        };
+        let sound =
+            |(music, volume): (BackgroundMusic, f32)| (music.default.map(|m| m.sound), volume);
+        let builtin = tables.at("minecraft:overworld", "minecraft:plains", None);
+        assert_eq!(
+            sound(builtin),
+            (Some("minecraft:music.overworld.meadow".into()), 0.3)
+        );
+        let pack = serde_json::json!({"attributes": {
+            "minecraft:audio/background_music": {"default": {"sound": "pack:music.dunes"}}
+        }});
+        let packed = tables.at("minecraft:overworld", "minecraft:plains", Some(&pack));
+        assert_eq!(sound(packed), (Some("pack:music.dunes".into()), 0.8));
+        let bare = serde_json::json!({"temperature": 0.8});
+        let packed = tables.at("minecraft:overworld", "minecraft:plains", Some(&bare));
+        assert_eq!(sound(packed), (Some("minecraft:music.game".into()), 0.8));
     }
 
     fn layer(sound: &str, volume: f32) -> MusicLayer {

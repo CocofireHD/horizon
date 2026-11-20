@@ -10,6 +10,7 @@ drawn, first frame in a world, the view filled).
     python3 tools/startup_trace.py --world T --seed 1234   # into a world, until the view is full
     python3 tools/startup_trace.py --server 127.0.0.1:25565  # a server's join
     python3 tools/startup_trace.py --runs 3 --warm         # 3 later starts (caches built by a first one)
+    python3 tools/startup_trace.py --runs 5 --stats       # named-step and RSS breakdown
 
 Every run gets fresh scratch folders (HORIZON_HOME, launcher and XDG dirs, the
 working directory where saves go); `--warm` keeps one scratch for all runs and
@@ -18,6 +19,7 @@ the trace wrapped as a JSON array: Perfetto (ui.perfetto.dev) opens it.
 """
 import argparse
 import json
+import math
 import pathlib
 import shutil
 import signal
@@ -67,6 +69,49 @@ def summarize(events):
     return steps, marks
 
 
+def step_stats(runs):
+    """Aggregate named step durations from one or more summarized runs.
+
+    Returns ``name -> {"n", "median_ms", "p95_ms", "total_ms"}`` in name order.
+    The trace is opt-in, so this is deliberately kept in the driver rather than
+    adding work to the game when startup tracing is off.
+    """
+    durations = {}
+    for steps in runs:
+        for start, end, name, _thread in steps:
+            durations.setdefault(name, []).append(end - start)
+    out = {}
+    for name, values in sorted(durations.items()):
+        ordered = sorted(values)
+        # Nearest-rank percentile: for 20 samples the 95th is the 19th, not the maximum.
+        p95 = ordered[min(len(ordered) - 1, max(0, math.ceil(len(ordered) * 0.95) - 1))]
+        out[name] = {
+            "n": len(values),
+            "median_ms": statistics.median(values),
+            "p95_ms": p95,
+            "total_ms": sum(values),
+        }
+    return out
+
+
+def rss_mb(pid):
+    """The child process RSS in MB, or None when the platform cannot report it."""
+    try:
+        status = pathlib.Path(f"/proc/{pid}/status").read_text()
+        for line in status.splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024.0
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    try:
+        text = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(pid)], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        return float(text) / 1024.0 if text else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def scratch_env(home):
     """lab.game_env with every folder in `home`, so a later start (`--warm`) finds what the first one built."""
     for d in ("home", "launcher", "data", "config", "trash"):
@@ -77,7 +122,6 @@ def scratch_env(home):
         XDG_DATA_HOME=home / "data",
         XDG_CONFIG_HOME=home / "config",
         HORIZON_LAUNCHER_TRASH=home / "trash",
-        HORIZON_TELEMETRY_URL="off",
     )
 
 
@@ -97,8 +141,11 @@ def run_once(args, home, label):
     proc = subprocess.Popen(cmd, cwd=home, env=env, stdout=log, stderr=subprocess.STDOUT)
     deadline = time.monotonic() + args.timeout
     marks = {}
+    rss = []
     while time.monotonic() < deadline and proc.poll() is None:
         _, marks = summarize(read_trace(trace))
+        if (sample := rss_mb(proc.pid)) is not None:
+            rss.append(sample)
         if want in marks:
             time.sleep(args.linger)
             break
@@ -115,7 +162,7 @@ def run_once(args, home, label):
     if want not in marks:
         print(f"{label}: no {want} within {args.timeout} s (log: {home / f'game-{label}.log'})",
               file=sys.stderr)
-    return steps, marks, trace
+    return steps, marks, trace, rss
 
 
 def print_timeline(steps, marks, floor_ms):
@@ -131,7 +178,7 @@ def print_timeline(steps, marks, floor_ms):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--bin", default=str(ROOT / "target/release/horizon-client"))
+    ap.add_argument("--bin", default=str(lab.binary(ROOT / "target/release", "horizon-client")))
     ap.add_argument("--resources", default=str(ROOT / ".local/horizon-client/26.3"))
     ap.add_argument("--world", help="open (or create) this world from the command line")
     ap.add_argument("--seed", type=int, default=1234)
@@ -145,6 +192,7 @@ def main():
     ap.add_argument("--floor", type=float, default=5, help="hide steps shorter than this (ms)")
     ap.add_argument("--keep", help="write the last run's trace here as a JSON array (Perfetto)")
     ap.add_argument("--json", action="store_true", help="print the marks of every run as JSON")
+    ap.add_argument("--stats", action="store_true", help="print median/p95/total duration for every named startup step")
     ap.add_argument("extra", nargs="*", help="more game arguments (after --)")
     args = ap.parse_args()
     args.until = args.until or ("world" if args.world or args.server else "title")
@@ -155,12 +203,16 @@ def main():
     if shared:
         run_once(args, shared, "warmup")
     results = []
+    step_runs = []
     for i in range(args.runs):
         home = shared or pathlib.Path(tempfile.mkdtemp(prefix="horizon-startup-"))
-        steps, marks, trace = run_once(args, home, f"run{i + 1}")
+        steps, marks, trace, rss = run_once(args, home, f"run{i + 1}")
+        step_runs.append(steps)
         results.append(marks)
         print(f"== run {i + 1} ({'later start' if shared else 'first start'}, {home})")
         print_timeline(steps, marks, args.floor)
+        if rss:
+            print(f"RSS peak {max(rss):.0f} MB, median {statistics.median(rss):.0f} MB")
         if args.keep:
             pathlib.Path(args.keep).write_text(json.dumps(read_trace(trace)))
         if not shared:
@@ -173,6 +225,11 @@ def main():
     for name in names:
         values = [m[name] for m in results if name in m]
         print(f"{statistics.median(values):8.0f}  {name}  (n={len(values)})")
+    if args.stats:
+        print("== step duration stats (ms)")
+        print("name                                      n   median      p95     total")
+        for name, stats in step_stats(step_runs).items():
+            print(f"{name:<40} {stats['n']:3} {stats['median_ms']:8.1f} {stats['p95_ms']:8.1f} {stats['total_ms']:8.1f}")
     if args.json:
         print(json.dumps(results))
 

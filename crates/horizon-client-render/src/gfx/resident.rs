@@ -45,6 +45,9 @@ pub struct Resident<T> {
     slots: FxHashMap<SectionKey, u32>,
     columns: Vec<Column>,
     column_index: FxHashMap<(i32, i32), u32>,
+    /// Calls that removed sections so far: a user that keeps its own per-section state
+    /// (the ray scene) sees from it whether any went.
+    removals: u64,
 }
 
 impl<T> Default for Resident<T> {
@@ -57,6 +60,7 @@ impl<T> Default for Resident<T> {
             slots: FxHashMap::default(),
             columns: Vec::new(),
             column_index: FxHashMap::default(),
+            removals: 0,
         }
     }
 }
@@ -92,7 +96,6 @@ impl<T> Resident<T> {
         self.items.iter_mut().map(|(_, v)| v)
     }
     /// Every section's key, value and bounds.
-    #[cfg(any(test, debug_assertions))]
     pub fn iter(&self) -> impl Iterator<Item = (SectionKey, &T, Option<[Vec3; 2]>)> {
         let items = self.items.iter().zip(&self.bounds);
         items.map(|((key, value), bounds)| (*key, value, *bounds))
@@ -124,6 +127,10 @@ impl<T> Resident<T> {
     pub fn get_mut(&mut self, slot: u32) -> &mut T {
         &mut self.items[slot as usize].1
     }
+    /// Padded mesh bounds of the section in `slot`, relative to its origin.
+    pub fn bounds(&self, slot: u32) -> Option<[Vec3; 2]> {
+        self.bounds[slot as usize]
+    }
     /// Sections from now on count from `min_y` (a level of another column).
     pub fn set_min_y(&mut self, min_y: i32) {
         self.min_y = min_y;
@@ -132,7 +139,12 @@ impl<T> Resident<T> {
     pub fn min_y(&self) -> i32 {
         self.min_y
     }
+    /// Changes whenever sections were removed (`remove`, `remove_columns`, `clear`).
+    pub fn removals(&self) -> u64 {
+        self.removals
+    }
     pub fn clear(&mut self) {
+        self.removals += 1;
         self.items.clear();
         self.bounds.clear();
         self.marked.clear();
@@ -223,6 +235,7 @@ impl<T> Resident<T> {
     /// marks: one pass over the store, where `remove` moves a slot and looks its column
     /// up for each.
     pub fn remove_columns(&mut self, gone: &FxHashSet<(i32, i32)>) -> Vec<T> {
+        self.removals += 1;
         // Every column (a far teleport): emptied, without a lookup per section.
         if self.columns.iter().all(|c| gone.contains(&(c.x, c.z))) {
             self.bounds.clear();
@@ -253,6 +266,7 @@ impl<T> Resident<T> {
     }
     pub fn remove(&mut self, key: SectionKey) -> Option<T> {
         let slot = self.slots.remove(&key)?;
+        self.removals += 1;
         self.mark_slot(slot, false);
         let c = self.column_index[&(key.0, key.2)] as usize;
         let column = &mut self.columns[c];
@@ -435,17 +449,18 @@ impl<T> Resident<T> {
             if list.is_empty() {
                 continue;
             }
-            let min = origin((column.x, column.low, column.z), self.min_y, camera).as_vec3();
-            let top = origin((column.x, column.high, column.z), self.min_y, camera).as_vec3();
-            let max = top + Vec3::splat(16.0);
-            let inside = frustum.contains(min, max);
-            if !inside && !frustum.intersects(min, max) {
-                continue;
-            }
             let ox = f64::from(column.x * 16) - camera.x;
             let oz = f64::from(column.z * 16) - camera.z;
             let min_x = ox as f32;
             let min_z = oz as f32;
+            let low_oy = (f64::from(self.min_y + column.low * 16) - camera.y) as f32;
+            let high_oy = (f64::from(self.min_y + column.high * 16) - camera.y) as f32;
+            let min = Vec3::new(min_x, low_oy, min_z);
+            let max = Vec3::new(min_x + 16.0, high_oy + 16.0, min_z + 16.0);
+            let inside = frustum.contains(min, max);
+            if !inside && !frustum.intersects(min, max) {
+                continue;
+            }
             let dx8 = ox + 8.0;
             let dz8 = oz + 8.0;
             let xz_sq = dx8 * dx8 + dz8 * dz8;
@@ -653,6 +668,31 @@ mod tests {
             assert!(r.contains(*key));
             assert_eq!(r.is_marked(*key), marked, "{key:?}");
         }
+    }
+
+    #[test]
+    fn every_removal_changes_the_count_and_nothing_else_does() {
+        let mut r = Resident::default();
+        let start = r.removals();
+        r.insert((0, 0, 0), 1u32);
+        r.insert((0, 1, 0), 2);
+        r.insert((1, 0, 0), 3);
+        r.insert((0, 0, 0), 4);
+        r.set_marked((0, 0, 0), true);
+        assert_eq!(r.remove((5, 0, 5)), None);
+        assert_eq!(
+            r.removals(),
+            start,
+            "inserts, replacements, marks and misses"
+        );
+        r.remove((0, 1, 0));
+        let one = r.removals();
+        assert_ne!(one, start);
+        r.remove_columns(&[(1, 0)].into_iter().collect());
+        let two = r.removals();
+        assert_ne!(two, one);
+        r.clear();
+        assert_ne!(r.removals(), two);
     }
 
     #[test]

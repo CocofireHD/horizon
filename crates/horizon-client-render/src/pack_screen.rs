@@ -44,7 +44,7 @@ pub enum Source {
 }
 
 /// A pack as the screen shows it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PackInfo {
     pub id: String,
     pub title: Text,
@@ -58,6 +58,9 @@ pub struct PackInfo {
     pub required: bool,
     pub position: Position,
     pub fixed: bool,
+    /// Left out of both lists (a mod's `PackRegistration::hidden`): the selection model still
+    /// holds it, so a selected hidden pack stays selected and loads.
+    pub hidden: bool,
 }
 impl PackInfo {
     pub fn selectable(&self) -> Selectable {
@@ -120,6 +123,40 @@ fn scale_icon((w, h, rgba): (u32, u32, Vec<u8>)) -> Option<Arc<[u8]>> {
         }
     }
     Some(out.into())
+}
+/// Points the icon blits of `draws` at the atlas's pack icon slots and writes the `icons` they
+/// name into them, one slot per blit (vanilla registers a texture per icon). Icons past the last
+/// slot keep `unknown_pack`.
+pub fn bind_icon_slots(
+    icons: &HashMap<String, Arc<[u8]>>,
+    draws: &mut [Draw],
+    atlas: &HudAtlas,
+    patches: &mut Vec<Patch>,
+) {
+    let mut slots = 0..PACK_ICON_SLOTS;
+    for draw in draws {
+        let Draw::Blit { texture, .. } = draw else {
+            continue;
+        };
+        let Some(icon) = icons.get(texture.as_str()) else {
+            continue;
+        };
+        let Some(slot) = slots.next() else {
+            return;
+        };
+        let sprite = format!("horizon/pack-icon{slot}");
+        let Some(rect) = atlas.sprites.get(&sprite) else {
+            return;
+        };
+        patches.push(Patch {
+            x: (rect.u0 * atlas.width as f32).round() as u32,
+            y: (rect.v0 * atlas.height as f32).round() as u32,
+            width: PACK_ICON_SIZE,
+            height: PACK_ICON_SIZE,
+            rgba: icon.to_vec(),
+        });
+        *texture = sprite;
+    }
 }
 /// `PackSelectionScreen.loadPackIcon`'s texture for a pack with an icon.
 pub fn icon_texture(id: &str) -> String {
@@ -278,6 +315,12 @@ impl List {
     fn scroller_height(&self) -> i32 {
         ((self.height * self.height) as f32 / self.content_height() as f32) as i32
     }
+    /// `AbstractScrollArea.scrollerHeight` clamped the Java way: `Mth.clamp`
+    /// applies the minimum first and then the maximum, so a list shorter than
+    /// 40 px keeps its last 8 px instead of panicking on crossed bounds.
+    fn scroller_thumb(&self) -> i32 {
+        self.scroller_height().max(32).min(self.height - 8)
+    }
     /// `AbstractScrollArea.mouseDragged` while the scrollbar is held.
     fn drag(&mut self, y: f64) {
         let Some(last) = self.held else { return };
@@ -287,7 +330,7 @@ impl List {
             self.set_scroll(self.max_scroll() as f64);
         } else {
             let max = self.max_scroll().max(1) as f64;
-            let bar = self.scroller_height().clamp(32, self.height - 8);
+            let bar = self.scroller_thumb();
             let scale = (max / (self.height - bar) as f64).max(1.0);
             self.set_scroll(self.scroll + (y - last) * scale);
         }
@@ -304,10 +347,16 @@ enum Focus {
     Button(usize),
 }
 
-/// The open `ConfirmScreen` for an incompatible pack.
+#[derive(Clone, Debug)]
+enum ConfirmAction {
+    Select(String),
+    Import(Vec<std::path::PathBuf>),
+}
+
+/// The open `ConfirmScreen` for an incompatible pack or dropped files.
 #[derive(Clone, Debug)]
 struct Confirm {
-    id: String,
+    action: ConfirmAction,
     title: Text,
     message: Text,
 }
@@ -316,10 +365,14 @@ struct Confirm {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     None,
+    /// The player accepted `pack.dropConfirm`.
+    Import(Vec<std::path::PathBuf>),
     /// The Open Pack Folder button.
     OpenFolder,
     /// The Done button (`onClose`: commit).
     Done,
+    /// Horizon's own: the options button on the card of this pack, which has Polytone options.
+    Options(String),
     /// Horizon's own: a Modrinth hit the player picked, to download into the
     /// packs folder. The screen does not know where that is.
     BrowsePick(usize),
@@ -359,11 +412,64 @@ pub struct PackScreen {
     browser_icons: Vec<String>,
     /// Whether that button is drawn at all.
     pub browsing_allowed: bool,
+    /// The packs with Polytone options (#11486): their cards carry an options button.
+    pub with_options: std::collections::BTreeSet<String>,
     /// The browser's own search box, separate from the one that filters the
     /// player's installed packs.
     browser_search: TextField,
     /// The browser's search box has the keyboard.
     browser_focus: bool,
+    /// Which atlas slot holds which icon, kept from one frame to the next
+    /// ([`PackScreen::bind_icons`]).
+    icon_slots: std::cell::RefCell<IconSlots>,
+}
+
+/// The atlas's pack icon slots and the icon each holds. The atlas keeps what is
+/// written into a slot, so an icon is sent once, when it takes a slot, and not
+/// again every frame it is drawn.
+#[derive(Clone, Debug, Default)]
+struct IconSlots {
+    /// The atlas the pixels went into ([`HudAtlas::revision`]); a new atlas holds none of them.
+    revision: u64,
+    /// Frames bound so far: an icon drawn in this one keeps its slot.
+    frame: u64,
+    /// Least recently drawn first: the icon's texture key, its slot, its pixels, and the
+    /// frame it was last drawn in.
+    held: Vec<(String, usize, Arc<[u8]>, u64)>,
+}
+
+impl IconSlots {
+    /// Starts a frame on `atlas`; an atlas that is not the one the slots were filled in empties them.
+    fn begin(&mut self, atlas: &HudAtlas) {
+        if self.revision != atlas.revision {
+            self.held.clear();
+            self.revision = atlas.revision;
+        }
+        self.frame += 1;
+    }
+
+    /// The slot for the icon drawn under `texture`, and whether its pixels have to be sent. A new
+    /// icon takes a free slot, else the slot of the icon drawn longest ago; none when every slot
+    /// holds an icon drawn in this frame, and that icon keeps `unknown_pack`.
+    fn slot_for(&mut self, texture: &str, icon: &Arc<[u8]>) -> Option<(usize, bool)> {
+        if let Some(at) = self.held.iter().position(|h| h.0 == texture) {
+            let mut kept = self.held.remove(at);
+            let same = Arc::ptr_eq(&kept.2, icon);
+            kept.2 = icon.clone();
+            kept.3 = self.frame;
+            let slot = kept.1;
+            self.held.push(kept);
+            return Some((slot, !same));
+        }
+        let slot = match (0..PACK_ICON_SLOTS).find(|i| !self.held.iter().any(|h| h.1 == *i)) {
+            Some(free) => free,
+            None if self.held.first().is_some_and(|h| h.3 < self.frame) => self.held.remove(0).1,
+            None => return None,
+        };
+        self.held
+            .push((texture.to_owned(), slot, icon.clone(), self.frame));
+        Some((slot, true))
+    }
 }
 
 fn tr(key: &str) -> Text {
@@ -374,6 +480,8 @@ fn tr(key: &str) -> Text {
 /// height of 20; drawn shorter, neither it nor its label sits right, so the
 /// button keeps that height and is centred on the shorter search box.
 const ADD_SIZE: i32 = 20;
+/// The options button on a pack's card.
+const OPTIONS_SIZE: i32 = 16;
 /// A card in the grid: its icon beside its name, author and description.
 const ROW_H: i32 = 74;
 /// The air around a card's contents.
@@ -440,6 +548,7 @@ impl PackScreen {
             confirm: None,
             browser: None,
             browsing_allowed: false,
+            with_options: Default::default(),
             backdrop: Backdrop::None,
             browser_icons: Vec::new(),
             browser_search: {
@@ -452,6 +561,7 @@ impl PackScreen {
                 field
             },
             browser_focus: false,
+            icon_slots: Default::default(),
             changed: false,
         };
         s.reposition(m);
@@ -461,6 +571,10 @@ impl PackScreen {
     }
     fn info(&self, id: &str) -> Option<&PackInfo> {
         self.packs.iter().find(|p| p.id == id)
+    }
+    /// Whether the lists leave `id` out ([`PackInfo::hidden`]).
+    fn hidden(&self, id: &str) -> bool {
+        self.info(id).is_some_and(|p| p.hidden)
     }
     /// The header layout: title, drop info and search box, centred.
     fn header(&self, m: &Measure) -> [(i32, i32); 3] {
@@ -514,6 +628,7 @@ impl PackScreen {
             &self.model.unselected
         };
         list.iter()
+            .filter(|p| !self.hidden(&p.id))
             .filter(|p| {
                 blank
                     || p.id.to_lowercase().contains(&value)
@@ -554,8 +669,13 @@ impl PackScreen {
                 .map(|p| p.id.clone())
                 .collect()
         };
-        self.update_list(1, all(&self.model, true), transferred);
-        self.update_list(0, all(&self.model, false), transferred);
+        let visible = |ids: Vec<String>| -> Vec<String> {
+            ids.into_iter().filter(|id| !self.hidden(id)).collect()
+        };
+        let (selected, available) = (all(&self.model, true), all(&self.model, false));
+        let (selected, available) = (visible(selected), visible(available));
+        self.update_list(1, selected, transferred);
+        self.update_list(0, available, transferred);
         self.filter(transferred);
     }
     /// `updateFilteredEntries`.
@@ -610,7 +730,7 @@ impl PackScreen {
             return action;
         }
         if self.search.contains(x, y) {
-            self.search.click(m, x, false);
+            self.search.click(m, x, false, false);
             self.set_focus(Focus::Search);
             return Action::None;
         }
@@ -632,6 +752,12 @@ impl PackScreen {
             }
             let l = &self.lists[side];
             let hit = l.entry_at(x as i32, y as i32);
+            if let Some(i) = hit
+                && let Some((id, bx, by)) = self.options_button(side, i)
+                && d::inside((x as i32, y as i32), bx, by, OPTIONS_SIZE, OPTIONS_SIZE)
+            {
+                return Action::Options(id);
+            }
             let mut took = false;
             if let Some(i) = hit {
                 took = true;
@@ -730,9 +856,43 @@ impl PackScreen {
             l.focused = false;
         }
         self.confirm = Some(Confirm {
-            id: id.to_owned(),
+            action: ConfirmAction::Select(id.to_owned()),
             title: tr("pack.incompatible.confirm.title"),
             message: tr(&format!("pack.incompatible.confirm.{}", compat.key())),
+        });
+    }
+    /// Winit delivers one event per path; collect a multi-file drop in one confirmation.
+    pub fn drop_file(&mut self, path: std::path::PathBuf) {
+        if matches!(
+            self.confirm.as_ref().map(|c| &c.action),
+            Some(ConfirmAction::Select(_))
+        ) {
+            return;
+        }
+        let mut paths = match self.confirm.take() {
+            Some(Confirm {
+                action: ConfirmAction::Import(paths),
+                ..
+            }) => paths,
+            _ => Vec::new(),
+        };
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+        let names = paths
+            .iter()
+            .filter_map(|p| p.file_name())
+            .map(|n| n.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.set_focus(Focus::None);
+        for list in &mut self.lists {
+            list.focused = false;
+        }
+        self.confirm = Some(Confirm {
+            action: ConfirmAction::Import(paths),
+            title: tr("pack.dropConfirm"),
+            message: Text::literal(names),
         });
     }
     /// The ConfirmScreen's layout: title, message lines and the two buttons.
@@ -769,12 +929,17 @@ impl PackScreen {
                 // The callback: back to the pack screen (repositioned), then select.
                 self.confirm = None;
                 self.reposition(m);
-                if i == 0
-                    && let Some(index) = self.model_index(0, &c.id)
-                {
-                    self.model.activate(false, index, true);
-                    self.changed = true;
-                    self.populate(Some(&c.id));
+                if i == 0 {
+                    match c.action {
+                        ConfirmAction::Import(paths) => return Action::Import(paths),
+                        ConfirmAction::Select(id) => {
+                            if let Some(index) = self.model_index(0, &id) {
+                                self.model.activate(false, index, true);
+                                self.changed = true;
+                                self.populate(Some(&id));
+                            }
+                        }
+                    }
                 }
                 return Action::None;
             }
@@ -918,10 +1083,13 @@ impl PackScreen {
         self.model.commit()
     }
     /// Points the icon blits of `draws` at the atlas's pack icon slots and
-    /// writes the icons into them, one slot per icon drawn (vanilla registers a
-    /// texture per pack). Icons past the last slot keep `unknown_pack`.
+    /// writes the icons into them (vanilla registers a texture per pack). An
+    /// icon keeps its slot from one frame to the next and is sent when it takes
+    /// the slot, not every frame; the slot of the icon drawn longest ago is
+    /// taken first. Icons past the last slot in one frame keep `unknown_pack`.
     pub fn bind_icons(&self, draws: &mut [Draw], atlas: &HudAtlas, patches: &mut Vec<Patch>) {
-        let mut slots = 0..PACK_ICON_SLOTS;
+        let mut slots = self.icon_slots.borrow_mut();
+        slots.begin(atlas);
         for draw in draws {
             let Draw::Blit { texture, .. } = draw else {
                 continue;
@@ -929,20 +1097,23 @@ impl PackScreen {
             let Some(icon) = self.icons.get(texture.as_str()) else {
                 continue;
             };
-            let Some(slot) = slots.next() else {
-                return;
+            let Some((slot, send)) = slots.slot_for(texture, icon) else {
+                continue;
             };
             let sprite = format!("horizon/pack-icon{slot}");
             let Some(rect) = atlas.sprites.get(&sprite) else {
+                slots.held.pop();
                 return;
             };
-            patches.push(Patch {
-                x: (rect.u0 * atlas.width as f32).round() as u32,
-                y: (rect.v0 * atlas.height as f32).round() as u32,
-                width: PACK_ICON_SIZE,
-                height: PACK_ICON_SIZE,
-                rgba: icon.to_vec(),
-            });
+            if send {
+                patches.push(Patch {
+                    x: (rect.u0 * atlas.width as f32).round() as u32,
+                    y: (rect.v0 * atlas.height as f32).round() as u32,
+                    width: PACK_ICON_SIZE,
+                    height: PACK_ICON_SIZE,
+                    rgba: icon.to_vec(),
+                });
+            }
             *texture = sprite;
         }
     }
@@ -982,6 +1153,9 @@ impl PackScreen {
             0,
         );
         self.search.draw(&mut out, m, blink_ms, None);
+        if self.browser.is_none() && self.search.contains(f64::from(mouse.0), f64::from(mouse.1)) {
+            crate::widgets::text_cursor(true, true);
+        }
         for side in 0..2 {
             self.draw_list(&mut out, m, side, mouse);
         }
@@ -1016,7 +1190,7 @@ impl PackScreen {
             if d::inside(point, qx, qy, BROWSER_SEARCH_W, 18) {
                 self.browser_search.x = qx;
                 self.browser_search.y = qy;
-                self.browser_search.click(m, x, false);
+                self.browser_search.click(m, x, false, false);
                 self.browser_focus = true;
                 return Some(Action::None);
             }
@@ -1184,6 +1358,9 @@ impl PackScreen {
         field.x = qx;
         field.y = qy;
         field.draw(out, m, 0, None);
+        if field.contains(f64::from(mouse.0), f64::from(mouse.1)) {
+            crate::widgets::text_cursor(true, true);
+        }
         let (sbx, sby) = self.browser_search_button();
         d::button(
             out,
@@ -1362,6 +1539,45 @@ impl PackScreen {
             );
         }
     }
+    /// The options button on the card of row `i` of list `side`, when its pack has
+    /// Polytone options: the pack and the button's corner, at the card's right edge.
+    fn options_button(&self, side: usize, i: usize) -> Option<(String, i32, i32)> {
+        let l = &self.lists[side];
+        let e = l.entries.get(i)?;
+        let Row::Pack(id) = &e.row else { return None };
+        if !self.with_options.contains(id) {
+            return None;
+        }
+        let x = l.row_left() + l.entry_width() - OPTIONS_SIZE - 2;
+        let y = e.y + (e.height - OPTIONS_SIZE) / 2;
+        Some((id.clone(), x, y))
+    }
+    /// The options button of a card: a small button with a sliders glyph.
+    fn draw_options_button(out: &mut Vec<Draw>, x: i32, y: i32, hover: bool) {
+        crate::widgets::narratable(|| {
+            crate::widgets::Narratable::button(
+                tr("horizon.pack.options").plain(),
+                [x as f32, y as f32, OPTIONS_SIZE as f32, OPTIONS_SIZE as f32],
+                true,
+            )
+        });
+        let sprite = if hover {
+            "widget/button_highlighted"
+        } else {
+            "widget/button"
+        };
+        d::sprite(out, sprite, x, y, OPTIONS_SIZE, OPTIONS_SIZE);
+        let (line, knob) = if hover {
+            (0xFF_C6_C6_C6u32 as i32, -1)
+        } else {
+            (0xFF_A0_A0_A0u32 as i32, 0xFF_E0_E0_E0u32 as i32)
+        };
+        // Three sliders, their knobs at different places.
+        for (row, at) in [(4, 8), (8, 4), (12, 9)] {
+            d::fill(out, x + 3, y + row, x + 13, y + row + 1, line);
+            d::fill(out, x + at, y + row - 1, x + at + 2, y + row + 2, knob);
+        }
+    }
     /// The Add button, just right of the search box.
     fn add_button(&self, m: &Measure) -> (i32, i32) {
         let (sx, sy) = self.header(m)[2];
@@ -1470,6 +1686,7 @@ impl PackScreen {
         });
         let (left, w) = (l.row_left(), l.entry_width());
         let narrow = if l.scrollable() { 6 } else { 0 };
+        let mut tooltip = None;
         for (i, e) in l.entries.iter().enumerate() {
             if e.y + e.height < l.y || e.y > l.bottom() {
                 continue;
@@ -1560,7 +1777,22 @@ impl PackScreen {
                             }
                         }
                     }
-                    let max = 157 - narrow;
+                    let mut max = 157 - narrow;
+                    if let Some((_, bx, by)) = self.options_button(side, i) {
+                        let hover = hovered == Some(i)
+                            && d::inside(mouse, bx, by, OPTIONS_SIZE, OPTIONS_SIZE);
+                        Self::draw_options_button(out, bx, by, hover);
+                        // A control for a pad's crosshair to glide onto and its D-pad to hop to,
+                        // while the list shows it whole.
+                        let mark = crate::widgets::targets_mark();
+                        let size = OPTIONS_SIZE as f32;
+                        crate::widgets::target([bx as f32, by as f32, size, size]);
+                        crate::widgets::clip_targets(mark, l.y as f32, l.bottom() as f32);
+                        if hover {
+                            tooltip = Some(tr("horizon.pack.optionsInfo"));
+                        }
+                        max -= OPTIONS_SIZE + 2;
+                    }
                     d::string_widget(out, m, &name, cx + 34, cy + 1, max);
                     let lines = d::label_lines(m, &desc, max, 2, &desc_style);
                     d::label(out, &lines, cx + 34, cy + 12, max, false);
@@ -1568,6 +1800,9 @@ impl PackScreen {
             }
         }
         out.push(Draw::NoScissor);
+        if let Some(t) = tooltip {
+            d::tooltip(out, m, &t, mouse);
+        }
         d::blit(
             out,
             &format!("textures/gui/{prefix}header_separator.png"),
@@ -1589,7 +1824,20 @@ impl PackScreen {
             [32, 2],
         );
         if l.scrollable() {
-            let sh = l.scroller_height().clamp(32, l.height - 8);
+            // AbstractScrollArea.extractScrollbar: over the bar, the pointer
+            // points, or resizes while the bar is held.
+            let over_bar = mouse.0 >= l.scroll_bar_x()
+                && mouse.0 < l.scroll_bar_x() + 6
+                && mouse.1 >= l.y
+                && mouse.1 < l.bottom();
+            if over_bar {
+                crate::widgets::request_cursor(if l.held.is_some() {
+                    crate::widgets::Cursor::ResizeNs
+                } else {
+                    crate::widgets::Cursor::PointingHand
+                });
+            }
+            let sh = l.scroller_thumb();
             let sy = (l.scroll as i32 * (l.height - sh) / l.max_scroll() + l.y).max(l.y);
             d::sprite(
                 out,
@@ -1607,6 +1855,60 @@ impl PackScreen {
 #[cfg(test)]
 mod icon_tests {
     use super::*;
+
+    #[test]
+    fn dropped_files_require_yes_and_keep_the_pending_selection() {
+        let atlas =
+            crate::hud::HudAtlas::build(&crate::resource_source::ResourceSource::directory(
+                "/nonexistent/horizon-test-assets".into(),
+            ))
+            .unwrap();
+        let m = Measure(&atlas.font);
+        let mut screen = PackScreen::new(
+            &m,
+            tr("resourcePack.title"),
+            480,
+            270,
+            false,
+            vec![pack("file/Keep", None)],
+            &[],
+        );
+        screen.model.activate(false, 0, true);
+        screen.changed = true;
+        let before = screen.commit();
+        assert_eq!(before, ["file/Keep"]);
+        screen.drop_file("One.zip".into());
+        screen.drop_file("Two".into());
+        screen.drop_file("One.zip".into());
+        let no = screen
+            .confirm_layout(&m, screen.confirm.as_ref().unwrap())
+            .2[1];
+        assert_eq!(
+            screen.click(&m, f64::from(no.0 + 1), f64::from(no.1 + 1)),
+            Action::None
+        );
+        assert!(!screen.confirming());
+        assert_eq!(screen.commit(), before);
+        screen.drop_file("One.zip".into());
+        screen.drop_file("Two".into());
+        screen.drop_file("One.zip".into());
+        let yes = screen
+            .confirm_layout(&m, screen.confirm.as_ref().unwrap())
+            .2[0];
+        assert_eq!(
+            screen.click(&m, f64::from(yes.0 + 1), f64::from(yes.1 + 1)),
+            Action::Import(vec!["One.zip".into(), "Two".into()])
+        );
+        assert_eq!(screen.commit(), before);
+        screen.drop_file("Cancelled.zip".into());
+        assert!(screen.cancel_confirm(&m));
+        assert!(!screen.confirming());
+        let mut options = crate::options_ui::OptionsUi::default();
+        options.pack_screen = Some(screen);
+        options.update_pack_infos(vec![pack("file/Keep", None), pack("file/Imported", None)]);
+        assert_eq!(options.pack_selection, ["file/Keep"]);
+        assert!(options.pack_screen.is_none());
+    }
 
     fn png(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1632,6 +1934,7 @@ mod icon_tests {
             required: false,
             position: Position::Top,
             fixed: false,
+            hidden: false,
         }
     }
 
@@ -1652,13 +1955,107 @@ mod icon_tests {
         assert!(load_icon(b"not a png").is_none());
     }
 
+    /// A mod's hidden pack is in neither list, but the selection keeps it: a required hidden pack
+    /// stays selected when the player commits.
+    #[test]
+    fn hidden_packs_stay_selected_but_out_of_both_lists() {
+        let atlas = crate::hud::HudAtlas::build(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                "/nonexistent/horizon-test-assets".into(),
+            ),
+        )
+        .unwrap();
+        let m = Measure(&atlas.font);
+        let mut compat = pack("mod/example:compat", None);
+        compat.hidden = true;
+        compat.required = true;
+        let mut optional = pack("mod/example:optional", None);
+        optional.hidden = true;
+        let packs = vec![compat, optional, pack("file/Plain", None)];
+        let selected = ["mod/example:compat".to_owned()];
+        let screen = PackScreen::new(
+            &m,
+            tr("resourcePack.title"),
+            480,
+            320,
+            false,
+            packs,
+            &selected,
+        );
+        let listed: Vec<&Row> = screen
+            .lists
+            .iter()
+            .flat_map(|l| &l.entries)
+            .map(|e| &e.row)
+            .collect();
+        assert!(
+            listed.contains(&&Row::Pack("file/Plain".into())),
+            "{listed:?}"
+        );
+        for id in ["mod/example:compat", "mod/example:optional"] {
+            assert!(!listed.contains(&&Row::Pack(id.into())), "{id} listed");
+        }
+        assert!(screen.commit().contains(&"mod/example:compat".to_owned()));
+        assert!(!screen.commit().contains(&"mod/example:optional".to_owned()));
+    }
+
+    /// A pack with Polytone options carries an options button on its card, which opens
+    /// that pack's options and nothing else; a pack without options has none.
+    #[test]
+    fn a_card_with_options_opens_its_own_pack_options() {
+        let atlas = crate::hud::HudAtlas::build(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                "/nonexistent/horizon-test-assets".into(),
+            ),
+        )
+        .unwrap();
+        let m = Measure(&atlas.font);
+        let packs = vec![pack("file/Configurable", None), pack("file/Plain", None)];
+        let mut screen = PackScreen::new(&m, tr("resourcePack.title"), 480, 320, false, packs, &[]);
+        screen.with_options.insert("file/Configurable".into());
+        let row = |screen: &PackScreen, id: &str| {
+            screen.lists[0]
+                .entries
+                .iter()
+                .position(|e| e.row == Row::Pack(id.into()))
+                .unwrap()
+        };
+        assert!(
+            screen
+                .options_button(0, row(&screen, "file/Plain"))
+                .is_none()
+        );
+        let (id, bx, by) = screen
+            .options_button(0, row(&screen, "file/Configurable"))
+            .unwrap();
+        assert_eq!(id, "file/Configurable");
+        let (cx, cy) = (bx + OPTIONS_SIZE / 2, by + OPTIONS_SIZE / 2);
+        // Hovered, it explains itself; a pad's crosshair reaches it as a control.
+        let draws = screen.draw(&m, (cx, cy), 0, 0);
+        assert!(draws.iter().any(|d| matches!(d, Draw::Tooltip { .. })));
+        crate::widgets::end_frame(crate::widgets::generation() + 1);
+        let size = OPTIONS_SIZE as f32;
+        let button = [bx as f32, by as f32, size, size];
+        let targets = crate::widgets::last_targets();
+        assert!(targets.iter().any(|t| t.rect == button), "{targets:?}");
+        assert_eq!(
+            screen.click(&m, cx as f64, cy as f64),
+            Action::Options("file/Configurable".into())
+        );
+        // The press opened the options, it did not move the pack.
+        assert!(screen.commit().is_empty());
+    }
+
     /// Programmer Art and High Contrast draw their own `pack.png`; a pack
     /// without one keeps `unknown_pack`.
     #[test]
     fn drawn_icons_take_atlas_slots() {
-        let atlas =
-            crate::hud::HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets"))
-                .unwrap();
+        let atlas = crate::hud::HudAtlas::build(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                (std::path::Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+            ),
+        )
+        .unwrap();
         let m = Measure(&atlas.font);
         let dirt = load_icon(&png(1, 1, &[134, 96, 67, 255])).unwrap();
         let contrast = load_icon(&png(1, 1, &[0, 0, 0, 255])).unwrap();
@@ -1710,9 +2107,12 @@ mod click_sound_tests {
 
     #[test]
     fn a_cards_parts_do_not_overlap_each_other() {
-        let atlas =
-            crate::hud::HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets"))
-                .unwrap();
+        let atlas = crate::hud::HudAtlas::build(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                (std::path::Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+            ),
+        )
+        .unwrap();
         let m = Measure(&atlas.font);
         // Both a wide window (two columns) and a narrow one (one column).
         for (w, h) in [(480, 320), (260, 320)] {
@@ -1750,10 +2150,14 @@ mod click_sound_tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn the_browsers_search_button_submits_what_was_typed() {
-        let atlas =
-            crate::hud::HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets"))
-                .unwrap();
+        let atlas = crate::hud::HudAtlas::build(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                (std::path::Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+            ),
+        )
+        .unwrap();
         let m = Measure(&atlas.font);
         let mut screen = PackScreen::new(
             &m,
@@ -1789,9 +2193,12 @@ mod click_sound_tests {
 
     #[test]
     fn only_footer_and_confirmation_buttons_request_a_click_sound() {
-        let atlas =
-            crate::hud::HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets"))
-                .unwrap();
+        let atlas = crate::hud::HudAtlas::build(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                (std::path::Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+            ),
+        )
+        .unwrap();
         let m = Measure(&atlas.font);
         let title = tr("resourcePack.title");
         let mut screen = PackScreen::new(&m, title, 480, 320, false, Vec::new(), &[]);
@@ -1815,7 +2222,7 @@ mod click_sound_tests {
             );
         }
         screen.confirm = Some(Confirm {
-            id: "incompatible".into(),
+            action: ConfirmAction::Select("incompatible".into()),
             title: Text::literal("Confirm"),
             message: Text::literal("Use this pack?"),
         });
@@ -1888,9 +2295,12 @@ mod footer_label_tests {
     /// does not panic and scrolls; the short "Done" keeps its centre.
     #[test]
     fn a_footer_label_wider_than_its_button_scrolls() {
-        let atlas =
-            crate::hud::HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets"))
-                .unwrap();
+        let atlas = crate::hud::HudAtlas::build(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                (std::path::Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+            ),
+        )
+        .unwrap();
         let m = Measure(&atlas.font);
         let wide = Text::literal("Otvori papku s paketami resursov, i jos nesto");
         assert!(m.width(&wide) > 146);
@@ -1919,7 +2329,7 @@ mod footer_label_tests {
     /// the crash of #6129) it scrolls. A local `Language` per file: the global
     /// language stays as it was.
     #[test]
-    #[ignore = "requires prepared language data in HORIZON_TEST_RESOURCES or .local/horizon-client/26.3"]
+    #[ignore = "daily"]
     fn the_footer_draws_in_every_language_file() {
         let root = std::env::var_os("HORIZON_TEST_RESOURCES")
             .map(std::path::PathBuf::from)
@@ -1927,7 +2337,10 @@ mod footer_label_tests {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../../.local/horizon-client/26.3")
             });
-        let atlas = crate::hud::HudAtlas::build(&root).unwrap();
+        let atlas = crate::hud::HudAtlas::build(
+            &horizon_assets::resource_source::ResourceSource::directory(root.to_path_buf()),
+        )
+        .unwrap();
         let m = Measure(&atlas.font);
         let before = lang::code();
         let mut codes: Vec<String> = std::fs::read_dir(root.join("assets/minecraft/lang"))
@@ -1964,5 +2377,228 @@ mod footer_label_tests {
             assert!(scrolling.contains(&code), "{code} not in {scrolling:?}");
         }
         assert_eq!(lang::code(), before, "the global language was left alone");
+    }
+}
+
+#[cfg(test)]
+mod icon_slot_tests {
+    use super::*;
+
+    fn atlas() -> HudAtlas {
+        HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            "/nonexistent/horizon-test-assets".into(),
+        ))
+        .unwrap()
+    }
+
+    /// `count` packs with an icon each, the pixels of icon `i` all `i`.
+    fn packs(count: usize) -> Vec<PackInfo> {
+        let side = PACK_ICON_SIZE as usize;
+        (0..count)
+            .map(|i| PackInfo {
+                id: format!("file/pack{i:03}"),
+                title: Text::literal(format!("pack{i:03}")),
+                description: Text::literal(""),
+                description_style: Style::default(),
+                source: Source::BuiltIn,
+                compat: Compat::Compatible,
+                icon: Some(vec![i as u8; side * side * 4].into()),
+                required: false,
+                position: Position::Top,
+                fixed: false,
+                hidden: false,
+            })
+            .collect()
+    }
+
+    /// One frame as `options_ui` draws it: the calls, then the icons bound. The icons drawn
+    /// (their texture keys before binding), the textures after, and the patches sent.
+    fn frame(screen: &PackScreen, atlas: &HudAtlas) -> (Vec<String>, Vec<String>, Vec<Patch>) {
+        let m = Measure(&atlas.font);
+        let mut draws = screen.draw(&m, (0, 0), 0, 0);
+        let drawn: Vec<String> = draws
+            .iter()
+            .filter_map(|d| match d {
+                Draw::Blit { texture, .. } if screen.icons.contains_key(texture) => {
+                    Some(texture.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut patches = Vec::new();
+        screen.bind_icons(&mut draws, atlas, &mut patches);
+        let bound = draws
+            .iter()
+            .filter_map(|d| match d {
+                Draw::Blit { texture, .. } if texture.contains("pack-icon") => {
+                    Some(texture.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        (drawn, bound, patches)
+    }
+
+    /// Only the available list has packs: one row of 36 for each of `count` icons fits in a
+    /// window `height` high.
+    /// `AbstractScrollArea.extractScrollbar`: over a held pack list's bar the
+    /// pointer asks to resize vertically, at rest it points.
+    #[test]
+    fn the_pack_scrollbar_asks_for_its_cursor() {
+        let atlas = atlas();
+        let m = Measure(&atlas.font);
+        let mut screen = screen(&m, 30, 200);
+        let l = &screen.lists[0];
+        assert!(l.scrollable());
+        let at = (l.scroll_bar_x() + 2, l.y + 8);
+        let _ = crate::widgets::take_cursor();
+        screen.draw(&m, at, 0, 0);
+        assert_eq!(
+            crate::widgets::take_cursor(),
+            crate::widgets::Cursor::PointingHand
+        );
+        screen.lists[0].held = Some(f64::from(at.1));
+        screen.draw(&m, at, 0, 0);
+        assert_eq!(
+            crate::widgets::take_cursor(),
+            crate::widgets::Cursor::ResizeNs
+        );
+    }
+    fn screen(m: &Measure, count: usize, height: i32) -> PackScreen {
+        PackScreen::new(
+            m,
+            tr("resourcePack.title"),
+            480,
+            height,
+            false,
+            packs(count),
+            &[],
+        )
+    }
+
+    /// A 120 px window leaves a 38 px pack list, under the 32 px scroller
+    /// minimum plus the 8 px margin: the Java clamp keeps the last 8 px of the
+    /// list, and neither drawing nor dragging the bar panics on crossed bounds.
+    #[test]
+    fn a_short_pack_list_keeps_a_whole_scroller() {
+        let atlas = atlas();
+        let m = Measure(&atlas.font);
+        let mut screen = screen(&m, 30, 120);
+        assert_eq!(screen.lists[0].height, 38);
+        assert_eq!(screen.lists[0].scroller_thumb(), 30);
+        assert!(screen.lists[0].scrollable());
+        let max = screen.lists[0].max_scroll() as f64;
+        // The bar is drawn: this used to panic with min 32 and max 30.
+        assert!(!screen.draw(&m, (0, 0), 0, 0).is_empty());
+        // Dragging one pixel moves the list by max_scroll / 8: the 38 px list
+        // minus the 8 px margin, not the 6 px the 32 px minimum would leave.
+        let l = &mut screen.lists[0];
+        l.held = Some(f64::from(l.y + 1));
+        l.drag(f64::from(l.y + 2));
+        assert_eq!(l.scroll, max / 8.0);
+    }
+
+    /// Every frame sent every drawn icon again (a 128 by 128 RGBA copy each) into the same
+    /// atlas, which keeps what it is given: an icon is sent when it takes a slot, once.
+    #[test]
+    fn an_icon_is_sent_once_and_not_every_frame() {
+        let atlas = atlas();
+        let screen = screen(&Measure(&atlas.font), 5, 400);
+        let (drawn, bound, patches) = frame(&screen, &atlas);
+        assert_eq!((drawn.len(), bound.len(), patches.len()), (5, 5, 5));
+        for again in 0..3 {
+            let (_, rebound, resent) = frame(&screen, &atlas);
+            assert_eq!(rebound, bound, "frame {again}");
+            assert_eq!(resent.len(), 0, "frame {again}");
+        }
+    }
+
+    /// More icons drawn in one frame than there are slots: the first 64 get one, the rest keep
+    /// `unknown_pack`, and the next frame does not move them or send anything.
+    #[test]
+    fn past_the_slots_in_one_frame_the_rest_keep_unknown_pack() {
+        let atlas = atlas();
+        let screen = screen(&Measure(&atlas.font), PACK_ICON_SLOTS + 6, 4000);
+        let (drawn, bound, patches) = frame(&screen, &atlas);
+        assert_eq!(
+            drawn.len(),
+            PACK_ICON_SLOTS + 6,
+            "the window shows every row"
+        );
+        assert_eq!(
+            (bound.len(), patches.len()),
+            (PACK_ICON_SLOTS, PACK_ICON_SLOTS)
+        );
+        let (_, rebound, resent) = frame(&screen, &atlas);
+        assert_eq!((rebound, resent.len()), (bound, 0));
+    }
+
+    /// Scrolling through more packs than slots: every icon drawn gets a slot, each one is sent
+    /// once on the way down, and a frame that draws what the last one drew sends nothing.
+    #[test]
+    fn scrolling_sends_only_the_icons_that_come_into_view() {
+        let atlas = atlas();
+        let m = Measure(&atlas.font);
+        let mut screen = screen(&m, 70, 330);
+        let mut seen = std::collections::HashSet::new();
+        let mut sent = 0;
+        // 150 wheel steps of 18 are more than the 2520 high list.
+        for step in 0..150 {
+            let (drawn, bound, patches) = frame(&screen, &atlas);
+            assert_eq!(bound.len(), drawn.len(), "step {step}: none falls back");
+            let new = drawn.iter().filter(|t| seen.insert((*t).clone())).count();
+            assert_eq!(patches.len(), new, "step {step}");
+            sent += patches.len();
+            assert_eq!(frame(&screen, &atlas).2.len(), 0, "step {step}: same view");
+            screen.scroll(100.0, 200.0, -1.0);
+        }
+        assert_eq!((seen.len(), sent), (70, 70));
+    }
+
+    /// The slot of the icon drawn longest ago is the one taken, and the icon that left it is
+    /// sent again when it comes back.
+    #[test]
+    fn the_icon_drawn_longest_ago_gives_up_its_slot() {
+        let icons: Vec<Arc<[u8]>> = packs(PACK_ICON_SLOTS + 1)
+            .into_iter()
+            .map(|p| p.icon.unwrap())
+            .collect();
+        let mut slots = IconSlots::default();
+        let key = |i: usize| format!("k{i}");
+        slots.begin(&atlas());
+        for i in 0..PACK_ICON_SLOTS {
+            assert_eq!(slots.slot_for(&key(i), &icons[i]), Some((i, true)));
+        }
+        // The next frame draws icon 0 first, then a new one: slot 1, the oldest left, is taken.
+        slots.frame += 1;
+        assert_eq!(slots.slot_for(&key(0), &icons[0]), Some((0, false)));
+        assert_eq!(
+            slots.slot_for("new", &icons[PACK_ICON_SLOTS]),
+            Some((1, true))
+        );
+        // Icon 1 comes back: it is sent again, into the slot of the next oldest.
+        assert_eq!(slots.slot_for(&key(1), &icons[1]), Some((2, true)));
+    }
+
+    /// New pixels under the same key take the same slot and are sent; a new atlas holds none
+    /// of the icons, so all are sent again.
+    #[test]
+    fn changed_pixels_and_a_new_atlas_send_again() {
+        let atlas = atlas();
+        let mut screen = screen(&Measure(&atlas.font), 3, 400);
+        let (_, bound, patches) = frame(&screen, &atlas);
+        assert_eq!(patches.len(), 3);
+        let key = icon_texture("file/pack001");
+        screen
+            .icons
+            .insert(key, vec![200; patches[1].rgba.len()].into());
+        let (_, rebound, resent) = frame(&screen, &atlas);
+        assert_eq!(rebound, bound);
+        assert_eq!(resent.len(), 1);
+        assert_eq!((resent[0].x, resent[0].y), (patches[1].x, patches[1].y));
+        assert_eq!(resent[0].rgba[0], 200);
+        let other = self::atlas();
+        assert_ne!(other.revision, atlas.revision);
+        assert_eq!(frame(&screen, &other).2.len(), 3);
     }
 }

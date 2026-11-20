@@ -1,12 +1,30 @@
 //! Scheduling hints for the game's threads and its allocator: the few OS calls
 //! that the other crates, which forbid unsafe code, can't make themselves.
 
+pub mod alloc_count;
+#[cfg(feature = "test-allocation-probe")]
+pub mod allocation_probe;
+pub mod allocator_stats;
 /// The game window's boot screen, before wgpu's first frame paints over it.
 #[cfg(target_os = "windows")]
 pub mod boot_paint;
+pub mod callgrind;
 pub mod heap_census;
+#[cfg(target_os = "linux")]
+pub mod heap_sample;
 pub mod jobs;
 pub mod process_memory;
+#[cfg(target_os = "linux")]
+pub mod profile;
+#[cfg(target_os = "linux")]
+pub mod sampler;
+pub mod sizing;
+pub mod stack_dump;
+/// Alt+Space and a bare Alt never open the window's system menu, as in GLFW.
+#[cfg(target_os = "windows")]
+pub mod system_menu;
+pub mod unwind;
+pub mod work;
 
 use std::sync::{
     OnceLock,
@@ -29,10 +47,219 @@ pub fn worker_count() -> usize {
     })
 }
 
+/// `HORIZON_SERIAL_TICK=all`: every [`par_chunks_mut`] keeps its chunks on the
+/// calling thread, in order — the serial reference a parallel phase of the
+/// tick is checked against, tick by tick (#8158).
+pub fn serial_tick_all() -> bool {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    *ALL.get_or_init(|| {
+        std::env::var("HORIZON_SERIAL_TICK").is_ok_and(|v| v.eq_ignore_ascii_case("all"))
+    })
+}
+
+/// Runs `f` over `items` in chunks of `chunk`, in place. Helper threads take
+/// the next chunk as they finish one under a scope, the calling thread working
+/// too; a helper the system refuses to start leaves its chunks to the others,
+/// and the calling thread does all of it at worst (the region writer's
+/// `share_out` shape). A chunk runs on whatever thread takes it, so `f` must
+/// not depend on the order; nothing is shared out while one chunk is the
+/// whole slice, or while [`serial_tick_all`] holds the tick serial. The
+/// thread-locals the tick relies on do not follow a helper: set them in `f`,
+/// as `block_contact::in_level` wraps a level's own.
+pub fn par_chunks_mut<T: Send>(items: &mut [T], chunk: usize, f: impl Fn(&mut [T]) + Send + Sync) {
+    par_chunks_mut_with(items, chunk, f, !serial_tick_all());
+}
+
+/// [`par_chunks_mut`] with whether the work is shared out (its test).
+pub fn par_chunks_mut_with<T: Send>(
+    items: &mut [T],
+    chunk: usize,
+    f: impl Fn(&mut [T]) + Send + Sync,
+    parallel: bool,
+) {
+    let chunk = chunk.max(1);
+    let count = items.len().div_ceil(chunk);
+    if !parallel || count < 2 {
+        for slice in items.chunks_mut(chunk) {
+            f(slice);
+        }
+        return;
+    }
+    // A helper takes a chunk whole, so no thread sees another's half of one;
+    // the lock is only held while a chunk is taken, never while it runs.
+    let pending: std::sync::Mutex<Vec<&mut [T]>> =
+        std::sync::Mutex::new(items.chunks_mut(chunk).collect());
+    let work = || {
+        while let Some(slice) = pending.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            f(slice);
+        }
+    };
+    std::thread::scope(|scope| {
+        let helpers = worker_count().saturating_sub(1).clamp(1, count - 1);
+        let threads: Vec<_> = (0..helpers)
+            .filter_map(|_| {
+                horizon_guest_stack::builder()
+                    .spawn_scoped(scope, work)
+                    .ok()
+            })
+            .collect();
+        work();
+        for t in threads {
+            t.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+        }
+    });
+}
+
+#[cfg(test)]
+mod par_chunks_tests {
+    use super::par_chunks_mut_with;
+
+    /// Every item is visited exactly once, in parallel and on the caller
+    /// alone: each adds one to itself, whatever thread its chunk ran on.
+    #[test]
+    fn every_item_runs_once_shared_out_or_not() {
+        for parallel in [true, false] {
+            let mut items: Vec<usize> = (0..10_000).collect();
+            par_chunks_mut_with(
+                &mut items,
+                16,
+                |chunk| {
+                    for i in chunk {
+                        *i += 1;
+                    }
+                },
+                parallel,
+            );
+            assert_eq!(items, (1..=10_000).collect::<Vec<_>>(), "{parallel}");
+        }
+    }
+
+    /// A slice one chunk long never starts a helper, whichever way it is
+    /// asked for.
+    #[test]
+    fn one_chunk_stays_whole() {
+        let mut items = vec![0usize; 3];
+        par_chunks_mut_with(
+            &mut items,
+            16,
+            |chunk| {
+                assert_eq!(chunk.len(), 3);
+                for i in chunk {
+                    *i = 7;
+                }
+            },
+            true,
+        );
+        assert_eq!(items, vec![7, 7, 7]);
+    }
+}
+
+/// The chunk worker pool's automatic size (`jobs::default_threads`, Graphics > Worker
+/// threads on Auto): every core but one, as vanilla's `Util.maxAllowedExecutorThreads`,
+/// counting on Apple silicon only its performance cores. Its efficiency cores are slower,
+/// and workers there kept the render and server threads waiting for a performance core: on
+/// a base M4 (4 performance and 6 efficiency cores) a fast flight's p99 frame went from
+/// 20 ms with 9 workers to 7 ms with 3 (#11294).
+pub fn default_workers() -> usize {
+    workers_for(worker_count(), performance_cores)
+}
+
+/// The cores this process has for its pools: [`worker_count`]'s share, narrowed to
+/// the performance cores where the machine tells them apart (its efficiency cores
+/// don't carry a worker, see [`default_workers`]).
+pub(crate) fn usable_cores() -> usize {
+    usable_cores_for(worker_count(), performance_cores)
+}
+
+/// [`usable_cores`] for `cores` cores, of which `performance` (asked only here, the
+/// sysctl) are performance cores where the machine tells them apart (`None` elsewhere).
+fn usable_cores_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usize {
+    let fast = performance().filter(|&n| n > 0).unwrap_or(cores);
+    cores.min(fast)
+}
+
+/// [`default_workers`] for `cores` cores, of which `performance` (asked only here, the
+/// sysctl) are performance cores where the machine tells them apart (`None` elsewhere):
+/// one less than the smaller count, at least 1.
+fn workers_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usize {
+    usable_cores_for(cores, performance)
+        .saturating_sub(1)
+        .max(1)
+}
+
+/// The machine's performance cores:
+/// - on Apple silicon via `hw.perflevel0.physicalcpu`
+/// - on Linux by comparing max frequencies in `/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq`
+///   (Intel Alder Lake, Raptor Lake, Meteor Lake, big.LITTLE ARM)
+#[cfg(target_vendor = "apple")]
+fn performance_cores() -> Option<usize> {
+    let mut count: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: a NUL-terminated name; `count` and `size` are live locals of the size passed.
+    let read = unsafe {
+        libc::sysctlbyname(
+            c"hw.perflevel0.physicalcpu".as_ptr(),
+            (&raw mut count).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (read == 0 && count > 0).then_some(count as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn performance_cores() -> Option<usize> {
+    // Read max frequencies across CPUs from sysfs
+    let mut max_freq = 0u64;
+    let mut freqs = Vec::new();
+    let mut cpu_idx = 0;
+    loop {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu_idx}/cpufreq/cpuinfo_max_freq");
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                if let Ok(freq) = content.trim().parse::<u64>() {
+                    max_freq = max_freq.max(freq);
+                    freqs.push(freq);
+                }
+                cpu_idx += 1;
+            }
+            Err(_) => break,
+        }
+    }
+
+    if freqs.is_empty() {
+        return None;
+    }
+
+    // Check if there is frequency disparity indicating asymmetric cores (hybrid architecture)
+    let min_freq = *freqs.iter().min()?;
+    if min_freq < max_freq {
+        // Count performance cores (within 5% of max frequency)
+        let threshold = max_freq.saturating_sub(max_freq / 20);
+        let p_threads = freqs.iter().filter(|&&f| f >= threshold).count();
+        if p_threads > 0 && p_threads < freqs.len() {
+            return Some(p_threads);
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+fn performance_cores() -> Option<usize> {
+    None
+}
+
 /// `Some(n)` when `value` names a positive count (`" 4 "` counts; `"0"`,
 /// `"lots"`, a missing variable don't).
 fn parse_worker_count(value: Option<String>) -> Option<usize> {
     value?.trim().parse().ok().filter(|&n| n > 0)
+}
+
+/// `true` only for `1` (`" 1 "` counts): `HORIZON_DECODER_PRIORITY` off where
+/// a run doesn't ask for it, and off for a value someone mistyped.
+fn parse_decoder_priority(value: Option<String>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
 }
 
 /// Ask the OS to run the calling thread ahead of the process's other
@@ -73,6 +300,18 @@ fn favour() -> bool {
     false
 }
 
+/// Called by a chunk decoder thread as it starts (the `ChunkDecoder` worker,
+/// up to four): the calling thread stays at the ordinary priority, below the
+/// one that ticks and draws a frame, as a decoder should. `HORIZON_DECODER_PRIORITY=1`
+/// gives the old raise back for an A/B run ([`favour_current`]); a value read
+/// once, like [`worker_count`]. Whether the OS took a raise it still asked for.
+pub fn chunk_decoder_current() -> bool {
+    static SWITCH: OnceLock<bool> = OnceLock::new();
+    let asked = *SWITCH
+        .get_or_init(|| parse_decoder_priority(std::env::var("HORIZON_DECODER_PRIORITY").ok()));
+    asked && favour_current()
+}
+
 /// The CPU time the calling thread has used, where only an OS call gives it
 /// precisely. Windows counts it exactly only in cycles of the time-stamp
 /// counter (`QueryThreadCycleTime`; `GetThreadTimes` moves in scheduler ticks
@@ -110,6 +349,31 @@ pub fn thread_cpu() -> Option<std::time::Duration> {
     None
 }
 
+/// Clones the file or the whole folder `from` as `to`, which must not exist, in one call
+/// that shares the data (APFS `clonefile`, folders included). `Unsupported` where there is
+/// no such call: the caller copies the files itself.
+pub fn clone_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = |p: &std::path::Path| {
+            std::ffi::CString::new(p.as_os_str().as_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        };
+        let (from, to) = (path(from)?, path(to)?);
+        // SAFETY: both paths are NUL-terminated strings that outlive the call.
+        if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = (from, to);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
 /// Set once as the game starts, before its helper threads do: they then go
 /// behind the server thread and the render thread (`behind_server`).
 static HELPERS_BEHIND: AtomicBool = AtomicBool::new(false);
@@ -139,6 +403,14 @@ pub fn behind_server() -> bool {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+fn idle_sched_param() -> libc::sched_param {
+    // SAFETY: `sched_param` is a plain C struct; zero-init also covers musl's extra fields.
+    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+    param.sched_priority = 0;
+    param
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn behind() -> bool {
     // SAFETY: these read and set the calling thread's own nice value or
     // policy (who 0, pid 0 is the calling thread on Linux and Android); `param` lives
@@ -148,7 +420,7 @@ fn behind() -> bool {
         if nice + BEHIND <= 19 {
             libc::setpriority(libc::PRIO_PROCESS as _, 0, nice + BEHIND) == 0
         } else {
-            let param = libc::sched_param { sched_priority: 0 };
+            let param = idle_sched_param();
             libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) == 0
         }
     }
@@ -233,7 +505,7 @@ pub fn idle_current() -> bool {
 
 #[cfg(target_os = "linux")]
 fn idle() -> bool {
-    let param = libc::sched_param { sched_priority: 0 };
+    let param = idle_sched_param();
     // SAFETY: sets the calling thread's own policy (pid 0); `param` lives
     // across the call.
     unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) == 0 }
@@ -295,13 +567,33 @@ pub fn catch_stop_signals() {
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 pub fn catch_stop_signals() {}
 
-/// The game's global allocator (`#[global_allocator]` in its `main.rs`).
+/// The game's global allocator (`#[global_allocator]` in `horizon-client`'s library).
 /// World generation, meshing and the tick allocate and free small blocks on
 /// every worker at once; the system heaps serialise them (Windows' heap was
 /// 16% of a chunk's generation time), mimalloc keeps a heap per thread.
+/// On Linux it samples allocations while a capture runs (`heap_sample`).
+#[cfg(all(target_os = "linux", not(feature = "test-allocation-count")))]
+pub type Allocator = heap_sample::SamplingAllocator;
+#[cfg(all(not(target_os = "linux"), not(feature = "test-allocation-count")))]
 pub type Allocator = mimalloc::MiMalloc;
 /// The game's mimalloc allocator.
-pub const ALLOCATOR: Allocator = mimalloc::MiMalloc;
+#[cfg(not(feature = "test-allocation-count"))]
+pub const ALLOCATOR: Allocator = Allocator {};
+
+/// The game's global allocator: the census, else counting mimalloc, else [`Allocator`].
+#[cfg(feature = "alloc-census")]
+pub type GameAllocator = heap_census::CensusAllocator;
+#[cfg(all(feature = "alloc-count", not(feature = "alloc-census")))]
+pub type GameAllocator = alloc_count::CountingAllocator;
+#[cfg(not(any(feature = "alloc-count", feature = "alloc-census")))]
+pub type GameAllocator = Allocator;
+/// The value of [`GameAllocator`].
+pub const GAME_ALLOCATOR: GameAllocator = GameAllocator {};
+
+#[cfg(feature = "test-allocation-count")]
+pub mod allocation_count;
+#[cfg(feature = "test-allocation-count")]
+pub use allocation_count::{ALLOCATOR, Allocator};
 
 /// The global allocator of a build with the `alloc-census` feature: live
 /// heap bytes by startup step and thread, for `horizon-ctl memory`.
@@ -318,15 +610,32 @@ pub fn heap_tag(name: &'static str) -> Option<heap_census::Tag> {
 /// `mi_option_purge_delay` in mimalloc.h (index 15 in v2 and v3); the bindings
 /// don't name it.
 const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+/// `mi_option_allow_thp` in mimalloc.h (index 43 in v3); unnamed in the bindings too.
+#[cfg(target_os = "linux")]
+const ALLOW_THP: libmimalloc_sys::mi_option_t = 43;
 
 /// Set the allocator up, first thing in `main`: free pages go back to the OS
 /// at once instead of a second later. With mimalloc's delay the game held a
 /// quarter more memory than with the system heap; without it a few percent,
 /// and generation keeps most of its speed-up.
+///
+/// On Linux it also turns transparent huge pages off for the process.
+/// mimalloc asks for them on its arenas (`MADV_HUGEPAGE`, so `madvise` systems
+/// give them too), and a 2 MiB huge page stays resident whole while one
+/// 64 KiB mimalloc page in it is used: in a world at render distance 12 the
+/// game held 200 MiB more that way, at the same load time and frame rate.
 pub fn configure_allocator() {
     // SAFETY: sets one integer option, which mimalloc reads at each purge.
     unsafe {
         libmimalloc_sys::mi_option_set(PURGE_DELAY, 0);
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: an integer option mimalloc reads at each new mapping, and a prctl
+    // that only sets this process's flag; the kernel reads it on each page fault,
+    // so the arenas mapped before `main` take small pages from now on too.
+    unsafe {
+        libmimalloc_sys::mi_option_set(ALLOW_THP, 0);
+        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
     }
 }
 
@@ -360,11 +669,52 @@ pub fn allocator_commit() -> (usize, usize) {
     (info[5], info[6])
 }
 
+/// Bumped by [`release_everywhere`]: each pool thread compares it with the
+/// value it saw last ([`release_asked`]).
+/// The names of the threads that called [`release_free_memory`], for tests.
+#[cfg(test)]
+static RELEASED_BY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+static RELEASE_ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How often a pool thread with nothing to do looks at [`release_asked`].
+pub const RELEASE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask every pool thread to give back the memory its heap holds free, and
+/// give back this thread's now. mimalloc returns a page that one thread freed
+/// into another's heap only when the owning thread collects: the chunks a
+/// server unloads were mostly made on the workers, encoded on the chunk
+/// encoders and read on the network threads, which then sleep. Each of them
+/// calls [`release_free_memory`] within [`RELEASE_POLL`].
+pub fn release_everywhere() {
+    RELEASE_ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    release_free_memory();
+}
+
+/// [`RELEASE_ASKED`] for a pool thread to start from: a release asked before
+/// it started is not its own.
+pub fn release_seen() -> u64 {
+    RELEASE_ASKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// For a pool thread between jobs: whether [`release_everywhere`] was asked
+/// since `seen`, which it updates. The thread then calls
+/// [`release_free_memory`].
+pub fn release_asked(seen: &mut u64) -> bool {
+    let now = release_seen();
+    std::mem::replace(seen, now) != now
+}
+
 /// Give back to the OS the memory the allocator holds free, after something
 /// large was dropped: mimalloc's free pages, then the system heap's, which
 /// native libraries still use: glibc keeps freed pages in the arena of the
 /// thread that allocated them, and macOS in its zones until memory runs short.
 pub fn release_free_memory() {
+    #[cfg(test)]
+    RELEASED_BY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(std::thread::current().name().unwrap_or_default().to_owned());
     // SAFETY: frees only pages no allocation uses (this thread's heap, shared arenas).
     unsafe {
         libmimalloc_sys::mi_collect(true);
@@ -508,6 +858,36 @@ mod tests {
         assert_eq!(super::worker_count(), machine);
     }
 
+    /// The pool leaves a core, counting only the performance cores where the machine has them.
+    #[test]
+    fn default_workers_count_performance_cores() {
+        use super::workers_for;
+        // Apple silicon: base M4 (4 + 6), M1 (4 + 4), M4 Pro (10 + 4).
+        assert_eq!(workers_for(10, || Some(4)), 3);
+        assert_eq!(workers_for(8, || Some(4)), 3);
+        assert_eq!(workers_for(14, || Some(10)), 9);
+        // HORIZON_WORKER_THREADS below the performance cores still caps the pool.
+        assert_eq!(workers_for(4, || Some(10)), 3);
+        // Everywhere else (and a sysctl that answers nothing): every core but one, as before.
+        assert_eq!(workers_for(12, || None), 11);
+        assert_eq!(workers_for(14, || Some(0)), 13);
+        // Never fewer than one worker.
+        assert_eq!(workers_for(1, || None), 1);
+        assert_eq!(workers_for(2, || Some(1)), 1);
+    }
+
+    /// Platforms without asymmetric core detection (Windows, etc.) are unchanged: the count is the one the pool always had.
+    #[test]
+    fn default_workers_are_unchanged_on_uniform_systems() {
+        let before = super::worker_count().saturating_sub(1).max(1);
+        if cfg!(any(target_vendor = "apple", target_os = "linux")) {
+            assert!((1..=before).contains(&super::default_workers()));
+        } else {
+            assert_eq!(super::performance_cores(), None);
+            assert_eq!(super::default_workers(), before);
+        }
+    }
+
     /// Only a positive number overrides the machine's count.
     #[test]
     fn worker_count_override_parses() {
@@ -570,6 +950,67 @@ mod tests {
         .unwrap();
     }
 
+    /// Only `1` asks for the decoders to be raised again: a run asks, a
+    /// mistyped or missing value leaves them below the frame.
+    #[test]
+    fn decoder_priority_switch_parses() {
+        for (value, on) in [
+            (None, false),
+            (Some("1"), true),
+            (Some(" 1 "), true),
+            (Some("0"), false),
+            (Some("true"), false),
+            (Some("2"), false),
+            (Some(""), false),
+        ] {
+            assert_eq!(super::parse_decoder_priority(value.map(String::from)), on);
+        }
+    }
+
+    /// What #18241 is about: the thread a chunk decoder runs on stays at the
+    /// ordinary priority the pools' helpers have, while a thread that asks for
+    /// the raise the frame asks for goes above it — the control half, since
+    /// `favour_current` asks for nothing on a machine of four cores or fewer
+    /// and the first half alone would then pass without proving anything. A
+    /// run that starts with `HORIZON_DECODER_PRIORITY=1` has to raise the
+    /// decoder again instead, which checks the switch the same way.
+    #[cfg(windows)]
+    #[test]
+    fn a_decoder_thread_stays_below_the_frame() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            THREAD_PRIORITY_NORMAL,
+        };
+        if std::thread::available_parallelism().map_or(1, |n| n.get()) <= 4 {
+            return;
+        }
+        // A run started with `HORIZON_DECODER_PRIORITY=1` asks for the old
+        // raise: the same measurement then has to show it, which is the A/B.
+        // Read here, not through the switch the code under test reads.
+        let asked = std::env::var("HORIZON_DECODER_PRIORITY").is_ok_and(|v| v.trim() == "1");
+        let priority = |call: fn() -> bool| {
+            std::thread::spawn(move || {
+                call();
+                // SAFETY: reads the priority of the thread it runs on; the
+                // pseudo handle needs no closing.
+                unsafe { GetThreadPriority(GetCurrentThread()) }
+            })
+            .join()
+            .unwrap()
+        };
+        let decoder = priority(super::chunk_decoder_current);
+        let frame = priority(super::favour_current);
+        assert_eq!(
+            decoder,
+            if asked {
+                THREAD_PRIORITY_ABOVE_NORMAL
+            } else {
+                THREAD_PRIORITY_NORMAL
+            }
+        );
+        assert_eq!(frame, THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+
     /// A helper goes behind only once a dedicated server asks for it, and
     /// then, on Linux and Android, 10 nice levels below the process or in the idle class.
     #[test]
@@ -619,7 +1060,12 @@ mod tests {
     }
 
     /// The option set is the purge delay: mimalloc v3's default for it is
-    /// 1000 ms, and it is 0 once configured.
+    /// 1000 ms, and it is 0 once configured. Configured, a Linux process also
+    /// takes no transparent huge pages, whatever the system's setting.
+    ///
+    /// The allocator's options are the process's, and libtest runs tests in
+    /// parallel: this must stay the only test here that configures it, or the
+    /// default read first sees another test's setting.
     #[test]
     fn configuring_the_allocator_purges_at_once() {
         // SAFETY: reads and sets one integer option.
@@ -629,6 +1075,19 @@ mod tests {
         }
         super::configure_allocator();
         assert_eq!(get(), 0);
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: reads this process's flag.
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_GET_THP_DISABLE, 0, 0, 0, 0) },
+                1
+            );
+            // SAFETY: reads one integer option.
+            assert_eq!(
+                unsafe { libmimalloc_sys::mi_option_get(super::ALLOW_THP) },
+                0
+            );
+        }
     }
 }
 

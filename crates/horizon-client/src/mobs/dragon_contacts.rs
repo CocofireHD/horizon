@@ -1,6 +1,7 @@
 //! `EnderDragon.knockBack` and `hurt` for living mobs.
 //! The dragon lives outside the normal mob array; its contacts must still reach them.
 // Contact rules compared with the installed vanilla Java 26.3 EnderDragon.
+use crate::health::DamageLevel;
 use crate::mobs::{Damage, DamageKind, Mob, Who};
 use horizon_core::geometry::{Aabb, Vec3};
 
@@ -16,9 +17,22 @@ pub struct Frame {
 
 /// Wings push even while perched and even when teams forbid damage.
 /// The normal mob damage handler owns armor, invulnerability frames and last-attacker bookkeeping.
-pub fn contact(m: &mut Mob, f: &Frame, teams_allow: bool) {
+pub fn contact(level: &mut DamageLevel<'_>, m: &mut Mob, f: &Frame, teams_allow: bool) {
+    for part in 0..4 {
+        contact_part(level, m, f, teams_allow, part);
+    }
+}
+/// `EnderDragon.knockBack` / `hurt`: one wing or head contact; true when it runs post-attack effects,
+/// even if the hurt cooldown refused the damage.
+pub fn contact_part(
+    level: &mut DamageLevel<'_>,
+    m: &mut Mob,
+    f: &Frame,
+    teams_allow: bool,
+    part: usize,
+) -> bool {
     if f.recently_hurt || m.removed || m.id == f.dragon_id {
-        return;
+        return false;
     }
     let bounds = m.bounds();
     let source = Damage {
@@ -27,8 +41,8 @@ pub fn contact(m: &mut Mob, f: &Frame, teams_allow: bool) {
         from: Some([f.origin.x, f.origin.y, f.origin.z]),
         attacker_species: None,
     };
-    for wing in &f.wings {
-        if wing.intersects(bounds) {
+    if part < 2 {
+        if f.wings[part].intersects(bounds) {
             let dx = m.position.x - f.center.0;
             let dz = m.position.z - f.center.1;
             let dd = (dx * dx + dz * dz).max(0.1);
@@ -39,17 +53,15 @@ pub fn contact(m: &mut Mob, f: &Frame, teams_allow: bool) {
                 && teams_allow
                 && m.ai.last_hurt_by_time < (m.age as i32).saturating_sub(2)
             {
-                m.damage(5.0, source);
+                m.damage(level, 5.0, source);
+                return true;
             }
         }
+    } else if teams_allow && f.heads[part - 2].intersects(bounds) {
+        m.damage(level, 10.0, source);
+        return true;
     }
-    if teams_allow {
-        for head in &f.heads {
-            if head.intersects(bounds) {
-                m.damage(10.0, source);
-            }
-        }
-    }
+    false
 }
 
 #[cfg(test)]
@@ -80,48 +92,60 @@ mod tests {
     }
     #[test]
     fn flying_wing_hurts_and_names_the_dragon() {
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
         let (mut m, f) = setup();
-        contact(&mut m, &f, true);
+        contact(level, &mut m, &f, true);
         assert_eq!(m.health, 35.0);
         assert_eq!(m.ai.last_hurt_by, Some(Who::Mob(99)));
     }
     #[test]
     fn perched_wing_pushes_without_damage() {
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
         let (mut m, mut f) = setup();
         f.sitting = true;
-        contact(&mut m, &f, true);
+        contact(level, &mut m, &f, true);
         assert_eq!(m.health, 40.0);
         assert_eq!(m.velocity, Vec3::new(4.0, f64::from(0.2_f32), 0.0));
     }
     #[test]
     fn team_protection_keeps_push_but_blocks_damage() {
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
         let (mut m, f) = setup();
-        contact(&mut m, &f, false);
+        contact(level, &mut m, &f, false);
         assert_eq!(m.health, 40.0);
         assert_eq!(m.velocity, Vec3::new(4.0, f64::from(0.2_f32), 0.0));
     }
     #[test]
     fn hurt_dragon_does_not_contact_mobs() {
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
         let (mut m, mut f) = setup();
         f.recently_hurt = true;
-        contact(&mut m, &f, true);
+        contact(level, &mut m, &f, true);
         assert_eq!(m.health, 40.0);
         assert_eq!(m.velocity, Vec3::ZERO);
     }
     #[test]
     fn head_hurts_even_when_perched() {
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
         let (mut m, mut f) = setup();
         f.sitting = true;
         f.wings = [box_at(100.0), box_at(100.0)];
         f.heads[0] = box_at(0.0);
-        contact(&mut m, &f, true);
+        contact(level, &mut m, &f, true);
         assert_eq!(m.health, 30.0);
     }
     #[test]
     fn recent_mob_attack_suppresses_wing_damage() {
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
         let (mut m, f) = setup();
         m.ai.last_hurt_by_time = 99;
-        contact(&mut m, &f, true);
+        contact(level, &mut m, &f, true);
         assert_eq!(m.health, 40.0);
         assert_eq!(m.velocity, Vec3::new(4.0, f64::from(0.2_f32), 0.0));
     }
@@ -133,6 +157,8 @@ mod parity {
     #[test]
     #[ignore = "writes the vanilla parity transcript"]
     fn contact_transcript() {
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
         let mut rows = Vec::new();
         for name in [
             "flying",
@@ -173,7 +199,7 @@ mod parity {
                 m.ai.last_hurt_by = Some(Who::Mob(99));
                 m.ai.last_hurt_by_time = 99;
             }
-            contact(&mut m, &f, name != "team");
+            contact(level, &mut m, &f, name != "team");
             rows.push(serde_json::json!({"case":name,"health":m.health,"velocity":[m.velocity.x,m.velocity.y,m.velocity.z],"revenge":m.ai.last_hurt_by==Some(Who::Mob(99))}));
         }
         let path = std::env::var_os("HORIZON_DRAGON_CONTACT_OUTPUT").expect("parity output path");

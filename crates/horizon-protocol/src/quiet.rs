@@ -1,6 +1,6 @@
 //! Quiet commands: a client mod's batch of commands that a Horizon server runs
 //! as the player who sent them, at that player's own permission level, with
-//! no feedback in the chat (docs/mods.md, `command.run-quiet`).
+//! no feedback in the chat (docs/modding/src/how-to/content-mods.md, `command.run-quiet`).
 //!
 //! The server announces it understands them with an empty [`CHANNEL`] payload
 //! in the configuration phase (a vanilla client ignores it); a client that
@@ -31,14 +31,24 @@ pub struct Batch {
     pub lines: Vec<String>,
 }
 
+/// The longest prefix of `s` of at most `max` UTF-16 units: what `decode` (and Java) count, so a
+/// line of emoji is cut short rather than refused whole.
+fn utf16_prefix(s: &str, max: usize) -> String {
+    let mut units = 0;
+    s.chars()
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= max
+        })
+        .collect()
+}
+
 /// `lines` as few payloads as fit [`MAX_PAYLOAD`] and [`MAX_LINES`], in
 /// order. Lines longer than [`MAX_LINE`] are cut, as a chat command's are.
 pub fn encode(mod_id: &str, lines: &[String]) -> Vec<Vec<u8>> {
-    let mod_id: String = mod_id.chars().take(MAX_MOD_ID).collect();
+    let mod_id = utf16_prefix(mod_id, MAX_MOD_ID);
     let mut payloads = Vec::new();
-    let mut rest = lines
-        .iter()
-        .map(|l| -> String { l.chars().take(MAX_LINE).collect() });
+    let mut rest = lines.iter().map(|l| utf16_prefix(l, MAX_LINE));
     let mut next = rest.next();
     while next.is_some() {
         let mut batch = Vec::new();
@@ -75,13 +85,24 @@ pub fn decode(data: &[u8]) -> Result<Batch> {
         return Err(Error::new("quiet commands: payload too big"));
     }
     let mut r = Reader::new(data);
-    let mod_id = r.string(MAX_MOD_ID)?;
+    // As StringUtil.isAllowedChatCharacter, which a chat command must pass: no control characters
+    // (a newline in the mod id would make whole lines of the server's log), DEL or section sign.
+    let checked = |s: String| -> Result<String> {
+        if s.chars()
+            .all(|c| c >= ' ' && c != '\u{7f}' && c != '\u{a7}')
+        {
+            Ok(s)
+        } else {
+            Err(Error::new("quiet commands: illegal characters"))
+        }
+    };
+    let mod_id = checked(r.string(MAX_MOD_ID)?)?;
     let count = r.varint()?;
     if !(0..=MAX_LINES as i32).contains(&count) {
         return Err(Error::new(format!("quiet commands: {count} lines")));
     }
     let lines = (0..count)
-        .map(|_| r.string(MAX_LINE))
+        .map(|_| r.string(MAX_LINE).and_then(checked))
         .collect::<Result<Vec<_>>>()?;
     if r.remaining() > 0 {
         return Err(Error::new("quiet commands: trailing bytes"));
@@ -92,6 +113,22 @@ pub fn decode(data: &[u8]) -> Result<Batch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_characters_are_refused_in_the_mod_id_and_lines() {
+        let forged = "x\n[12:00:00] [Server thread/INFO]: Stopping server";
+        for (id, line) in [
+            (forged, "say hi"),
+            ("orbital", "say hi\nop Kim"),
+            ("orbital", "say \u{a7}cred"),
+            ("orb\u{7f}", "say hi"),
+        ] {
+            let payload = &encode(id, &[line.to_owned()])[0];
+            assert!(decode(payload).is_err(), "{id:?} {line:?}");
+        }
+        let fine = &encode("orbital", &["say hé".to_owned()])[0];
+        assert_eq!(decode(fine).unwrap().mod_id, "orbital");
+    }
 
     #[test]
     fn a_batch_round_trips() {
@@ -162,5 +199,14 @@ mod tests {
         w.varint(0);
         w.u8(1);
         assert!(decode(&w.data).is_err());
+    }
+
+    #[test]
+    fn lines_are_cut_in_utf16_units_so_decode_takes_them() {
+        let emoji = "😀".repeat(200);
+        let payloads = encode(&"🦀".repeat(40), &[emoji]);
+        let batch = decode(&payloads[0]).unwrap();
+        assert_eq!(batch.lines[0].chars().count(), MAX_LINE / 2);
+        assert_eq!(batch.mod_id.chars().count(), MAX_MOD_ID / 2);
     }
 }

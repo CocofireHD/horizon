@@ -1,4 +1,4 @@
-//! Horizon modpacks from the registry (`.hpack`, docs/api/mod-index.md), each played as its own
+//! Horizon modpacks from the registry (`.hpack`, docs/modding/src/reference/registry-index.md), each played as its own
 //! profile: `horizon-packs/<id>/` in the game's home holds the pack's file, `pack.json` (what
 //! was installed) and `home/`, the profile's game folder: its saves, its options, and the pack's
 //! mods in `home/horizon-mods/`, each downloaded and checked against the index like any
@@ -6,7 +6,7 @@
 //! packs, a mod's saved settings) are copied in once, when it is installed.
 use super::{fetch, index, install_version, local, newest, Index};
 use crate::browser::{java, FileRef};
-use horizon_mods::{index as idx, modpack::Modpack};
+use horizon_platform::mod_package::{index as idx, modpack::Modpack};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -85,8 +85,9 @@ fn install_in(
     if p.kind != idx::Kind::Modpack {
         return Err(format!("{} is a {}, not a modpack.", p.name, p.kind.name()));
     }
-    let v = newest(index, p, None)?;
     let work = dir.join(&p.id);
+    let _game = crate::game_shader_api::for_home(&home(&work));
+    let v = newest(index, p)?;
     let fresh = !work.exists();
     let result = install_version_in(index, local, p, v, &work, progress);
     if result.is_err() && fresh {
@@ -122,6 +123,10 @@ fn install_version_in(
     let pack = Modpack::read(&path)?;
     let home = home(work);
     fs::create_dir_all(&home).map_err(|e| format!("{}: {e}", home.display()))?;
+    // A mod the pack's last version listed keeps the player's on/off choice from the Mods
+    // page; a mod this version adds starts at the pack's `on`. `install_version` turns a mod
+    // on, so the choice is read before it and written back after.
+    let before = read(work).map(|p| p.mods).unwrap_or_default();
     let mut mods = Vec::new();
     for m in &pack.manifest.mods {
         let found = index
@@ -133,8 +138,12 @@ fn install_version_in(
                 p.name, m.id, m.version
             ));
         };
+        let was = before
+            .iter()
+            .any(|s| s.split(' ').next() == Some(m.id.as_str()))
+            .then(|| java::is_enabled(&home, &m.id));
         install_version(index, local, mp, mv, &home, progress)?;
-        java::set_enabled(&home, &m.id, m.on)?;
+        java::set_enabled(&home, &m.id, was.unwrap_or(m.on))?;
         mods.push(format!("{} {}", m.id, m.version));
     }
     // Settings once: the player's own changes to the profile stay on updates.
@@ -190,18 +199,23 @@ mod tests {
 
     /// A local registry: the mod and a pack of it, as `file://` files.
     fn registry(dir: &Path, on: bool, extra: &str) -> Index {
+        registry_at(dir, "1.0.0", on, extra)
+    }
+
+    /// [`registry`] with the pack at `pack_version`.
+    fn registry_at(dir: &Path, pack_version: &str, on: bool, extra: &str) -> Index {
         let hmod_src = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../crates/horizon-mods/tests/index/coords_hud-0.1.0.hmod");
+            .join("../crates/horizon-mod-package/tests/index/coords_hud-0.1.0.hmod");
         let hmod = dir.join("coords_hud-0.1.0.hmod");
         fs::copy(hmod_src, &hmod).unwrap();
         let hmod_sha = idx::sha256_file(&hmod).unwrap();
-        let hpack = dir.join("cozy-1.0.0.hpack");
+        let hpack = dir.join(format!("cozy-{pack_version}.hpack"));
         let mut zip = zip::ZipWriter::new(fs::File::create(&hpack).unwrap());
         let o = zip::write::SimpleFileOptions::default();
         zip.start_file("horizon-modpack.toml", o).unwrap();
         write!(
             zip,
-            "format = 1\nid = \"cozy\"\nname = \"Cozy\"\nversion = \"1.0.0\"\ngame = \"26.3\"\n\
+            "format = 1\nid = \"cozy\"\nname = \"Cozy\"\nversion = \"{pack_version}\"\ngame = \"26.3\"\n\
              [[mods]]\nid = \"coords_hud\"\nversion = \"0.1.0\"\nsha256 = \"{hmod_sha}\"\non = {on}\n"
         )
         .unwrap();
@@ -222,13 +236,13 @@ mod tests {
         let text = format!(
             r#"{{"schema": 1, "projects": [
               {{"id": "coords_hud", "kind": "mod", "name": "Coordinates HUD", "summary": "", "license": "MIT",
-                "source": "https://x.test", "versions": [{{"version": "0.1.0", "api": "0.1", "side": "client",
-                "capabilities": ["game-read", "hud", "chat"], "game": "26.3", "file": {{"name": "coords_hud-0.1.0.hmod",
+                "source": "https://x.test", "versions": [{{"version": "0.1.0", "api": "0.2", "side": "client",
+                "capabilities": ["registries"], "game": "26.3", "file": {{"name": "coords_hud-0.1.0.hmod",
                 "url": "file://{}", "size": {}, "sha256": "{hmod_sha}"}}}}]}},
               {{"id": "cozy", "kind": "modpack", "name": "Cozy", "summary": "", "license": "MIT",
-                "source": "https://x.test", "versions": [{{"version": "1.0.0", "api": "1", "game": "26.3",
+                "source": "https://x.test", "versions": [{{"version": "{pack_version}", "api": "1", "game": "26.3",
                 "requires": [{{"id": "coords_hud", "version": "0.1.0", "sha256": "{hmod_sha}"}}],
-                "file": {{"name": "cozy-1.0.0.hpack", "url": "file://{}", "size": {}, "sha256": "{}"}}}}]}}
+                "file": {{"name": "cozy-{pack_version}.hpack", "url": "file://{}", "size": {}, "sha256": "{}"}}}}]}}
             ]{extra}}}"#,
             url(&hmod),
             size(&hmod),
@@ -288,6 +302,38 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A pack update keeps the mods the player turned on or off in the Mods page, as a Java
+    /// mod update does; a mod the new pack version adds takes the pack's own `on`.
+    #[test]
+    fn a_pack_update_keeps_the_players_mod_choices() {
+        let dir = scratch("keep-choice");
+        let packs = dir.join("horizon-packs");
+        let first = registry_at(&dir, "1.0.0", true, "");
+        install_in(&first, true, "cozy", &packs, &|_, _| {}).unwrap();
+        let home = home(&packs.join("cozy"));
+        assert!(
+            java::is_enabled(&home, "coords_hud"),
+            "the pack turns it on"
+        );
+
+        // The player turns it off on the Mods page; the next pack version leaves it off.
+        java::set_enabled(&home, "coords_hud", false).unwrap();
+        let second = registry_at(&dir, "1.1.0", true, "");
+        let pack = install_in(&second, true, "cozy", &packs, &|_, _| {}).unwrap();
+        assert_eq!(pack.version, "1.1.0", "it was an update");
+        assert!(
+            !java::is_enabled(&home, "coords_hud"),
+            "the update kept it off"
+        );
+
+        // Turned back on, the next one leaves it on.
+        java::set_enabled(&home, "coords_hud", true).unwrap();
+        let third = registry_at(&dir, "1.2.0", true, "");
+        install_in(&third, true, "cozy", &packs, &|_, _| {}).unwrap();
+        assert!(java::is_enabled(&home, "coords_hud"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_pack_with_a_taken_down_mod_installs_nothing() {
         let dir = scratch("revoked");
@@ -299,6 +345,43 @@ mod tests {
         let packs = dir.join("horizon-packs");
         let e = install_in(&index, true, "cozy", &packs, &|_, _| {}).unwrap_err();
         assert!(e.contains("taken down: Test."), "{e}");
+        assert!(!packs.join("cozy").exists(), "nothing left behind");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A pack that pins a shader pack made for another shader API fails as a whole, and the
+    /// pinned pack isn't downloaded (#17245).
+    #[test]
+    fn a_pack_pinning_a_shader_pack_for_another_shader_api_installs_nothing() {
+        let dir = scratch("shader-api");
+        let mut index = registry(&dir, true, "");
+        let pinned = index
+            .projects
+            .iter_mut()
+            .find(|p| p.id == "coords_hud")
+            .unwrap();
+        pinned.kind = idx::Kind::Shader;
+        pinned.versions[0].api = "0.1".into();
+        let packs = dir.join("horizon-packs");
+        let fetched = std::sync::Mutex::new(Vec::new());
+        let install = || {
+            install_in(&index, true, "cozy", &packs, &|line, _| {
+                fetched.lock().unwrap().push(line.to_owned())
+            })
+        };
+        let e = crate::game_shader_api::tests::with_game(&["0.2"], install).unwrap_err();
+        assert_eq!(
+            e,
+            "Coordinates HUD needs shader API 0.1; this Horizon serves 0.2."
+        );
+        assert!(
+            fetched
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|l| l.starts_with("Cozy ")),
+            "only the pack's own file was downloaded"
+        );
         assert!(!packs.join("cozy").exists(), "nothing left behind");
         fs::remove_dir_all(&dir).unwrap();
     }

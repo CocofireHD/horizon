@@ -36,10 +36,12 @@ jobs:
   parity:
     runs-on: ${{ inputs.full && fromJSON('["self-hosted", "horizon-game", "playhorizon"]') || fromJSON('["self-hosted", "horizon-game"]') }}
     # A change to core crates reruns ~350 harnesses: ~60-90 min on the Mac mini; on playhorizon (4 of its 8 vCPUs, 4
-    # harnesses at a time) up to a few hours, and any pull request's job may land there.
-    timeout-minutes: ${{ inputs.full && 360 || 180 }}
+    # harnesses at a time) up to a few hours, and any pull request's job may land there. 180 min cut one off on the
+    # Mac mini on 2026-11-20 (#18551). After the oracle shim's key changes, its records are rebuilt once, which adds
+    # up to ~23 min.
+    timeout-minutes: ${{ inputs.full && 360 || 240 }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The commit the event names: a fork's later pushes need another run-parity label. The next step merges
           # main into it.
@@ -71,7 +73,9 @@ jobs:
             echo "::warning::head ${HEAD_SHA:0:9} conflicts with main ${main:0:9}: tested alone, without main's fixes"
             echo "Tested: head ${HEAD_SHA:0:9} alone (it conflicts with main ${main:0:9})" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-11
+        with:
+          toolchain: stable
       - name: Tools from the runner
         run: bash tools/ci/runner-env.sh
       - name: Vanilla data, and resources prepared by this preparer
@@ -101,7 +105,7 @@ jobs:
         run: python3 tools/parity.py frame_identity --timeout 2400
       - name: Logs of the failed harnesses
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: parity-logs
           path: .local/parity-runner/logs/

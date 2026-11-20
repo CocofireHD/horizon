@@ -2,12 +2,13 @@
 //! with `IS_GUI`): servers' HUDs that their pack's vertex shader moves to the screen's corners,
 //! and text effects in its fragment shader. Without one the text draws natively.
 
-use std::path::Path;
+use crate::resource_source::ResourceSource;
 use std::sync::Arc;
 
-use horizon_shaders::{CoreProgram, Glue};
+use crate::core_shader::{CoreProgram, Glue};
 
 use super::{HudBatch, HudVertex};
+use crate::gfx::hud_coverage::Pipeline;
 
 /// GUI text's vertex format (`POSITION_TEX_COLOR`) from the HUD's vertices. A glyph is two
 /// triangles here, its corners top left, top right, bottom right, top left, bottom right, bottom
@@ -30,7 +31,7 @@ const GLUE: Glue = Glue {
 };
 
 /// The packs' text shader, when a pack replaces either stage.
-pub(super) fn load(root: &Path, defaults: &Path) -> Option<Arc<CoreProgram>> {
+pub(super) fn load(root: &ResourceSource, defaults: &ResourceSource) -> Option<Arc<CoreProgram>> {
     load_core(root, defaults, "text", &["IS_GUI"], &GLUE)
 }
 
@@ -38,16 +39,13 @@ pub(super) fn load(root: &Path, defaults: &Path) -> Option<Arc<CoreProgram>> {
 /// game's own resources, which have vanilla's and its includes), when a pack replaces either
 /// stage.
 pub(super) fn load_core(
-    root: &Path,
-    defaults: &Path,
+    root: &ResourceSource,
+    defaults: &ResourceSource,
     name: &str,
     defines: &[&str],
     glue: &Glue,
 ) -> Option<Arc<CoreProgram>> {
-    if root == defaults {
-        return None;
-    }
-    let read = |base: &Path, path: &str| std::fs::read_to_string(base.join(path)).ok();
+    let read = |base: &ResourceSource, path: &str| base.read_to_string(path).ok();
     let own =
         |path: &str| read(root, path).filter(|text| read(defaults, path).as_ref() != Some(text));
     let vertex_path = format!("assets/minecraft/shaders/core/{name}.vsh");
@@ -63,7 +61,7 @@ pub(super) fn load_core(
         let path = format!("assets/{namespace}/{path}");
         read(root, &path).or_else(|| read(defaults, &path))
     };
-    match horizon_shaders::translate_core(&vertex, &fragment, defines, &include, glue) {
+    match crate::core_shader::translate_core(&vertex, &fragment, defines, &include, glue) {
         Ok(program) => {
             log::info!("the resource pack's {name} shader is used");
             Some(Arc::new(program))
@@ -75,13 +73,38 @@ pub(super) fn load_core(
     }
 }
 
+/// The packs' core shaders the atlas carries (text, block outline, sky, stars).
+pub(super) fn load_shaders(
+    atlas: &mut super::HudAtlas,
+    root: &ResourceSource,
+    defaults: &ResourceSource,
+) {
+    atlas.text_shaders.gui = load(root, defaults);
+    atlas.lines_shader = load_core(
+        root,
+        defaults,
+        "rendertype_lines",
+        &[],
+        &crate::gfx::core_lines::GLUE,
+    );
+    let sky = |name| load_core(root, defaults, name, &[], &crate::gfx::core_sky::GLUE);
+    atlas.sky_shader = sky("sky");
+    atlas.stars_shader = sky("stars");
+    let world = |defines: &[&str], glue| load_core(root, defaults, "text", defines, glue);
+    atlas.text_shaders.world = world(&[], &crate::gfx::core_text::WORLD_GLUE);
+    atlas.text_shaders.see_through = world(
+        &["IS_SEE_THROUGH"],
+        &crate::gfx::core_text::SEE_THROUGH_GLUE,
+    );
+}
+
 /// Each uniform block's offset in the one buffer (`core_shader::BLOCKS` order).
 const BLOCK_OFFSETS: [u64; 4] = [0, 256, 512, 768];
 const BLOCK_SIZES: [u64; 4] = [48, 64, 160, 48];
 
 /// The pipeline and its resources.
 pub(super) struct PackText {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: Pipeline,
     group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
 }
@@ -92,6 +115,7 @@ impl PackText {
         format: wgpu::TextureFormat,
         atlas: &wgpu::TextureView,
         program: &CoreProgram,
+        coverage: bool,
     ) -> Option<Self> {
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = |label, module: &naga::Module| {
@@ -115,7 +139,7 @@ impl PackText {
                 count: None,
             })
             .collect();
-        for (_, binding) in horizon_shaders::SAMPLERS {
+        for (_, binding) in crate::core_shader::SAMPLERS {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility,
@@ -158,7 +182,7 @@ impl PackText {
                 }),
             })
             .collect();
-        for (_, binding) in horizon_shaders::SAMPLERS {
+        for (_, binding) in crate::core_shader::SAMPLERS {
             resources.push(wgpu::BindGroupEntry {
                 binding,
                 resource: wgpu::BindingResource::TextureView(atlas),
@@ -179,7 +203,7 @@ impl PackText {
             ..Default::default()
         });
         let attributes = wgpu::vertex_attr_array![0=>Float32x2,1=>Float32x2,2=>Unorm8x4];
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let desc = wgpu::RenderPipelineDescriptor {
             label: Some("Resource pack text"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -208,11 +232,17 @@ impl PackText {
             }),
             multiview_mask: None,
             cache: None,
-        });
+        };
+        let source = wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(program.fragment.clone()));
+        let pipeline = Pipeline::new(device, &desc, source, coverage);
         if let Some(e) = pollster::block_on(scope.pop()) {
             log::warn!("the resource pack's text shader is not used: {e}");
             return None;
         }
+        let Some(pipeline) = pipeline else {
+            log::warn!("the resource pack's text shader is not used: it has no colour output");
+            return None;
+        };
         Some(Self {
             pipeline,
             group,
@@ -234,8 +264,13 @@ impl PackText {
 
     /// Draw `range` (whole glyph quads) with the pack's shader; the caller sets its own
     /// pipeline and bind group again after.
-    pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>, range: std::ops::Range<u32>) {
-        pass.set_pipeline(&self.pipeline);
+    pub(super) fn draw(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        range: std::ops::Range<u32>,
+        coverage: bool,
+    ) {
+        pass.set_pipeline(self.pipeline.get(coverage));
         pass.set_bind_group(0, &self.group, &[]);
         pass.draw(range.clone(), range.start..range.start + 1);
     }
@@ -298,7 +333,7 @@ mod tests {
 
     #[test]
     fn the_gui_projection_maps_gui_pixels_to_the_screen() {
-        let mut batch = HudBatch::new([1920, 1080]);
+        let mut batch = HudBatch::scratch([1920, 1080]);
         batch.scale = 4.0;
         let data: Vec<f32> =
             bytemuck::cast_slice(&uniforms(&batch, [1920, 1080], batch.scale)).to_vec();

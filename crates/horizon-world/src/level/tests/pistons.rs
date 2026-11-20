@@ -1,0 +1,707 @@
+use super::*;
+
+#[test]
+fn pistons_pop_fragile_blocks_and_refuse_obsidian() {
+    let mut w = world!();
+    w.floor(0, 10, "stone");
+    let piston = w.id("piston", &[("facing", "east")]);
+    let block = w.id("redstone_block", &[]);
+    let torch = w.id("torch", &[]);
+    let obsidian = w.id("obsidian", &[]);
+    w.set(BlockPos::new(0, 1, 0), piston);
+    w.set(BlockPos::new(1, 1, 0), torch);
+    w.set(BlockPos::new(-1, 1, 0), block);
+    for _ in 0..4 {
+        w.full_tick();
+    }
+    assert_eq!(
+        w.name(BlockPos::new(1, 1, 0)),
+        "piston_head[facing=east,short=false,type=normal]"
+    );
+    assert!(
+        w.level
+            .events
+            .iter()
+            .any(|e| matches!(e, LevelEvent::DropResources { state, .. } if *state == torch))
+    );
+    let mut w = world!();
+    w.floor(0, 10, "stone");
+    w.set(BlockPos::new(0, 1, 0), piston);
+    w.set(BlockPos::new(1, 1, 0), obsidian);
+    w.set(BlockPos::new(-1, 1, 0), block);
+    for _ in 0..4 {
+        w.full_tick();
+    }
+    assert_eq!(w.prop(BlockPos::new(0, 1, 0), "extended"), "false");
+    assert_eq!(w.get(BlockPos::new(1, 1, 0)), obsidian);
+}
+
+/// `MovingPistonBlock.getDrops`: a broken moving piston drops the block it is
+/// moving, and drops nothing at all once its moving-piston block entity is
+/// gone.
+#[test]
+fn a_broken_moving_piston_drops_the_block_it_carries() {
+    let mut w = world!();
+    let moving = w.id("moving_piston", &[("facing", "east"), ("type", "normal")]);
+    let sand = w.id("sand", &[]);
+    let carried = BlockPos::new(0, 1, 0);
+    let orphan = BlockPos::new(5, 1, 5);
+    for pos in [carried, orphan] {
+        w.put(pos, moving);
+    }
+    w.ticks.moving_pistons.push((
+        carried,
+        MovingPiston {
+            moved_state: sand,
+            direction: Direction::East,
+            extending: true,
+            source: false,
+            progress: 0.5,
+            progress_o: 0.4,
+            last_ticked: 0,
+            death_ticks: 0,
+            id: 0,
+        },
+    ));
+    w.level.events.clear();
+    for pos in [carried, orphan] {
+        w.b().destroy_block(&mut w.level, &mut w.ticks, pos, true);
+    }
+    let drops: Vec<(BlockPos, BlockStateId)> = w
+        .level
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            LevelEvent::DropResources { pos, state } => Some((*pos, *state)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        drops,
+        vec![(carried, sand)],
+        "the moving piston drops the sand it carries; without its block entity there is nothing to drop"
+    );
+}
+
+/// `MovingPistonBlock.useWithoutItem`: a moving piston with no block entity (its
+/// move is not in flight) is removed by the click, and one that is still moving
+/// keeps its block and passes the click on.
+#[test]
+fn a_moving_piston_without_a_block_entity_is_removed_by_a_click() {
+    let mut w = world!();
+    let moving = w.id("moving_piston", &[("facing", "east"), ("type", "normal")]);
+    let orphan = BlockPos::new(0, 1, 0);
+    let in_flight = BlockPos::new(4, 1, 4);
+    let air = w.id("air", &[]);
+    for pos in [orphan, in_flight] {
+        w.put(pos, moving);
+    }
+    w.ticks.moving_pistons.push((
+        in_flight,
+        MovingPiston {
+            moved_state: w.id("sand", &[]),
+            direction: Direction::East,
+            extending: true,
+            source: false,
+            progress: 0.5,
+            progress_o: 0.4,
+            last_ticked: 0,
+            death_ticks: 0,
+            id: 0,
+        },
+    ));
+    assert_eq!(w.use_block(orphan), InteractionResult::Consume);
+    assert_eq!(w.get(orphan), air, "the orphan moving piston is removed");
+    assert_eq!(w.use_block(in_flight), InteractionResult::Pass);
+    assert_eq!(
+        w.get(in_flight),
+        moving,
+        "a moving piston in flight keeps its block"
+    );
+}
+
+/// `MovingPistonBlock.destroy`: a moving piston a player breaks takes the
+/// extended piston base behind it with it; an unextended base stays.
+#[test]
+fn breaking_a_moving_piston_removes_its_extended_base() {
+    let mut w = world!();
+    let moving = w.id("moving_piston", &[("facing", "east"), ("type", "normal")]);
+    let extended = w.id("piston", &[("facing", "east"), ("extended", "true")]);
+    let retracted = w.id("piston", &[("facing", "east"), ("extended", "false")]);
+    let air = w.id("air", &[]);
+    // The head at (1, 1, 0) faces east, so its base is at (0, 1, 0).
+    w.put(BlockPos::new(0, 1, 0), extended);
+    w.put(BlockPos::new(1, 1, 0), moving);
+    w.f.behaviours.player_destroy_block(
+        &mut w.level,
+        &mut w.ticks,
+        BlockPos::new(1, 1, 0),
+        false,
+        true,
+        None,
+    );
+    assert_eq!(
+        w.get(BlockPos::new(0, 1, 0)),
+        air,
+        "the extended base goes with the moving piston"
+    );
+    w.put(BlockPos::new(5, 1, 0), retracted);
+    w.put(BlockPos::new(6, 1, 0), moving);
+    w.f.behaviours.player_destroy_block(
+        &mut w.level,
+        &mut w.ticks,
+        BlockPos::new(6, 1, 0),
+        false,
+        true,
+        None,
+    );
+    assert_eq!(
+        w.get(BlockPos::new(5, 1, 0)),
+        retracted,
+        "an unextended base is left alone"
+    );
+}
+
+/// `LevelChunk.setBlockState` over a moving piston only runs the block
+/// entity's `finalTick`: `MovingPistonBlock.destroy`, which removes the
+/// extended base, is `ServerPlayerGameMode.destroyBlock`'s alone. `/setblock`,
+/// `/fill` and `Level.destroyBlock` over the head leave a headless piston.
+#[test]
+fn replacing_a_moving_piston_leaves_its_extended_base() {
+    let mut w = world!();
+    let moving = w.id("moving_piston", &[("facing", "east"), ("type", "normal")]);
+    let extended = w.id("piston", &[("facing", "east"), ("extended", "true")]);
+    let air = w.id("air", &[]);
+    // /setblock ~ ~ ~ air on the head: the extended base stays.
+    w.put(BlockPos::new(0, 1, 0), extended);
+    w.put(BlockPos::new(1, 1, 0), moving);
+    w.set(BlockPos::new(1, 1, 0), air);
+    assert_eq!(w.get(BlockPos::new(1, 1, 0)), air);
+    assert_eq!(
+        w.get(BlockPos::new(0, 1, 0)),
+        extended,
+        "a setBlock over the head leaves a headless extended piston"
+    );
+    // Level.destroyBlock (explosions, decay) is not a player break either.
+    w.put(BlockPos::new(4, 1, 0), extended);
+    w.put(BlockPos::new(5, 1, 0), moving);
+    w.b()
+        .destroy_block(&mut w.level, &mut w.ticks, BlockPos::new(5, 1, 0), false);
+    assert_eq!(
+        w.get(BlockPos::new(4, 1, 0)),
+        extended,
+        "destroyBlock over the head leaves a headless extended piston"
+    );
+}
+
+#[test]
+fn replacing_moving_piston_skips_the_same_effects_with_or_without_flag() {
+    let mut w = world!();
+    let moving = w.id("moving_piston", &[("facing", "east"), ("type", "normal")]);
+    let extended = w.id("piston", &[("facing", "east"), ("extended", "true")]);
+    let stone = w.id("stone", &[]);
+    let air = w.id("air", &[]);
+    for (x, flags) in [
+        (0, 0),
+        (5, super::flags::UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS),
+    ] {
+        let base = BlockPos::new(x, 1, 0);
+        let pos = BlockPos::new(x + 1, 1, 0);
+        w.put(base, extended);
+        w.put(pos, moving);
+        w.ticks.moving_pistons.push((
+            pos,
+            MovingPiston {
+                moved_state: stone,
+                direction: Direction::East,
+                extending: true,
+                source: false,
+                progress: 0.5,
+                progress_o: 0.4,
+                last_ticked: 0,
+                death_ticks: 0,
+                id: 0,
+            },
+        ));
+        assert!(w.b().set_block(&mut w.level, &mut w.ticks, pos, air, flags));
+        assert_eq!(w.get(pos), air);
+        assert_eq!(
+            w.get(base),
+            extended,
+            "setBlock over the head keeps the extended base"
+        );
+        assert!(!w.ticks.moving_pistons.iter().any(|(p, _)| *p == pos));
+    }
+}
+
+fn settle(w: &mut World) {
+    for _ in 0..8 {
+        w.full_tick();
+    }
+}
+
+/// `PistonStructureResolver.addBlockLine` refuses once `toPush` would hold more
+/// than 12 blocks: a line of twelve moves, and a thirteenth makes the whole
+/// push fail (the piston stays retracted), not move twelve of them.
+#[test]
+fn a_piston_moves_twelve_blocks_and_refuses_a_thirteenth() {
+    for (count, moves) in [(11, true), (12, true), (13, false)] {
+        let mut w = world!();
+        let piston = w.id("piston", &[("facing", "east")]);
+        let dirt = w.id("dirt", &[]);
+        let air = w.b().air();
+        for x in 1..=count {
+            w.set(BlockPos::new(x, 5, 0), dirt);
+        }
+        w.set(BlockPos::new(0, 5, 0), piston);
+        w.set(BlockPos::new(-1, 5, 0), w.id("redstone_block", &[]));
+        settle(&mut w);
+        let origin = BlockPos::new(0, 5, 0);
+        assert_eq!(
+            w.prop(origin, "extended"),
+            if moves { "true" } else { "false" },
+            "{count} blocks in a line"
+        );
+        if moves {
+            assert!(
+                w.name(BlockPos::new(1, 5, 0)).starts_with("piston_head"),
+                "{count} blocks: the head stands where the first block was"
+            );
+            for x in 2..=count + 1 {
+                assert_eq!(
+                    w.get(BlockPos::new(x, 5, 0)),
+                    dirt,
+                    "{count} blocks: every one moved a block along, to x = {x}"
+                );
+            }
+            assert_eq!(w.get(BlockPos::new(count + 2, 5, 0)), air);
+        } else {
+            for x in 1..=count {
+                assert_eq!(
+                    w.get(BlockPos::new(x, 5, 0)),
+                    dirt,
+                    "{count} blocks: a refused push moves none of them"
+                );
+            }
+        }
+    }
+}
+
+/// `PistonStructureResolver.canStickToEachOther`: a slime block drags slime and
+/// a honey block drags honey, but slime and honey never stick to each other.
+/// Built in open air: a slime block on stone drags the floor too, which is
+/// vanilla's as well but would make the check about something else.
+#[test]
+fn slime_and_honey_each_drag_their_own_kind_and_never_each_other() {
+    // (the block the piston faces, the block at its side, is the side one dragged)
+    for (front, side, dragged) in [
+        ("slime_block", "slime_block", true),
+        ("honey_block", "honey_block", true),
+        ("slime_block", "honey_block", false),
+        ("honey_block", "slime_block", false),
+    ] {
+        let mut w = world!();
+        let (front_id, side_id) = (w.id(front, &[]), w.id(side, &[]));
+        let air = w.b().air();
+        let (ahead, beside) = (BlockPos::new(1, 5, 0), BlockPos::new(1, 5, 1));
+        w.set(ahead, front_id);
+        w.set(beside, side_id);
+        w.set(
+            BlockPos::new(0, 5, 0),
+            w.id("piston", &[("facing", "east")]),
+        );
+        w.set(BlockPos::new(-1, 5, 0), w.id("redstone_block", &[]));
+        settle(&mut w);
+        assert_eq!(
+            w.prop(BlockPos::new(0, 5, 0), "extended"),
+            "true",
+            "{front} ahead, {side} beside: the front block always moves"
+        );
+        assert_eq!(w.get(BlockPos::new(2, 5, 0)), front_id, "{front} moved");
+        let moved = w.get(BlockPos::new(2, 5, 1));
+        let stayed = w.get(beside);
+        if dragged {
+            assert_eq!(moved, side_id, "{front} ahead drags {side} beside it");
+            assert_eq!(stayed, air, "{front} ahead: {side} left its place");
+        } else {
+            assert_eq!(moved, air, "{front} ahead does not drag {side}");
+            assert_eq!(stayed, side_id, "{front} ahead: {side} stays where it was");
+        }
+    }
+}
+
+/// `PushReaction.PUSH` (glazed terracotta, the only block 26.3 gives it) moves
+/// only along the line it is pushed in: `isPushable` answers `direction ==
+/// connectionDirection`, so a slime block beside it cannot drag it sideways,
+/// where it drags an ordinary block.
+#[test]
+fn glazed_terracotta_is_pushed_in_line_but_never_dragged_sideways() {
+    let mut w = world!();
+    let slime = w.id("slime_block", &[]);
+    let dirt = w.id("dirt", &[]);
+    let terracotta = w.id("white_glazed_terracotta", &[("facing", "north")]);
+    let air = w.b().air();
+    // The slime block drags the dirt on one side and cannot drag the
+    // terracotta on the other.
+    w.set(BlockPos::new(1, 5, 0), slime);
+    w.set(BlockPos::new(1, 5, 1), dirt);
+    w.set(BlockPos::new(1, 5, -1), terracotta);
+    w.set(
+        BlockPos::new(0, 5, 0),
+        w.id("piston", &[("facing", "east")]),
+    );
+    w.set(BlockPos::new(-1, 5, 0), w.id("redstone_block", &[]));
+    settle(&mut w);
+    assert_eq!(w.prop(BlockPos::new(0, 5, 0), "extended"), "true");
+    assert_eq!(w.get(BlockPos::new(2, 5, 1)), dirt, "the dirt is dragged");
+    assert_eq!(
+        w.get(BlockPos::new(1, 5, -1)),
+        terracotta,
+        "the terracotta stays beside the slime block"
+    );
+    assert_eq!(w.get(BlockPos::new(2, 5, -1)), air);
+
+    // In line with the push it moves like any block.
+    let mut w = world!();
+    w.set(BlockPos::new(1, 5, 0), terracotta);
+    w.set(
+        BlockPos::new(0, 5, 0),
+        w.id("piston", &[("facing", "east")]),
+    );
+    w.set(BlockPos::new(-1, 5, 0), w.id("redstone_block", &[]));
+    settle(&mut w);
+    assert_eq!(w.prop(BlockPos::new(0, 5, 0), "extended"), "true");
+    assert_eq!(w.get(BlockPos::new(2, 5, 0)), terracotta, "pushed in line");
+}
+
+/// `PistonBaseBlock.isPushable`: a piston is pushable only while retracted. An
+/// extended one (`EXTENDED`) answers false, so a push that meets it fails and
+/// the pusher stays put; the same push moves a retracted piston.
+///
+/// The extended one is held extended by a power source of its own, beside it
+/// and out of the pusher's reach. Unpowered it would retract on the tick, and
+/// that retraction updates the pusher, which then pushes it: also vanilla, and
+/// not what is being checked.
+#[test]
+fn a_piston_pushes_a_retracted_piston_and_refuses_an_extended_one() {
+    for kind in ["piston", "sticky_piston"] {
+        for (extended, held_by_power, moves) in [("false", false, true), ("true", true, false)] {
+            let mut w = world!();
+            let target = w.id(kind, &[("facing", "north"), ("extended", extended)]);
+            // Written raw: an extended piston with no head would be removed by
+            // the updates `set` sends, and the check is about the resolver.
+            w.put(BlockPos::new(1, 5, 0), target);
+            if held_by_power {
+                // Beside the target, diagonal to the pusher: not a neighbour of it.
+                w.set(BlockPos::new(1, 5, 1), w.id("redstone_block", &[]));
+            }
+            w.set(
+                BlockPos::new(0, 5, 0),
+                w.id("piston", &[("facing", "east")]),
+            );
+            w.set(BlockPos::new(-1, 5, 0), w.id("redstone_block", &[]));
+            settle(&mut w);
+            assert_eq!(
+                w.prop(BlockPos::new(0, 5, 0), "extended"),
+                if moves { "true" } else { "false" },
+                "a {kind} with extended={extended} ahead"
+            );
+            if moves {
+                assert_eq!(w.get(BlockPos::new(2, 5, 0)), target, "{kind} pushed along");
+            } else {
+                assert_eq!(w.get(BlockPos::new(1, 5, 0)), target, "{kind} left alone");
+                assert_eq!(w.prop(BlockPos::new(1, 5, 0), "extended"), "true");
+            }
+        }
+    }
+}
+
+/// `PistonBaseBlock.isPushable` ends in `!state.hasBlockEntity()`: a block with a
+/// block entity is never pushed, whatever its push reaction, so the piston
+/// facing one does not extend at all.
+#[test]
+fn a_piston_refuses_blocks_that_have_a_block_entity() {
+    let blocks: [(&str, &[(&str, &str)]); 4] = [
+        ("chest", &[("facing", "north"), ("type", "single")]),
+        ("furnace", &[("facing", "north"), ("lit", "false")]),
+        ("barrel", &[("facing", "north"), ("open", "false")]),
+        ("hopper", &[("facing", "down"), ("enabled", "true")]),
+    ];
+    for (name, props) in blocks {
+        let mut w = world!();
+        let block = w.id(name, props);
+        w.set(BlockPos::new(1, 5, 0), block);
+        w.set(
+            BlockPos::new(0, 5, 0),
+            w.id("piston", &[("facing", "east")]),
+        );
+        w.set(BlockPos::new(-1, 5, 0), w.id("redstone_block", &[]));
+        settle(&mut w);
+        assert_eq!(
+            w.prop(BlockPos::new(0, 5, 0), "extended"),
+            "false",
+            "a {name} ahead"
+        );
+        assert_eq!(w.get(BlockPos::new(1, 5, 0)), block, "{name} stays");
+    }
+}
+
+/// `PistonBaseBlock.getNeighborSignal`: a piston is powered by its direct neighbours
+/// on every side but the one it pushes towards, and also (quasi-connectivity) by what
+/// powers the block above it: that block's neighbours in every direction but down, the
+/// pushing side and the block two above included.
+///
+/// A source that is not beside the piston sends it no block update, so it takes
+/// effect only when something beside the piston changes (BUD, the reason quasi-
+/// connectivity is a quirk and not a power source). Each case places the source and
+/// then pokes the piston with a block beside it, which powers nothing.
+#[test]
+fn a_piston_is_powered_by_its_neighbours_except_the_front_and_by_quasi_connectivity() {
+    // (where the redstone block stands relative to the piston, does it extend)
+    let sources: [((i32, i32, i32), bool, &str); 12] = [
+        ((0, 1, 0), true, "above"),
+        ((0, -1, 0), true, "below"),
+        ((-1, 0, 0), true, "behind"),
+        ((0, 0, 1), true, "beside"),
+        ((1, 0, 0), false, "in front: the pushing side is skipped"),
+        (
+            (1, 1, 0),
+            true,
+            "above the front: quasi-connected, the pushing side is not skipped there",
+        ),
+        ((-1, 1, 0), true, "above and behind: quasi-connected"),
+        ((0, 1, 1), true, "above and beside: quasi-connected"),
+        (
+            (0, 2, 0),
+            true,
+            "two above: the above block's own upward neighbour",
+        ),
+        (
+            (-1, -1, 0),
+            false,
+            "below and behind: quasi-connectivity is only upward",
+        ),
+        ((-1, 0, 1), false, "diagonal on its level: not adjacent"),
+        (
+            (1, 2, 0),
+            false,
+            "diagonal above the above block: not adjacent to it",
+        ),
+    ];
+    for ((dx, dy, dz), extends, what) in sources {
+        let mut w = world!();
+        let at = BlockPos::new(0, 5, 0);
+        w.set(at, w.id("piston", &[("facing", "east")]));
+        w.set(BlockPos::new(dx, 5 + dy, dz), w.id("redstone_block", &[]));
+        // The poke: stone beside the piston on the north side, no case's source.
+        w.set(BlockPos::new(0, 5, -1), w.id("stone", &[]));
+        settle(&mut w);
+        assert_eq!(
+            w.prop(at, "extended"),
+            if extends { "true" } else { "false" },
+            "a redstone block {what}"
+        );
+    }
+}
+
+/// `ServerLevel.tick` runs its block events inside `handlingTick`
+/// (ServerLevel.java:360 sets it, :409 runs `runBlockEvents`, :412 clears it),
+/// so `PistonBaseBlock.checkIfExtend`'s `isHandlingTick()`
+/// (PistonBaseBlock.java:108) answers true while an event runs. A piston that
+/// loses its signal inside that pass, with the block it pushed still past
+/// half-way out and not ticked at the current game time, therefore asks for
+/// event 2 (`TRIGGER_DROP`) where a neighbour change outside the pass asks for
+/// event 1 (`TRIGGER_CONTRACT`); `PistonBaseBlock.triggerEvent` (:192-201)
+/// takes a different path for the two.
+///
+/// The second piston stands in a chunk the level holds back, so its event is
+/// rescheduled instead of run and the queue can be read.
+#[test]
+fn a_piston_dropping_its_signal_inside_a_block_event_asks_for_event_two() {
+    struct Held<'a> {
+        inner: &'a mut TestLevel,
+        held: ChunkPos,
+    }
+    impl LevelAccess for Held<'_> {
+        fn block_state(&self, pos: BlockPos) -> BlockStateId {
+            self.inner.block_state(pos)
+        }
+        fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
+            self.inner.set_raw(pos, state)
+        }
+        fn is_loaded(&self, pos: BlockPos) -> bool {
+            self.inner.is_loaded(pos)
+        }
+        fn random(&mut self) -> &mut LegacyRandom {
+            self.inner.random()
+        }
+        fn game_time(&self) -> i64 {
+            self.inner.game_time()
+        }
+        fn should_tick_blocks_at(&self, chunk: ChunkPos) -> bool {
+            chunk != self.held
+        }
+    }
+    impl crate::level::BlockEntityNeighbors for Held<'_> {}
+    let mut w = world!();
+    let piston = w.id("piston", &[("facing", "east")]);
+    let redstone = w.id("redstone_block", &[]);
+    // The piston whose event runs: empty air in front, so its extension only
+    // notifies the neighbours of the arm it places.
+    let mover = BlockPos::new(0, 5, 15);
+    // Beside that arm and in the next chunk: extended, unpowered, and its
+    // pushed block still in flight two ahead.
+    let losing = BlockPos::new(1, 5, 16);
+    let flight = BlockPos::new(3, 5, 16);
+    w.put(
+        losing,
+        w.id("piston", &[("facing", "east"), ("extended", "true")]),
+    );
+    w.put(
+        BlockPos::new(2, 5, 16),
+        w.id(
+            "piston_head",
+            &[("facing", "east"), ("type", "normal"), ("short", "false")],
+        ),
+    );
+    w.put(
+        flight,
+        w.id("moving_piston", &[("facing", "east"), ("type", "normal")]),
+    );
+    w.ticks.moving_pistons.push((
+        flight,
+        MovingPiston {
+            moved_state: w.id("sand", &[]),
+            direction: Direction::East,
+            extending: true,
+            source: false,
+            progress: 0.5,
+            progress_o: 0.5,
+            last_ticked: 0,
+            death_ticks: 0,
+            id: 0,
+        },
+    ));
+    // Ticked in an earlier game time: only `isHandlingTick` can still answer
+    // for the pass about to run.
+    w.level.time = 40;
+    w.set(mover, piston);
+    w.set(BlockPos::new(-1, 5, 15), redstone);
+    let queued: Vec<i32> = w.ticks.block_events.iter().map(|e| e.param_a).collect();
+    assert_eq!(queued, [0], "the powered piston queues its extension");
+    let b = w.b();
+    let mut held = Held {
+        inner: &mut w.level,
+        held: losing.chunk(),
+    };
+    // The level tick's block phases: the scheduled ticks and the block events
+    // inside `handlingTick` (ServerLevel.java:360-412).
+    b.tick_level_blocks(&mut held, &mut w.ticks);
+    let events: Vec<(BlockPos, i32)> = w
+        .ticks
+        .block_events
+        .iter()
+        .map(|e| (e.pos, e.param_a))
+        .collect();
+    assert_eq!(
+        events,
+        [(losing, 2)],
+        "the signal that goes during a block event asks for event 2, as vanilla's isHandlingTick makes it"
+    );
+}
+
+/// The other side of the same span: `ServerLevel.tick` clears `handlingTick`
+/// at :412 and ticks its block entities at :455, below it. A moving piston
+/// that finishes there places its block and notifies its neighbours outside
+/// `handlingTick`, so the piston beside it that loses its signal with a pushed
+/// block still in flight asks for event 1 (`TRIGGER_CONTRACT`) — event 2 is
+/// what the same neighbour change asks for inside the tick's block phases
+/// (see `a_piston_dropping_its_signal_inside_a_block_event_asks_for_event_two`).
+///
+/// The moving piston that notifies it ticks first (`Ticks::moving_pistons` is
+/// in tick order), so the pushed block it looks at has not been ticked at the
+/// current game time: only `isHandlingTick` can still answer.
+#[test]
+fn a_piston_dropping_its_signal_in_the_block_entity_pass_asks_for_event_one() {
+    let mut w = world!();
+    // The block entity: a moving piston a full step out, so its tick places the
+    // stone it carries beside the piston below.
+    let finishing = BlockPos::new(1, 5, 15);
+    w.put(
+        finishing,
+        w.id("moving_piston", &[("facing", "east"), ("type", "normal")]),
+    );
+    w.ticks.moving_pistons.push((
+        finishing,
+        MovingPiston {
+            moved_state: w.id("stone", &[]),
+            direction: Direction::East,
+            extending: true,
+            source: false,
+            progress: 1.0,
+            progress_o: 1.0,
+            last_ticked: 0,
+            death_ticks: 0,
+            id: 0,
+        },
+    ));
+    // Beside it: extended, unpowered, its pushed block still in flight two
+    // ahead, and ticked after the moving piston above.
+    let losing = BlockPos::new(1, 5, 16);
+    let flight = BlockPos::new(3, 5, 16);
+    w.put(
+        losing,
+        w.id("piston", &[("facing", "east"), ("extended", "true")]),
+    );
+    w.put(
+        BlockPos::new(2, 5, 16),
+        w.id(
+            "piston_head",
+            &[("facing", "east"), ("type", "normal"), ("short", "false")],
+        ),
+    );
+    w.put(
+        flight,
+        w.id("moving_piston", &[("facing", "east"), ("type", "normal")]),
+    );
+    w.ticks.moving_pistons.push((
+        flight,
+        MovingPiston {
+            moved_state: w.id("sand", &[]),
+            direction: Direction::East,
+            extending: true,
+            source: false,
+            progress: 0.5,
+            progress_o: 0.5,
+            last_ticked: 0,
+            death_ticks: 0,
+            id: 1,
+        },
+    ));
+    w.level.time = 40;
+    assert_eq!(w.ticks.block_events.len(), 0, "nothing queued yet");
+    let b = w.b();
+    // The level tick's block phases, which open and close `handlingTick` with
+    // nothing due here (ServerLevel.java:360-412): they leave the world as it
+    // was, so the pass below starts outside the span.
+    b.tick_level_blocks(&mut w.level, &mut w.ticks);
+    // `Level.tickBlockEntities`, below the tick's `handlingTick`
+    // (ServerLevel.java:412, :455).
+    b.tick_block_entities(&mut w.level, &mut w.ticks);
+    assert_eq!(
+        w.name(finishing),
+        "stone[]",
+        "the moving piston finished where it stood"
+    );
+    let events: Vec<(BlockPos, i32)> = w
+        .ticks
+        .block_events
+        .iter()
+        .map(|e| (e.pos, e.param_a))
+        .collect();
+    assert_eq!(
+        events,
+        [(losing, 1)],
+        "a block entity ticks below handlingTick, so its neighbour change asks for event 1"
+    );
+}

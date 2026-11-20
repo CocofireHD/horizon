@@ -4,10 +4,7 @@ use horizon_client::{
     Result,
     mobs::{Anim, Brain, Flags, Mob, MobEvent, MobType, Part, Species, zombie_villager},
 };
-use horizon_core::{
-    geometry::Vec3,
-    random::{LegacyRandom, RandomSource},
-};
+use horizon_core::{geometry::Vec3, random::RandomSource};
 use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, Write},
@@ -16,6 +13,7 @@ use std::{
 
 fn kind(eye_height: f64) -> Arc<MobType> {
     Arc::new(MobType {
+        shadow: None,
         id: "minecraft:zombie_villager".into(),
         species: Species::ZombieVillager,
         width: 0.6,
@@ -35,6 +33,7 @@ fn kind(eye_height: f64) -> Arc<MobType> {
         jump_strength: 0.42,
         attributes: Arc::default(),
         item_stack_limits: Arc::default(),
+        attribute_bounds: Default::default(),
         gravity: 0.08,
         safe_fall_distance: 3.0,
         fall_damage_multiplier: 1.0,
@@ -58,9 +57,10 @@ fn kind(eye_height: f64) -> Arc<MobType> {
         brain: Brain::Passive,
         anim: Anim::Zombie,
         sounds: [""; 3],
-        step_sound: None,
+        sound_overrides: Default::default(),
         food: Arc::default(),
         tempt: Arc::default(),
+        passenger_attachments: Vec::new(),
     })
 }
 
@@ -76,7 +76,7 @@ pub fn main() -> Result<()> {
             Vec3::new(p[2].parse()?, p[3].parse()?, p[4].parse()?),
             0.0,
         );
-        m.random = LegacyRandom::new(p[0].parse()?);
+        m.random.set_seed(p[0].parse()?);
         m.silent = p[1] == "1";
         if let Some(MobEvent::Sound(name, at, volume, pitch)) = zombie_villager::cure_sound(&mut m)
         {

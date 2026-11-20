@@ -10,8 +10,8 @@ and MultiPackResourceManager and asks what each reload listener reads: which
 pack a file comes from, translations (ClientLanguage), sound events
 (SoundManager.prepare), font providers (FontManager) and atlas sources
 (SpriteSourceList). examples/probe/pack_resources_fixture builds Horizon's resource
-root for the same selection (packs::build_overlay) and reads it with Horizon's
-loaders. Every answer must agree.
+view for the same selection (packs::resources) and reads it without extracting
+archive entries. Every answer must agree.
 """
 import json
 import shutil
@@ -117,11 +117,11 @@ def main():
     for index, selection in enumerate(SELECTIONS):
         # One run per selection: the input's first line names the packs, bottom first.
         def make(build, selection=selection):
-            folder = build / "resourcepacks"
+            folder = build / "resource packs"
             packs(folder)
             vanilla = lab.RESOURCES
             path = build / "inputs.txt"
-            path.write_text(f"root {vanilla} {folder} {' '.join(selection)}".rstrip() + "\n"
+            path.write_text(json.dumps(["root", str(vanilla), str(folder), *selection]) + "\n"
                             + "".join(q + "\n" for q in QUERIES))
             return path, len(QUERIES)
         harness.differential(f"resource-pack-parity-{index}", "VanillaPackResourcesOracle",

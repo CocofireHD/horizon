@@ -8,11 +8,11 @@
 #
 # The token is made on a machine whose gh has admin on the repository, never printed or stored here:
 #   gh api -X POST repos/horizon-rust/horizon/actions/runners/registration-token --jq .token |
-#     ssh ludovic@playhorizon 'bash ~/horizon-install/checks-runners.sh install'
+#     ssh ludovic@playhorizon 'bash ~/horizon-install/checks-runners.sh install'   # git-slim.sh beside it
 #
 # Two kinds of runner, each a systemd user service in ~/.actions-runners/<name>:
 # - horizon-ci-<n> (label playhorizon-ci, CI_RUNNERS of them, default 2): this repository's own verify and launcher
-#   jobs (no workflow routes them here since 2026-11-03: the desktop's horizon-checks runners take them). Each has
+#   jobs (no workflow routes them here since 2026-11-03: the horizon-checks runners take them). Each has
 #   its own work folder, rustup home and cargo target folder (outside the checkout, so the checkout's clean leaves it),
 #   and they share one cargo home (registry and git sources).
 # - horizon-light-<n> (labels playhorizon-light and horizon-light, LIGHT_RUNNERS, default 12): the bots that run main's
@@ -21,7 +21,7 @@
 #   the workflows ask for.
 # All of them run nice, pinned to CPUs 4-7 inside horizon-ci.slice (linux-runner.sh: CPU quota and memory cap for
 # all CI on the machine), so CPUs 0-3 stay for tools/remote.sh runs, benchmarks and the servers.
-# Before every job, ci-shared/job-started.sh fails a job from a fork's pull request (whatever its workflow file says),
+# Before every job, ci-shared/job-started.sh fails a job from a fork's pull request on a light runner (whatever its workflow file says),
 # empties a cargo target folder grown past MAX_TARGET_GB and drops a checkout's .git grown past MAX_GIT_GB (every
 # fetch adds a pack and nothing repacks them: 6822 packs, 50 GB, in each light runner's checkout on 2026-11-03).
 set -euo pipefail
@@ -50,16 +50,26 @@ shared_files() {
   cat > "$shared/job-started.sh" <<'EOF'
 #!/usr/bin/env bash
 # ACTIONS_RUNNER_HOOK_JOB_STARTED of the checks runners (tools/ci/checks-runners.sh): runs before each job's steps;
-# a failure fails the job. A fork's pull request runs its own copy of the workflows, so its runs-on can name these
-# runners whatever ci.yml says: such a job stops here, before any of its code is on disk.
+# a failure fails the job. A fork's pull request runs its own copy of the workflows, so its runs-on can name any
+# runner whatever ci.yml says: on a runner whose .env lacks HORIZON_RUNNER_POOL=checks (the light runners) such a job
+# stops here, before any of its code is on disk. The checks runners take a fork's pull request (approved by a
+# maintainer first, isolated user, no secret).
 set -euo pipefail
 case ${GITHUB_EVENT_NAME:-} in
-  pull_request|pull_request_review|pull_request_review_comment|merge_group)
+  pull_request|pull_request_review|pull_request_review_comment)
     head=$(jq -r '.pull_request.head.repo.full_name // "unknown"' "${GITHUB_EVENT_PATH:-/dev/null}" 2>/dev/null || echo unknown)
-    if [ "$head" != "${GITHUB_REPOSITORY:-}" ]; then
-      echo "::error::A pull request from $head never runs on a self-hosted runner: use runs-on ubuntu-latest for forks"
+    if [ "$head" != "${GITHUB_REPOSITORY:-}" ] && [ "${HORIZON_RUNNER_POOL:-}" != checks ]; then
+      echo "::error::A pull request from $head never runs on this self-hosted runner: use runs-on ubuntu-latest for forks"
       exit 1
     fi;;
+  merge_group)
+    # The queue's own branch in this repository: main plus what a maintainer reviewed and queued (its workflow files
+    # included), merged by GitHub; a fork's pull request reaches it only through that review.
+    ref=$(jq -r '.merge_group.head_ref // ""' "${GITHUB_EVENT_PATH:-/dev/null}" 2>/dev/null || true)
+    case $ref in
+      refs/heads/gh-readonly-queue/main/*) ;;
+      *) echo "::error::A merge_group run for $ref is not main's merge queue"; exit 1;;
+    esac;;
 esac
 if [ -n "${CARGO_TARGET_DIR:-}" ] && [ -d "$CARGO_TARGET_DIR" ]; then
   size=$(du -s --block-size=1G "$CARGO_TARGET_DIR" | cut -f1)
@@ -68,12 +78,14 @@ if [ -n "${CARGO_TARGET_DIR:-}" ] && [ -d "$CARGO_TARGET_DIR" ]; then
     rm -rf "${CARGO_TARGET_DIR:?}"
   fi
 fi
-# The checkout's history: actions/checkout fetches into the same .git every job and never repacks. Without .git it
-# clones again (and replaces the rest of the folder).
+# The checkout's history: actions/checkout fetches into the same .git every job and never repacks. git-slim.sh (beside
+# this hook) collects it past 1.5 GB (a healthy one is ~0.5 GB) and folds many packs; one that is still over MAX_GIT_GB
+# is removed: the checkout then clones again (and replaces the rest of the folder).
 if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -d "$GITHUB_WORKSPACE/.git" ]; then
+  MAX_GIT_MB=${MAX_GIT_MB:-1536} bash "$(dirname "$0")/git-slim.sh" "$GITHUB_WORKSPACE" || true
   size=$(du -s --block-size=1G "$GITHUB_WORKSPACE/.git" | cut -f1)
-  if [ "$size" -gt "${MAX_GIT_GB:-2}" ]; then
-    echo "Checkout's .git at ${size} GB (over ${MAX_GIT_GB:-2}): removed, this job clones again"
+  if [ "$size" -gt "${MAX_GIT_GB:-4}" ]; then
+    echo "Checkout's .git at ${size} GB (over ${MAX_GIT_GB:-4}): removed, this job clones again"
     rm -rf "${GITHUB_WORKSPACE:?}/.git"
   fi
 fi
@@ -121,6 +133,7 @@ install() {
   [ -f "$units/horizon-ci.slice" ] || { echo "No horizon-ci.slice: install tools/ci/linux-runner.sh first"; exit 1; }
   shared_files
   cp "$0" "$shared/checks-runners.sh"
+  cp "$(dirname "$0")/git-slim.sh" "$shared/git-slim.sh"
   # The checks' share of the CI slice's memory: a build that runs out stops there, not the parity runner's jobs.
   cat > "$units/horizon-ci-checks.slice" <<EOF
 [Unit]
@@ -141,12 +154,11 @@ EOF
       echo "LANG=C.UTF-8"
       echo "HOME=$dir/home"
       echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=$shared/job-started.sh"
-      echo "HORIZON_TELEMETRY_URL=off"
       echo "HORIZON_NO_AUDIO=1"
-      echo "HORIZON_NO_HEARTBEAT=1"
       echo "HORIZON_LAUNCHER_NO_SELF_UPDATE=1"
       echo "GH_PROMPT_DISABLED=1"
       if [ "$label" = playhorizon-ci ]; then
+        echo "HORIZON_RUNNER_POOL=checks"
         rust "$dir"
         echo "RUSTUP_HOME=$dir/rustup"
         echo "CARGO_HOME=$shared/cargo"
@@ -184,7 +196,7 @@ EOF
     local unit=horizon-runner-${name#horizon-}.service
     systemctl --user enable "$unit" > /dev/null 2>&1
     # The runner reads .env when it starts: restart only an idle one (a restart cancels its job).
-    if pgrep -f "$base/$name/bin/Runner.Worker" > /dev/null; then echo "$name in a job: restart $unit after it"
+    if pgrep -f "$base/$name/bin[^/]*/Runner.Worker" > /dev/null; then echo "$name in a job: restart $unit after it"
     else systemctl --user restart "$unit"; fi
   done < <(runners)
   status
@@ -196,7 +208,7 @@ status() {
   for dir in "$base"/horizon-ci-* "$base"/horizon-light-*; do
     [ -d "$dir" ] || continue
     printf '%-16s %s, target %s\n' "$(basename "$dir")" \
-      "$(pgrep -f "$dir/bin/Runner.Worker" > /dev/null && echo busy || echo idle)" \
+      "$(pgrep -f "$dir/bin[^/]*/Runner.Worker" > /dev/null && echo busy || echo idle)" \
       "$(du -sh "$dir/target" 2>/dev/null | cut -f1 || echo -)"
   done
 }

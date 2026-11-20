@@ -3,26 +3,30 @@
 //! level's terrain and portals) through `horizon_world::level::portal_travel`
 //! and prints the same result text.
 use horizon_core::{
-    geometry::{Axis, Vec3},
+    geometry::{Axis, Direction, Vec3},
     position::BlockPos,
     random::LegacyRandom,
-};
-use horizon_world::{
-    level::{
-        Behaviours, Dimension, LevelAccess, Ticks,
-        data::load_registry,
-        portal_travel::{
-            BorderBounds, closest_portal, collision_free_position, exit_position,
-            largest_rectangle_around, relative_position,
-        },
-    },
-    registry::BlockStateId,
 };
 use serde_json::Value;
 use std::{
     collections::HashMap,
     io::{BufRead, Write},
     path::Path,
+};
+use {
+    horizon_core::dimension::Dimension,
+    horizon_world::{
+        level::{
+            Behaviours, LevelAccess, Ticks,
+            data::load_registry,
+            portal::PortalShape,
+            portal_travel::{
+                BorderBounds, closest_portal, collision_free_position, exit_position,
+                largest_rectangle_around, relative_position,
+            },
+        },
+        registry::BlockStateId,
+    },
 };
 
 struct Cells {
@@ -31,6 +35,7 @@ struct Cells {
     random: LegacyRandom,
     nether: bool,
 }
+impl horizon_world::level::BlockEntityNeighbors for Cells {}
 impl LevelAccess for Cells {
     fn block_state(&self, pos: BlockPos) -> BlockStateId {
         self.cells.get(&pos).copied().unwrap_or(self.air)
@@ -246,6 +251,66 @@ fn run(case: &Value, b: &Behaviours, air: BlockStateId, out: &mut Vec<String>) {
     ));
 }
 
+fn direction_name(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Down => "down",
+        Direction::Up => "up",
+        Direction::North => "north",
+        Direction::South => "south",
+        Direction::West => "west",
+        Direction::East => "east",
+    }
+}
+
+fn shape_line(shape: &PortalShape) -> String {
+    format!(
+        "axis={} right={} bottom={},{},{} size={}x{} blocks={} valid={} complete={}",
+        if shape.x_axis { "x" } else { "z" },
+        direction_name(shape.right),
+        shape.bottom_left.x,
+        shape.bottom_left.y,
+        shape.bottom_left.z,
+        shape.width,
+        shape.height,
+        shape.portal_blocks,
+        shape.is_valid(),
+        shape.is_complete()
+    )
+}
+
+fn run_shape(case: &Value, b: &Behaviours, air: BlockStateId, out: &mut Vec<String>) {
+    let mut source = level(case, "source", air, false);
+    let mut ticks = Ticks::new(0);
+    let probe = &case["probe"];
+    let at = pos(&probe["pos"]);
+    let x_axis = probe["axis"] == "x";
+    out.push(format!(
+        "shape {}",
+        shape_line(&b.portal_shape(&mut source, &mut ticks, at, x_axis))
+    ));
+    let before = source.cells.clone();
+    match b.empty_portal_shape(&mut source, &mut ticks, at, x_axis) {
+        None => out.push("empty none".into()),
+        Some(shape) => {
+            out.push(format!("empty {}", shape_line(&shape)));
+            b.create_portal_blocks(&mut source, &mut ticks, &shape);
+            let mut changed: Vec<BlockPos> = before
+                .keys()
+                .copied()
+                .chain(source.cells.keys().copied())
+                .collect();
+            changed.sort_by_key(|p| (p.x, p.y, p.z));
+            changed.dedup();
+            for p in changed {
+                let now = source.block_state(p);
+                if before.get(&p).copied().unwrap_or(air) != now {
+                    out.push(format!("set {},{},{} {}", p.x, p.y, p.z, now.0));
+                }
+            }
+        }
+    }
+}
+
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = crate::args().skip(1);
     let resources = args.next().expect("resource directory");
@@ -262,7 +327,11 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let case: Value = serde_json::from_str(&line?)?;
         let mut lines = Vec::new();
-        run(&case, &behaviours, air, &mut lines);
+        if case["kind"] == "shape" {
+            run_shape(&case, &behaviours, air, &mut lines);
+        } else {
+            run(&case, &behaviours, air, &mut lines);
+        }
         writeln!(out, "case {index}")?;
         for l in lines {
             writeln!(out, "{l}")?;

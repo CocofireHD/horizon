@@ -8,7 +8,7 @@
 //! would otherwise fail here while the launcher's own downloads worked.
 //!
 //! Which hosts those are is decided here and nowhere else. The launcher asks `direct`, `env_for`,
-//! `host_of`, `scheme_of`, `socks` and `parse` for its own traffic, and keeps its agents here too
+//! `host_of`, `scheme_of` and `parse` for its own traffic, and keeps its agents here too
 //! (`keep`), so the two agree whatever the player set — and there is one copy of the rules to
 //! change when they need it.
 use std::collections::HashMap;
@@ -58,6 +58,140 @@ pub fn agent(url: &str) -> ureq::Agent {
     })
 }
 
+/// GET from allowed HTTPS hosts, validating every redirect before contacting it.
+pub(crate) fn get_from_hosts(url: &str, hosts: &[&str]) -> Result<Option<ureq::Response>, String> {
+    follow(url, hosts, |address| {
+        let agent = keep(
+            "port-pack-no-redirect",
+            spec_for(address).as_deref(),
+            |proxy| {
+                let builder = ureq::AgentBuilder::new().redirects(0);
+                match proxy {
+                    Some(proxy) => builder.proxy(proxy).build(),
+                    None => builder.build(),
+                }
+            },
+        );
+        match agent
+            .get(address)
+            .set("User-Agent", crate::modrinth::AGENT)
+            .call()
+        {
+            Ok(response) => Ok(Some(response)),
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(error) => Err(format!("{address}: {error}")),
+        }
+    })
+}
+
+fn follow(
+    url: &str,
+    hosts: &[&str],
+    mut request: impl FnMut(&str) -> Result<Option<ureq::Response>, String>,
+) -> Result<Option<ureq::Response>, String> {
+    let mut current = checked_url(url, hosts)?;
+    for _ in 0..=5 {
+        let Some(response) = request(current.as_str())? else {
+            return Ok(None);
+        };
+        if !(300..400).contains(&response.status()) {
+            return Ok(Some(response));
+        }
+        let location = response
+            .header("Location")
+            .ok_or("Redirect without Location")?;
+        current = checked_url(
+            current.join(location).map_err(|e| e.to_string())?.as_str(),
+            hosts,
+        )?;
+    }
+    Err("Too many redirects".into())
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    #[test]
+    fn checks_each_redirect_before_requesting_it() {
+        let mut seen = Vec::new();
+        let result = follow("https://cdn.modrinth.com/a", &["cdn.modrinth.com"], |url| {
+            seen.push(url.to_owned());
+            let raw = if seen.len() == 1 {
+                "HTTP/1.1 302 Found\r\nLocation: /b\r\n\r\n"
+            } else {
+                "HTTP/1.1 302 Found\r\nLocation: https://evil.example/steal\r\n\r\n"
+            };
+            Ok(Some(raw.parse().unwrap()))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            seen,
+            ["https://cdn.modrinth.com/a", "https://cdn.modrinth.com/b"]
+        );
+        let mut seen = Vec::new();
+        let result = follow("https://github.com/a", &["github.com", "release-assets.githubusercontent.com"], |url| {
+            seen.push(url.to_owned());
+            let raw = if seen.len() == 1 {
+                "HTTP/1.1 302 Found\r\nLocation: https://release-assets.githubusercontent.com/file\r\n\r\n"
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+            };
+            Ok(Some(raw.parse().unwrap()))
+        }).unwrap();
+        assert!(result.is_some());
+        assert_eq!(seen.len(), 2);
+        for url in [
+            "http://cdn.modrinth.com/a",
+            "https://cdn.modrinth.com.evil/a",
+            "https://user@cdn.modrinth.com/a",
+            "https://cdn.modrinth.com:444/a",
+        ] {
+            assert!(checked_url(url, &["cdn.modrinth.com"]).is_err());
+        }
+        let mut count = 0;
+        assert!(
+            follow("https://cdn.modrinth.com/a", &["cdn.modrinth.com"], |_| {
+                count += 1;
+                Ok(Some(
+                    "HTTP/1.1 302 Found\r\nLocation: /a\r\n\r\n"
+                        .parse()
+                        .unwrap(),
+                ))
+            })
+            .is_err()
+        );
+        assert_eq!(count, 6);
+        assert!(
+            follow("https://cdn.modrinth.com/a", &["cdn.modrinth.com"], |_| Ok(
+                None
+            ))
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            follow(
+                "https://cdn.modrinth.com/a",
+                &["cdn.modrinth.com"],
+                |_| Err("network failure".into())
+            )
+            .is_err()
+        );
+    }
+}
+
+fn checked_url(address: &str, hosts: &[&str]) -> Result<url::Url, String> {
+    let url = url::Url::parse(address).map_err(|e| e.to_string())?;
+    if url.scheme() != "https"
+        || !url.host_str().is_some_and(|host| hosts.contains(&host))
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("Refused download URL outside allowed HTTPS hosts".into());
+    }
+    Ok(url)
+}
+
 /// The agent `url` is fetched with, built by `build` and then kept for the next request that names
 /// the same `slot` and proxy: a fresh `Agent` starts a new connection pool, so building one per
 /// request is a handshake per file, and a modpack's jars are fetched one after another.
@@ -89,15 +223,13 @@ pub fn keep(
 /// `spec` as a proxy, when it is one. An address that can't be used is said once: a download left
 /// to go direct would otherwise fail with nothing pointing at the proxy.
 pub fn parse(spec: &str) -> Option<ureq::Proxy> {
-    if socks(spec) {
-        say(&format!(
-            "{} is a SOCKS proxy; downloads go without one. Write the http:// address your \
-             proxy app listens on as well.",
-            redacted(spec)
-        ));
-        return None;
-    }
-    match ureq::Proxy::new(spec) {
+    // `socks5h` is curl's name for SOCKS5 with the proxy resolving host names. `ureq` has only the
+    // name `socks5`, which already sends it host names to resolve.
+    let address = match spec.strip_prefix("socks5h://") {
+        Some(rest) => format!("socks5://{rest}"),
+        None => spec.to_owned(),
+    };
+    match ureq::Proxy::new(&address) {
         Ok(proxy) => Some(proxy),
         Err(e) => {
             say(&format!(
@@ -122,17 +254,6 @@ pub fn redacted(spec: &str) -> String {
         Some(at) => format!("{scheme}***@{}", &rest[at + 1..]),
         None => spec.to_owned(),
     }
-}
-
-/// Whether `spec` names a SOCKS proxy, which these downloads don't go through: `ureq` reads a
-/// SOCKS address happily and only fails when it connects through it.
-pub fn socks(spec: &str) -> bool {
-    matches!(
-        spec.split_once("://")
-            .map(|(s, _)| s.to_ascii_lowercase())
-            .as_deref(),
-        Some("socks" | "socks4" | "socks4a" | "socks5" | "socks5h")
-    )
 }
 
 /// Whether `url` is reached without the proxy: a local address, or a host `NO_PROXY` names. The
@@ -382,10 +503,57 @@ mod tests {
     fn an_address_that_cant_be_used_becomes_no_proxy() {
         assert!(parse("http://127.0.0.1:7890").is_some());
         assert!(parse("127.0.0.1:7890").is_some());
-        // `ureq` reads a SOCKS address and only fails once it connects through it.
-        assert!(socks("socks5://127.0.0.1:7891"));
-        assert!(parse("socks5://127.0.0.1:7891").is_none());
-        assert!(!socks("http://127.0.0.1:7890"));
+        assert!(parse("socks5://127.0.0.1:7891").is_some());
+        assert!(parse("socks3://127.0.0.1:7890").is_none());
+    }
+
+    /// A stand-in SOCKS5 proxy: answers one request itself and returns the host it was asked for.
+    fn socks5_proxy() -> (u16, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut greeting = [0; 2];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0; greeting[1].into()];
+            stream.read_exact(&mut methods).unwrap();
+            stream.write_all(&[5, 0]).unwrap();
+            let mut request = [0; 5];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(request[..4], [5, 1, 0, 3], "a CONNECT to a host name");
+            let mut host = vec![0; request[4].into()];
+            stream.read_exact(&mut host).unwrap();
+            let mut target_port = [0; 2];
+            stream.read_exact(&mut target_port).unwrap();
+            stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+            let mut http = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while http.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            String::from_utf8(host).unwrap()
+        });
+        (port, server)
+    }
+
+    /// `.invalid` never resolves here (RFC 2606), so the answer can only have come through the
+    /// proxy, which is handed the name to resolve.
+    #[test]
+    #[ignore = "daily"]
+    fn a_request_goes_through_a_socks_proxy() {
+        for scheme in ["socks5", "socks5h"] {
+            let (port, server) = socks5_proxy();
+            let proxy = parse(&format!("{scheme}://127.0.0.1:{port}")).unwrap();
+            let agent = ureq::AgentBuilder::new().proxy(proxy).build();
+            let answer = agent.get("http://horizon.invalid/a.jar").call().unwrap();
+            assert_eq!(answer.into_string().unwrap(), "ok", "{scheme}");
+            assert_eq!(server.join().unwrap(), "horizon.invalid", "{scheme}");
+        }
     }
 
     /// The agent a second request gets is the one the first built: one connection pool, not one

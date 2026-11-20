@@ -117,7 +117,7 @@ use alloc::{boxed::Box, string::String, string::ToString as _, sync::Arc, vec::V
 use core::{
     fmt,
     ops::Range,
-    sync::atomic::{AtomicU32, AtomicU8},
+    sync::atomic::{AtomicU8, AtomicU32},
 };
 use parking_lot::Mutex;
 
@@ -130,10 +130,11 @@ use crate::{CopyExtent, TextureDescriptor};
 #[derive(Clone, Debug)]
 pub struct Api;
 
-//Note: we can support more samplers if not every one of them is used at a time,
-// but it probably doesn't worth it.
-const MAX_TEXTURE_SLOTS: usize = 16;
-const MAX_SAMPLERS: usize = 16;
+// The arrays below are sized for this many slots; the limits the adapter reports are
+// the context's own (GL 4.6 usually has 32 texture units per stage, WebGL2 16), capped
+// here (the dirty masks are `u32`).
+const MAX_TEXTURE_SLOTS: usize = 32;
+const MAX_SAMPLERS: usize = 32;
 const MAX_VERTEX_ATTRIBUTES: usize = 16;
 const ZERO_BUFFER_SIZE: usize = 256 << 10;
 const MAX_IMMEDIATES: usize = 64;

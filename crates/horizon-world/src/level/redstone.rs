@@ -2,7 +2,7 @@
 //! diodes (repeaters, comparators), observers, lamps and the power-driven
 //! responses of doors, trapdoors, gates and other consumers.
 use super::{
-    LevelAccess, LevelEvent, Sim,
+    LevelAccess, LevelEvent, Signals, Sim,
     classes::Class,
     data::state_flags,
     query::{axis_of, clockwise, counter_clockwise},
@@ -29,167 +29,6 @@ const SIGNAL_ORDER: [Direction; 6] = [
 ];
 
 impl<L: LevelAccess + ?Sized> Sim<'_, L> {
-    fn nibble(word: u32, direction: Direction) -> i32 {
-        ((word >> (4 * direction as u32)) & 15) as i32
-    }
-    pub(crate) fn is_signal_source(&self, state: BlockStateId) -> bool {
-        if self.b.is_block(state, self.b.named.redstone_wire) {
-            return !self.wire_signal_off.get();
-        }
-        self.level
-            .adjust_signal_source(state, self.b.has_flag(state, state_flags::SIGNAL_SOURCE))
-    }
-    /// `BlockState.getSignal(level, pos, direction)`.
-    pub(crate) fn state_signal(
-        &self,
-        state: BlockStateId,
-        pos: BlockPos,
-        direction: Direction,
-    ) -> i32 {
-        let vanilla = self.vanilla_signal(state, pos, direction);
-        self.level
-            .adjust_signal(pos, state, direction, false, vanilla)
-    }
-    fn vanilla_signal(&self, state: BlockStateId, pos: BlockPos, direction: Direction) -> i32 {
-        let b = self.b;
-        // BlockBehaviour.getSignal is `ownSignal` for a TestBlock, which is
-        // not an `isSignalSource`.
-        if b.data(state).class == Class::TestBlock {
-            return self.level.block_entity_signal(pos, state, direction);
-        }
-        if !b.has_flag(state, state_flags::SIGNAL_SOURCE) {
-            return 0;
-        }
-        let data = b.data(state);
-        match data.class {
-            Class::RedstoneWire => self.wire_signal(state, pos, direction),
-            Class::Comparator => {
-                if b.facing(state) == direction && b.table.bool(state, b.props.powered) {
-                    self.comparator_output(pos)
-                } else {
-                    0
-                }
-            }
-            Class::TrappedChest | Class::Jukebox => {
-                self.level.block_entity_signal(pos, state, direction)
-            }
-            _ => Self::nibble(b.facts(state).weak, direction),
-        }
-    }
-    /// `BlockState.getDirectSignal(level, pos, direction)`.
-    pub(crate) fn state_direct_signal(
-        &self,
-        state: BlockStateId,
-        pos: BlockPos,
-        direction: Direction,
-    ) -> i32 {
-        let vanilla = self.vanilla_direct_signal(state, pos, direction);
-        self.level
-            .adjust_signal(pos, state, direction, true, vanilla)
-    }
-    fn vanilla_direct_signal(
-        &self,
-        state: BlockStateId,
-        pos: BlockPos,
-        direction: Direction,
-    ) -> i32 {
-        let b = self.b;
-        if !b.has_flag(state, state_flags::SIGNAL_SOURCE) {
-            return 0;
-        }
-        match b.data(state).class {
-            Class::RedstoneWire => {
-                if self.wire_signal_off.get() {
-                    0
-                } else {
-                    self.wire_signal(state, pos, direction)
-                }
-            }
-            Class::Comparator => self.vanilla_signal(state, pos, direction),
-            Class::TrappedChest => {
-                if direction == Direction::Up {
-                    self.level.block_entity_signal(pos, state, direction)
-                } else {
-                    0
-                }
-            }
-            _ => Self::nibble(b.facts(state).strong, direction),
-        }
-    }
-    pub(crate) fn comparator_output(&self, pos: BlockPos) -> i32 {
-        self.ticks
-            .comparator_outputs
-            .get(&pos)
-            .copied()
-            .unwrap_or(0)
-    }
-    fn wire_signal(&self, state: BlockStateId, pos: BlockPos, direction: Direction) -> i32 {
-        if self.wire_signal_off.get() || direction == Direction::Down {
-            return 0;
-        }
-        let power = self.b.table.int(state, self.b.props.power);
-        if power == 0 {
-            return 0;
-        }
-        if direction != Direction::Up {
-            let connected = self.wire_connection_state(state, pos);
-            if self
-                .b
-                .table
-                .text(connected, self.direction_prop(direction.opposite()))
-                == "none"
-            {
-                return 0;
-            }
-        }
-        power
-    }
-    /// `SignalGetter.getDirectSignal(pos, direction)`.
-    pub fn direct_signal(&self, pos: BlockPos, direction: Direction) -> i32 {
-        self.state_direct_signal(self.state(pos), pos, direction)
-    }
-    /// `SignalGetter.getDirectSignalTo`.
-    pub fn direct_signal_to(&self, pos: BlockPos) -> i32 {
-        let mut result = 0;
-        for direction in SIGNAL_ORDER {
-            result = result.max(self.direct_signal(rel(pos, direction), direction));
-            if result >= 15 {
-                return result;
-            }
-        }
-        result
-    }
-    /// `SignalGetter.getSignal(pos, direction)`.
-    pub fn signal(&self, pos: BlockPos, direction: Direction) -> i32 {
-        let state = self.state(pos);
-        let signal = self.state_signal(state, pos, direction);
-        if self.is_redstone_conductor(state, pos) {
-            signal.max(self.direct_signal_to(pos))
-        } else {
-            signal
-        }
-    }
-    pub fn has_signal(&self, pos: BlockPos, direction: Direction) -> bool {
-        self.signal(pos, direction) > 0
-    }
-    /// `SignalGetter.hasNeighborSignal`.
-    pub fn has_neighbor_signal(&self, pos: BlockPos) -> bool {
-        SIGNAL_ORDER
-            .into_iter()
-            .any(|direction| self.signal(rel(pos, direction), direction) > 0)
-    }
-    /// `SignalGetter.getBestNeighborSignal`.
-    pub fn best_neighbor_signal(&self, pos: BlockPos) -> i32 {
-        let mut best = 0;
-        for direction in SIGNAL_ORDER {
-            let signal = self.signal(rel(pos, direction), direction);
-            if signal >= 15 {
-                return 15;
-            }
-            best = best.max(signal);
-        }
-        best
-    }
     /// `SignalGetter.getControlInputSignal`.
     fn control_input_signal(&self, pos: BlockPos, direction: Direction, only_diodes: bool) -> i32 {
         let b = self.b;
@@ -213,71 +52,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
 
     // ---- redstone wire ----
 
-    fn should_wire_connect_to(&self, state: BlockStateId, direction: Option<Direction>) -> bool {
-        let b = self.b;
-        match b.data(state).class {
-            Class::RedstoneWire => true,
-            Class::Observer => direction == Some(b.facing(state)),
-            Class::Repeater => {
-                let facing = b.facing(state);
-                direction == Some(facing) || direction == Some(facing.opposite())
-            }
-            _ => self.is_signal_source(state) && direction.is_some(),
-        }
-    }
-    /// `RedstoneWireBlock.canSurvive` and `updateShape`'s down face: the block
-    /// below is read through `support_state`, since a retracting piston's
-    /// `moving_piston` block carries the extended base only through its block
-    /// entity and its exported facts call every face unsupported (#4728).
-    fn wire_can_survive_on(&self, pos: BlockPos) -> bool {
-        let state = self.support_state(pos);
-        self.sturdy(pos, Direction::Up) || self.b.is_block(state, self.b.named.hopper)
-    }
-    fn wire_connecting_side(
-        &self,
-        pos: BlockPos,
-        direction: Direction,
-        can_connect_up: bool,
-    ) -> &'static str {
-        let b = self.b;
-        let relative_pos = rel(pos, direction);
-        let relative = self.state(relative_pos);
-        if can_connect_up {
-            let placeable_above =
-                b.instance_of(relative, Class::TrapDoor) || self.wire_can_survive_on(relative_pos);
-            if placeable_above && self.should_wire_connect_to(self.state(above(relative_pos)), None)
-            {
-                return if b.is_face_sturdy(relative, direction.opposite()) {
-                    "up"
-                } else {
-                    "side"
-                };
-            }
-        }
-        if !self.should_wire_connect_to(relative, Some(direction))
-            && (self.is_redstone_conductor(relative, relative_pos)
-                || !self.should_wire_connect_to(self.state(below(relative_pos)), None))
-        {
-            "none"
-        } else {
-            "side"
-        }
-    }
-    fn wire_can_connect_up(&self, pos: BlockPos) -> bool {
-        !self.is_redstone_conductor(self.above_state(pos), pos)
-    }
-    fn wire_connected(&self, state: BlockStateId, direction: Direction) -> bool {
-        self.b.table.text(state, self.direction_prop(direction)) != "none"
-    }
     fn wire_is_cross(&self, state: BlockStateId) -> bool {
         HORIZONTAL
             .into_iter()
             .all(|d| self.wire_connected(state, d))
-    }
-    fn wire_is_dot(&self, state: BlockStateId) -> bool {
-        !HORIZONTAL
-            .into_iter()
-            .any(|d| self.wire_connected(state, d))
     }
     pub(crate) fn wire_cross_state(&self, power: i32) -> BlockStateId {
         let b = self.b;
@@ -288,46 +66,6 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 .set_text(state, self.direction_prop(direction), "side");
         }
         b.table.set_int(state, b.props.power, power)
-    }
-    /// `RedstoneWireBlock.getConnectionState`.
-    pub(crate) fn wire_connection_state(&self, state: BlockStateId, pos: BlockPos) -> BlockStateId {
-        let b = self.b;
-        let table = &b.table;
-        let was_dot = self.wire_is_dot(state);
-        let mut result = table.set_int(
-            b.default_of(b.named.redstone_wire),
-            b.props.power,
-            table.int(state, b.props.power),
-        );
-        let can_up = self.wire_can_connect_up(pos);
-        for direction in HORIZONTAL {
-            if !self.wire_connected(result, direction) {
-                let side = self.wire_connecting_side(pos, direction, can_up);
-                result = table.set_text(result, self.direction_prop(direction), side);
-            }
-        }
-        if was_dot && self.wire_is_dot(result) {
-            return result;
-        }
-        let north = self.wire_connected(result, Direction::North);
-        let south = self.wire_connected(result, Direction::South);
-        let east = self.wire_connected(result, Direction::East);
-        let west = self.wire_connected(result, Direction::West);
-        let ns_empty = !north && !south;
-        let ew_empty = !east && !west;
-        if !west && ns_empty {
-            result = table.set_text(result, b.props.west, "side");
-        }
-        if !east && ns_empty {
-            result = table.set_text(result, b.props.east, "side");
-        }
-        if !north && ew_empty {
-            result = table.set_text(result, b.props.north, "side");
-        }
-        if !south && ew_empty {
-            result = table.set_text(result, b.props.south, "side");
-        }
-        result
     }
     pub(crate) fn redstone_wire_update_shape(
         &self,
@@ -348,7 +86,13 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             }
             Direction::Up => self.wire_connection_state(state, pos),
             _ => {
-                let side = self.wire_connecting_side(pos, direction, self.wire_can_connect_up(pos));
+                let has_hook = self.level.has_redstone_wire_connection_hook();
+                let side = self.wire_connecting_side(
+                    pos,
+                    direction,
+                    self.wire_can_connect_up(pos),
+                    has_hook,
+                );
                 let key = self.direction_prop(direction);
                 if (side != "none") == self.wire_connected(state, direction)
                     && !self.wire_is_cross(state)
@@ -357,7 +101,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 } else {
                     let power = b.table.int(state, b.props.power);
                     let cross = b.table.set_text(self.wire_cross_state(power), key, side);
-                    self.wire_connection_state(cross, pos)
+                    self.wire_connection_state_with_hook(cross, pos, has_hook)
                 }
             }
         }
@@ -461,9 +205,13 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             // Vanilla iterates a HashSet of the position and its six
             // neighbours; BlockPos hash order is reproduced below.
             let wire = self.b.named.redstone_wire;
-            let mut targets: Vec<BlockPos> = std::iter::once(pos)
-                .chain(Direction::ALL.map(|d| rel(pos, d)))
-                .collect();
+            // `pos` and its six neighbours are always distinct, so keep this
+            // tiny HashSet iteration equivalent on the stack. The old path
+            // allocated three Vecs (the input, deduplication scratch and the
+            // sorted output) for every wire update.
+            let mut targets = [BlockPos::default(); 7];
+            targets[0] = pos;
+            targets[1..].copy_from_slice(&Direction::ALL.map(|d| rel(pos, d)));
             java_hash_set_order(&mut targets);
             for target_pos in targets {
                 self.update_neighbors_at(target_pos, wire);
@@ -513,7 +261,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         self.control_input_signal(rel(pos, cw), cw, only_diodes)
             .max(self.control_input_signal(rel(pos, ccw), ccw, only_diodes))
     }
-    fn diode_input_signal(&self, pos: BlockPos, state: BlockStateId) -> i32 {
+    fn diode_input_signal(&mut self, pos: BlockPos, state: BlockStateId) -> i32 {
         let b = self.b;
         let facing = b.facing(state);
         let target = rel(pos, facing);
@@ -544,7 +292,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         }
         result
     }
-    pub(crate) fn diode_should_turn_on(&self, pos: BlockPos, state: BlockStateId) -> bool {
+    pub(crate) fn diode_should_turn_on(&mut self, pos: BlockPos, state: BlockStateId) -> bool {
         if self.b.instance_of(state, Class::Comparator) {
             let input = self.diode_input_signal(pos, state);
             if input == 0 {
@@ -570,7 +318,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         self.neighbor_changed_at_oriented(opposite_pos, block, orientation);
         self.update_neighbors_at_except_oriented(opposite_pos, block, direction, orientation);
     }
-    fn comparator_calculate_output(&self, pos: BlockPos, state: BlockStateId) -> i32 {
+    fn comparator_calculate_output(&mut self, pos: BlockPos, state: BlockStateId) -> i32 {
         let input = self.diode_input_signal(pos, state);
         if input == 0 {
             return 0;
@@ -687,7 +435,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     }
     /// `BlockState.getAnalogOutputSignal`, as the level answers it (a mod's block), 0 to 15.
     pub(crate) fn analog_output(
-        &self,
+        &mut self,
         state: BlockStateId,
         pos: BlockPos,
         direction: Direction,
@@ -699,7 +447,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     }
     /// `getAnalogOutputSignal` for state-only sources; others ask the caller.
     fn vanilla_analog_output(
-        &self,
+        &mut self,
         state: BlockStateId,
         pos: BlockPos,
         direction: Direction,
@@ -1260,33 +1008,44 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.set_block(pos, b.table.set_bool(next, p.powered, signal), 3);
         }
     }
-    /// `NoteBlock.playNote`: queues the block event and emits the game event.
-    pub(crate) fn note_play(&mut self, pos: BlockPos, state: BlockStateId) {
-        if !self.note_play_allowed(pos, state) {
-            return;
-        }
-        self.note_play_unchecked(pos, state);
-    }
-    pub(crate) fn note_play_allowed(&self, pos: BlockPos, state: BlockStateId) -> bool {
+    /// The note block's `instrument`, as its index in `data::INSTRUMENTS`.
+    pub(crate) fn note_instrument(&self, state: BlockStateId) -> u8 {
         let b = self.b;
         let instrument = b.table.text(state, b.props.instrument);
-        let note = b.table.int(state, b.props.note);
-        self.level.allow_note_play(pos, instrument, note)
-    }
-    pub(crate) fn note_play_unchecked(&mut self, pos: BlockPos, state: BlockStateId) {
-        let b = self.b;
-        let instrument = b.table.text(state, b.props.instrument);
-        let mob_head = super::data::INSTRUMENTS
+        super::data::INSTRUMENTS
             .iter()
             .position(|n| *n == instrument)
-            .is_some_and(|i| super::data::instrument_works_above(i as u8));
-        if mob_head || b.is_air(self.above_state(pos)) {
-            self.block_event(pos, b.block(state), 0, 0);
+            .map_or(0, |i| i as u8)
+    }
+    /// `NoteBlock.playNote`: queues the block event and emits the game event.
+    /// `by_player` for a tune or a punch, not for redstone.
+    pub(crate) fn note_play(&mut self, pos: BlockPos, state: BlockStateId, by_player: bool) {
+        let b = self.b;
+        let index = self.note_instrument(state);
+        if super::data::instrument_works_above(index) || b.is_air(self.above_state(pos)) {
+            let note = b.table.int(state, b.props.note);
+            let (mut played, mut played_note) = (index, note);
+            if !self
+                .level
+                .note_block_play(pos, by_player, &mut played, &mut played_note)
+            {
+                return;
+            }
+            // Hook-selected values are typed engine metadata, not raw event ints.
+            self.ticks
+                .queue_block_event(super::pistons::BlockEventData {
+                    pos,
+                    block: b.block(state),
+                    param_a: 0,
+                    param_b: 0,
+                    note_override: ((played, played_note) != (index, note))
+                        .then_some((played, played_note)),
+                });
             self.game_event(pos, "minecraft:note_block_play");
         }
     }
     /// `NoteBlock.triggerEvent`: the note's particle (tunable instruments)
-    /// and sound.
+    /// and sound. Raw block-event integers do not select the instrument or note.
     pub(crate) fn note_trigger_event(&mut self, pos: BlockPos, state: BlockStateId) {
         let b = self.b;
         let instrument = b.table.text(state, b.props.instrument).to_owned();
@@ -1328,12 +1087,29 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             pitch,
         });
     }
+    /// Apply the typed values selected by the note-play hook.
+    pub(crate) fn note_played_state(
+        &self,
+        state: BlockStateId,
+        instrument: u8,
+        note: i32,
+    ) -> BlockStateId {
+        let t = &self.b.table;
+        let p = &self.b.props;
+        let Some(instrument) = super::data::INSTRUMENTS.get(usize::from(instrument)) else {
+            return state;
+        };
+        let state = t
+            .with_text(state, p.instrument, instrument)
+            .unwrap_or(state);
+        t.with_int(state, p.note, note).unwrap_or(state)
+    }
     pub(crate) fn note_neighbor_changed(&mut self, pos: BlockPos, state: BlockStateId) {
         let b = self.b;
         let signal = self.has_neighbor_signal(pos);
         if signal != b.table.bool(state, b.props.powered) {
             if signal {
-                self.note_play(pos, state);
+                self.note_play(pos, state, false);
             }
             self.set_block_and_update(pos, b.table.set_bool(state, b.props.powered, signal));
         }
@@ -1477,31 +1253,415 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     }
 }
 
-/// Order `positions` as a `java.util.HashSet<BlockPos>` of capacity 16 would
-/// iterate them (bucket index of the spread hash, then insertion order).
-fn java_hash_set_order(positions: &mut Vec<BlockPos>) {
+/// Order the seven distinct positions as a `java.util.HashSet<BlockPos>` of
+/// capacity 16 would iterate them (bucket index of the spread hash, then
+/// insertion order).
+fn java_hash_set_order(positions: &mut [BlockPos; 7]) {
     fn hash(pos: BlockPos) -> i32 {
         // Vec3i.hashCode: (y + z * 31) * 31 + x
         (pos.y.wrapping_add(pos.z.wrapping_mul(31)))
             .wrapping_mul(31)
             .wrapping_add(pos.x)
     }
-    let mut unique: Vec<BlockPos> = Vec::new();
-    for pos in positions.iter() {
-        if !unique.contains(pos) {
-            unique.push(*pos);
-        }
-    }
     let buckets = 16;
     let bucket = |pos: BlockPos| {
         let h = hash(pos);
         ((h ^ ((h as u32) >> 16) as i32) & (buckets - 1)) as usize
     };
-    let mut ordered: Vec<(usize, usize, BlockPos)> = unique
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (bucket(*p), i, *p))
-        .collect();
-    ordered.sort_by_key(|(b, i, _)| (*b, *i));
-    *positions = ordered.into_iter().map(|(_, _, p)| p).collect();
+    let mut ordered: [(usize, usize, BlockPos); 7] =
+        std::array::from_fn(|i| (bucket(positions[i]), i, positions[i]));
+    ordered.sort_unstable_by_key(|(b, i, _)| (*b, *i));
+    for (position, (_, _, ordered_position)) in positions.iter_mut().zip(ordered) {
+        *position = ordered_position;
+    }
+}
+
+impl<L: super::signal_access::SignalAccess + ?Sized> Signals<'_, L> {
+    fn nibble(word: u32, direction: Direction) -> i32 {
+        ((word >> (4 * direction as u32)) & 15) as i32
+    }
+    pub(crate) fn is_signal_source(&self, state: BlockStateId) -> bool {
+        if self.b.is_block(state, self.b.named.redstone_wire) {
+            return !self.wire_signal_off;
+        }
+        self.level
+            .adjust_signal_source(state, self.b.has_flag(state, state_flags::SIGNAL_SOURCE))
+    }
+    /// `BlockState.getSignal(level, pos, direction)`.
+    pub(crate) fn state_signal(
+        &self,
+        state: BlockStateId,
+        pos: BlockPos,
+        direction: Direction,
+    ) -> i32 {
+        let vanilla = self.vanilla_signal(state, pos, direction);
+        self.level
+            .adjust_signal(pos, state, direction, false, vanilla)
+    }
+    fn vanilla_signal(&self, state: BlockStateId, pos: BlockPos, direction: Direction) -> i32 {
+        let b = self.b;
+        // BlockBehaviour.getSignal is `ownSignal` for a TestBlock, which is
+        // not an `isSignalSource`.
+        if b.data(state).class == Class::TestBlock {
+            return self.level.block_entity_signal(pos, state, direction);
+        }
+        if !b.has_flag(state, state_flags::SIGNAL_SOURCE) {
+            return 0;
+        }
+        let data = b.data(state);
+        match data.class {
+            Class::RedstoneWire => self.wire_signal(state, pos, direction),
+            Class::Comparator => {
+                if b.facing(state) == direction && b.table.bool(state, b.props.powered) {
+                    self.comparator_output(pos)
+                } else {
+                    0
+                }
+            }
+            Class::TrappedChest | Class::Jukebox => {
+                self.level.block_entity_signal(pos, state, direction)
+            }
+            _ => Self::nibble(b.facts(state).weak, direction),
+        }
+    }
+    /// `BlockState.getDirectSignal(level, pos, direction)`.
+    pub(crate) fn state_direct_signal(
+        &self,
+        state: BlockStateId,
+        pos: BlockPos,
+        direction: Direction,
+    ) -> i32 {
+        let vanilla = self.vanilla_direct_signal(state, pos, direction);
+        self.level
+            .adjust_signal(pos, state, direction, true, vanilla)
+    }
+    fn vanilla_direct_signal(
+        &self,
+        state: BlockStateId,
+        pos: BlockPos,
+        direction: Direction,
+    ) -> i32 {
+        let b = self.b;
+        if !b.has_flag(state, state_flags::SIGNAL_SOURCE) {
+            return 0;
+        }
+        match b.data(state).class {
+            Class::RedstoneWire => {
+                if self.wire_signal_off {
+                    0
+                } else {
+                    self.wire_signal(state, pos, direction)
+                }
+            }
+            Class::Comparator => self.vanilla_signal(state, pos, direction),
+            Class::TrappedChest => {
+                if direction == Direction::Up {
+                    self.level.block_entity_signal(pos, state, direction)
+                } else {
+                    0
+                }
+            }
+            _ => Self::nibble(b.facts(state).strong, direction),
+        }
+    }
+    pub(crate) fn comparator_output(&self, pos: BlockPos) -> i32 {
+        self.ticks
+            .comparator_outputs
+            .get(&pos)
+            .copied()
+            .unwrap_or(0)
+    }
+    fn wire_signal(&self, state: BlockStateId, pos: BlockPos, direction: Direction) -> i32 {
+        if self.wire_signal_off || direction == Direction::Down {
+            return 0;
+        }
+        let power = self.b.table.int(state, self.b.props.power);
+        if power == 0 {
+            return 0;
+        }
+        if direction != Direction::Up {
+            let connected = self.wire_connection_state(state, pos);
+            if self
+                .b
+                .table
+                .text(connected, self.direction_prop(direction.opposite()))
+                == "none"
+            {
+                return 0;
+            }
+        }
+        power
+    }
+    /// `SignalGetter.getDirectSignal(pos, direction)`.
+    pub fn direct_signal(&self, pos: BlockPos, direction: Direction) -> i32 {
+        self.state_direct_signal(self.state(pos), pos, direction)
+    }
+    /// `SignalGetter.getDirectSignalTo`.
+    pub fn direct_signal_to(&self, pos: BlockPos) -> i32 {
+        let mut result = 0;
+        for direction in SIGNAL_ORDER {
+            result = result.max(self.direct_signal(rel(pos, direction), direction));
+            if result >= 15 {
+                return result;
+            }
+        }
+        result
+    }
+    /// `SignalGetter.getSignal(pos, direction)`.
+    pub fn signal(&self, pos: BlockPos, direction: Direction) -> i32 {
+        let has_hook = self.level.has_weak_power_hook();
+        let state = self.state(pos);
+        let signal = self.state_signal(state, pos, direction);
+        let vanilla = self.is_redstone_conductor(state, pos);
+        let check = if has_hook {
+            self.level
+                .adjust_should_check_weak_power(pos, state, direction, vanilla)
+        } else {
+            vanilla
+        };
+        if check {
+            signal.max(self.direct_signal_to(pos))
+        } else {
+            signal
+        }
+    }
+    pub fn has_signal(&self, pos: BlockPos, direction: Direction) -> bool {
+        self.signal(pos, direction) > 0
+    }
+    /// `SignalGetter.hasNeighborSignal`.
+    pub fn has_neighbor_signal(&self, pos: BlockPos) -> bool {
+        SIGNAL_ORDER
+            .into_iter()
+            .any(|direction| self.signal(rel(pos, direction), direction) > 0)
+    }
+    /// `SignalGetter.getBestNeighborSignal`.
+    pub fn best_neighbor_signal(&self, pos: BlockPos) -> i32 {
+        let mut best = 0;
+        for direction in SIGNAL_ORDER {
+            let signal = self.signal(rel(pos, direction), direction);
+            if signal >= 15 {
+                return 15;
+            }
+            best = best.max(signal);
+        }
+        best
+    }
+    fn should_wire_connect_to(
+        &self,
+        pos: BlockPos,
+        state: BlockStateId,
+        direction: Option<Direction>,
+        has_hook: bool,
+    ) -> bool {
+        let b = self.b;
+        let vanilla = match b.data(state).class {
+            Class::RedstoneWire => true,
+            Class::Observer => direction == Some(b.facing(state)),
+            Class::Repeater => {
+                let facing = b.facing(state);
+                direction == Some(facing) || direction == Some(facing.opposite())
+            }
+            _ => self.is_signal_source(state) && direction.is_some(),
+        };
+        if has_hook {
+            self.level
+                .adjust_should_redstone_wire_connect_to(pos, state, direction, vanilla)
+        } else {
+            vanilla
+        }
+    }
+    /// `RedstoneWireBlock.canSurvive` and `updateShape`'s down face: the block
+    /// below is read through `support_state`, since a retracting piston's
+    /// `moving_piston` block carries the extended base only through its block
+    /// entity and its exported facts call every face unsupported (arismoko/horizon#4728).
+    fn wire_can_survive_on(&self, pos: BlockPos) -> bool {
+        let state = self.support_state(pos);
+        self.sturdy(pos, Direction::Up) || self.b.is_block(state, self.b.named.hopper)
+    }
+    fn wire_connecting_side(
+        &self,
+        pos: BlockPos,
+        direction: Direction,
+        can_connect_up: bool,
+        has_hook: bool,
+    ) -> &'static str {
+        let b = self.b;
+        let relative_pos = rel(pos, direction);
+        let relative = self.state(relative_pos);
+        if can_connect_up {
+            let placeable_above =
+                b.instance_of(relative, Class::TrapDoor) || self.wire_can_survive_on(relative_pos);
+            let above_pos = above(relative_pos);
+            if placeable_above
+                && self.should_wire_connect_to(above_pos, self.state(above_pos), None, has_hook)
+            {
+                return if b.is_face_sturdy(relative, direction.opposite()) {
+                    "up"
+                } else {
+                    "side"
+                };
+            }
+        }
+        let below_pos = below(relative_pos);
+        if !self.should_wire_connect_to(relative_pos, relative, Some(direction), has_hook)
+            && (self.is_redstone_conductor(relative, relative_pos)
+                || !self.should_wire_connect_to(below_pos, self.state(below_pos), None, has_hook))
+        {
+            "none"
+        } else {
+            "side"
+        }
+    }
+    fn wire_can_connect_up(&self, pos: BlockPos) -> bool {
+        !self.is_redstone_conductor(self.above_state(pos), pos)
+    }
+    fn wire_connected(&self, state: BlockStateId, direction: Direction) -> bool {
+        self.b.table.text(state, self.direction_prop(direction)) != "none"
+    }
+    fn wire_is_dot(&self, state: BlockStateId) -> bool {
+        !HORIZONTAL
+            .into_iter()
+            .any(|d| self.wire_connected(state, d))
+    }
+    /// `RedstoneWireBlock.getConnectionState`.
+    pub(crate) fn wire_connection_state(&self, state: BlockStateId, pos: BlockPos) -> BlockStateId {
+        self.wire_connection_state_with_hook(
+            state,
+            pos,
+            self.level.has_redstone_wire_connection_hook(),
+        )
+    }
+    fn wire_connection_state_with_hook(
+        &self,
+        state: BlockStateId,
+        pos: BlockPos,
+        has_hook: bool,
+    ) -> BlockStateId {
+        let b = self.b;
+        let table = &b.table;
+        let was_dot = self.wire_is_dot(state);
+        let mut result = table.set_int(
+            b.default_of(b.named.redstone_wire),
+            b.props.power,
+            table.int(state, b.props.power),
+        );
+        let can_up = self.wire_can_connect_up(pos);
+        for direction in HORIZONTAL {
+            if !self.wire_connected(result, direction) {
+                let side = self.wire_connecting_side(pos, direction, can_up, has_hook);
+                result = table.set_text(result, self.direction_prop(direction), side);
+            }
+        }
+        if was_dot && self.wire_is_dot(result) {
+            return result;
+        }
+        let north = self.wire_connected(result, Direction::North);
+        let south = self.wire_connected(result, Direction::South);
+        let east = self.wire_connected(result, Direction::East);
+        let west = self.wire_connected(result, Direction::West);
+        let ns_empty = !north && !south;
+        let ew_empty = !east && !west;
+        if !west && ns_empty {
+            result = table.set_text(result, b.props.west, "side");
+        }
+        if !east && ns_empty {
+            result = table.set_text(result, b.props.east, "side");
+        }
+        if !north && ew_empty {
+            result = table.set_text(result, b.props.north, "side");
+        }
+        if !south && ew_empty {
+            result = table.set_text(result, b.props.south, "side");
+        }
+        result
+    }
+}
+
+/// `Sim` reads these through its [`Signals`], so there is one implementation of each.
+impl<L: LevelAccess + ?Sized> Sim<'_, L> {
+    pub(crate) fn is_signal_source(&self, state: BlockStateId) -> bool {
+        self.signals().is_signal_source(state)
+    }
+    pub(crate) fn comparator_output(&self, pos: BlockPos) -> i32 {
+        self.signals().comparator_output(pos)
+    }
+    pub fn direct_signal(&self, pos: BlockPos, direction: Direction) -> i32 {
+        self.signals().direct_signal(pos, direction)
+    }
+    pub fn signal(&self, pos: BlockPos, direction: Direction) -> i32 {
+        self.signals().signal(pos, direction)
+    }
+    pub fn has_signal(&self, pos: BlockPos, direction: Direction) -> bool {
+        self.signals().has_signal(pos, direction)
+    }
+    pub fn has_neighbor_signal(&self, pos: BlockPos) -> bool {
+        self.signals().has_neighbor_signal(pos)
+    }
+    pub fn best_neighbor_signal(&self, pos: BlockPos) -> i32 {
+        self.signals().best_neighbor_signal(pos)
+    }
+    fn wire_can_survive_on(&self, pos: BlockPos) -> bool {
+        self.signals().wire_can_survive_on(pos)
+    }
+    fn wire_connecting_side(
+        &self,
+        pos: BlockPos,
+        direction: Direction,
+        can_connect_up: bool,
+        has_hook: bool,
+    ) -> &'static str {
+        self.signals()
+            .wire_connecting_side(pos, direction, can_connect_up, has_hook)
+    }
+    fn wire_can_connect_up(&self, pos: BlockPos) -> bool {
+        self.signals().wire_can_connect_up(pos)
+    }
+    fn wire_connected(&self, state: BlockStateId, direction: Direction) -> bool {
+        self.signals().wire_connected(state, direction)
+    }
+    pub(crate) fn wire_connection_state(&self, state: BlockStateId, pos: BlockPos) -> BlockStateId {
+        self.signals().wire_connection_state(state, pos)
+    }
+    fn wire_connection_state_with_hook(
+        &self,
+        state: BlockStateId,
+        pos: BlockPos,
+        has_hook: bool,
+    ) -> BlockStateId {
+        self.signals()
+            .wire_connection_state_with_hook(state, pos, has_hook)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::java_hash_set_order;
+    use horizon_core::position::BlockPos;
+
+    #[test]
+    fn hash_set_order_matches_vanilla_bucket_and_insertion_order() {
+        let origin = BlockPos::new(0, 0, 0);
+        let mut positions = [
+            origin,
+            BlockPos::new(0, -1, 0),
+            BlockPos::new(0, 1, 0),
+            BlockPos::new(0, 0, -1),
+            BlockPos::new(0, 0, 1),
+            BlockPos::new(-1, 0, 0),
+            BlockPos::new(1, 0, 0),
+        ];
+        java_hash_set_order(&mut positions);
+        assert_eq!(
+            positions,
+            [
+                origin,
+                BlockPos::new(0, 0, -1),
+                BlockPos::new(-1, 0, 0),
+                BlockPos::new(0, 0, 1),
+                BlockPos::new(1, 0, 0),
+                BlockPos::new(0, -1, 0),
+                BlockPos::new(0, 1, 0),
+            ]
+        );
+    }
 }

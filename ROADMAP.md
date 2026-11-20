@@ -76,9 +76,7 @@ Owner: [levzzz5154](https://github.com/levzzz5154) · Tracking: [#3911](https://
 
 <details><summary>Technical</summary>
 
-One item for all modding work ([#3911](https://github.com/horizon-rust/horizon/issues/3911)), led by levzzz5154 with vladislav_hagen; the order between the parts is theirs. Native mods on stable hook points (game/native_hooks.rs, [#3345](https://github.com/horizon-rust/horizon/issues/3345), [#3346](https://github.com/horizon-rust/horizon/issues/3346), [#3434](https://github.com/horizon-rust/horizon/issues/3434), [#3435](https://github.com/horizon-rust/horizon/issues/3435)) built by the launcher ([#3388](https://github.com/horizon-rust/horizon/issues/3388), [#3855](https://github.com/horizon-rust/horizon/issues/3855)); server-side hooks ([#3878](https://github.com/horizon-rust/horizon/issues/3878), [#3706](https://github.com/horizon-rust/horizon/issues/3706)); mod-owned screens, input and drawing; tools for mod makers (templates, `native.py check`); the registry ([#1634](https://github.com/horizon-rust/horizon/issues/1634), [#1642](https://github.com/horizon-rust/horizon/issues/1642), [#1659](https://github.com/horizon-rust/horizon/issues/1659)); machines with inventories and menus ([#1189](https://github.com/horizon-rust/horizon/issues/1189)); mods that read and change the world through the server. [docs/native-mods.md](docs/native-mods.md).
-
-More: [#3351](https://github.com/horizon-rust/horizon/issues/3351) · [#3353](https://github.com/horizon-rust/horizon/issues/3353) · [#3360](https://github.com/horizon-rust/horizon/issues/3360) · [#1596](https://github.com/horizon-rust/horizon/issues/1596) · [#1635](https://github.com/horizon-rust/horizon/issues/1635)
+One item for all modding work ([#3911](https://github.com/horizon-rust/horizon/issues/3911)), led by levzzz5154; the order between the parts is theirs. Native mods on stable hook points (game/native_hooks.rs, [#3345](https://github.com/horizon-rust/horizon/issues/3345), [#3346](https://github.com/horizon-rust/horizon/issues/3346), [#3434](https://github.com/horizon-rust/horizon/issues/3434), [#3435](https://github.com/horizon-rust/horizon/issues/3435)) built by the launcher ([#3388](https://github.com/horizon-rust/horizon/issues/3388), [#3855](https://github.com/horizon-rust/horizon/issues/3855)); server-side hooks ([#3878](https://github.com/horizon-rust/horizon/issues/3878), [#3706](https://github.com/horizon-rust/horizon/issues/3706)); mod-owned screens, input and drawing; tools for mod makers (templates, `native.py check`); the registry ([#1634](https://github.com/horizon-rust/horizon/issues/1634), [#1642](https://github.com/horizon-rust/horizon/issues/1642), [#1659](https://github.com/horizon-rust/horizon/issues/1659)); machines with inventories and menus ([#1189](https://github.com/horizon-rust/horizon/issues/1189)); mods that read and change the world through the server. [docs/modding/src/how-to/native-mods.md](docs/modding/src/how-to/native-mods.md).
 
 </details>
 
@@ -150,7 +148,7 @@ New public numbers comparing Horizon with vanilla on many kinds of computers, me
 
 <details><summary>Technical</summary>
 
-Redo the comparison after the current performance work ([#1073](https://github.com/horizon-rust/horizon/issues/1073)); reliability, coverage and presentation ([#1346](https://github.com/horizon-rust/horizon/issues/1346)); a scene must count as loaded only once its first chunk arrives ([#1749](https://github.com/horizon-rust/horizon/issues/1749)). Next: a performance history across releases (an automatic comparison of each release with the last, on a timeline), more report fields (server TPS and MSPT, power, battery drain, temperature, throttling) and more hardware (a MacBook on battery, low-end laptops, community reports). Players' reports come in through `--benchmark` and `horizon-launcher data benchmark` ([docs/benchmark.md](docs/benchmark.md)).
+Redo the comparison after the current performance work ([#1073](https://github.com/horizon-rust/horizon/issues/1073)); reliability, coverage and presentation ([#1346](https://github.com/horizon-rust/horizon/issues/1346)); a scene must count as loaded only once its first chunk arrives ([#1749](https://github.com/horizon-rust/horizon/issues/1749)). Next: a performance history across releases (an automatic comparison of each release with the last, on a timeline), more report fields (server TPS and MSPT, power, battery drain, temperature, throttling) and more hardware (a MacBook on battery, low-end laptops, community reports). Server scale is published in [#12930](https://github.com/horizon-rust/horizon/issues/12930) and [docs/performance/server-vs-vanilla.md](docs/performance/server-vs-vanilla.md). Players' reports come in through `--benchmark` and `horizon-launcher data benchmark` ([docs/benchmark.md](docs/benchmark.md)).
 
 </details>
 
@@ -194,7 +192,7 @@ Speeding up the code that reads and writes the blocks of the world, which almost
 
 <details><summary>Technical</summary>
 
-`PalettedContainer` and `PackedStorage` find an entry's word by multiply and shift instead of an integer division ([#1790](https://github.com/horizon-rust/horizon/issues/1790), [#1794](https://github.com/horizon-rust/horizon/issues/1794)); meshing looks up baked models by index, not by name ([#1747](https://github.com/horizon-rust/horizon/issues/1747)). Each change keeps the paletted storage harnesses identical and shows its microbenchmark ([docs/performance/paletted-container-access-results.md](docs/performance/paletted-container-access-results.md)).
+`PalettedContainer` and `PackedStorage` find an entry's word by multiply and shift instead of an integer division ([#1790](https://github.com/horizon-rust/horizon/issues/1790), [#1794](https://github.com/horizon-rust/horizon/issues/1794)); meshing looks up baked models by index, not by name ([#1747](https://github.com/horizon-rust/horizon/issues/1747)). Each change keeps the paletted storage harnesses identical and shows its microbenchmark in its pull request.
 
 </details>
 
@@ -266,7 +264,7 @@ Shader packs were removed and are being rebuilt from scratch. They come back, of
 
 A clean-room rewrite in `horizon-shaderpack`, from the packs' public format documentation only: reading packs, the preprocessor and `.properties` files are merged ([#1584](https://github.com/horizon-rust/horizon/issues/1584), [#1585](https://github.com/horizon-rust/horizon/issues/1585), [#1586](https://github.com/horizon-rust/horizon/issues/1586)); translating programs to WGSL through naga, buffers, uniforms and the terrain, entity, sky, weather and hand stages are in review ([#1698](https://github.com/horizon-rust/horizon/issues/1698) to [#1801](https://github.com/horizon-rust/horizon/issues/1801)).
 
-More: [#1561](https://github.com/horizon-rust/horizon/issues/1561) · [#1771](https://github.com/horizon-rust/horizon/issues/1771) · [#1786](https://github.com/horizon-rust/horizon/issues/1786)
+More: [#1561](https://github.com/horizon-rust/horizon/issues/1561) · [#1771](https://github.com/horizon-rust/horizon/issues/1771) · [#1786](https://github.com/horizon-rust/horizon/issues/1786) · [#9045](https://github.com/horizon-rust/horizon/issues/9045) · [#6233](https://github.com/horizon-rust/horizon/issues/6233) · [#6485](https://github.com/horizon-rust/horizon/issues/6485) · [#3734](https://github.com/horizon-rust/horizon/issues/3734) · [#3125](https://github.com/horizon-rust/horizon/issues/3125)
 
 </details>
 
@@ -298,6 +296,8 @@ Far terrain drawn from the world you really built and explored, caves and builds
 
 Keep a 3D mip store on disk built from real chunks, drawn by the GPU beside the seed preview for areas nobody has visited. Written from scratch and measured before it is kept. Builds on Far Detail and the far-terrain levels of detail already shipped; the open work on them is [#718](https://github.com/horizon-rust/horizon/issues/718).
 
+More: [#4678](https://github.com/horizon-rust/horizon/issues/4678)
+
 </details>
 
 #### A batch of targeted optimisations
@@ -308,7 +308,7 @@ Several smaller speed-ups, each measured: idle block entities that sleep, cheape
 
 Block entities and hoppers that skip work when idle (the hopper item scan is already skipped when no item is near); a particle frustum test first (also a parity gap), then particle quads built on the GPU; jigsaw shortcuts that skip blocked connectors and pool elements known not to fit, with layouts unchanged (trial chambers and ancient cities first); batched raw mouse input on Windows for 8000 Hz mice; a better atlas packer for huge resource packs (a 64x pack builds a 704 MiB atlas for 452 MiB of textures); sign-heavy scenes ([#1461](https://github.com/horizon-rust/horizon/issues/1461)). Profile first, keep what pays, show before and after numbers.
 
-More: [docs/profiling.md](docs/profiling.md)
+More: [docs/profiling.md](docs/profiling.md) · [#7752](https://github.com/horizon-rust/horizon/issues/7752) · [#8251](https://github.com/horizon-rust/horizon/issues/8251) · [#10229](https://github.com/horizon-rust/horizon/issues/10229)
 
 </details>
 
@@ -321,6 +321,8 @@ Recognise mods built for versions before 26.1 in the mod browser, so they can be
 <details><summary>Technical</summary>
 
 A mapping table from intermediary and SRG names so pre-26.1 jars can be classified, and a rename for mod ids with dashes (`fabric-api`); the port step then treats them like newer jars ([docs/mod-browser.md](docs/mod-browser.md)).
+
+More: [#10262](https://github.com/horizon-rust/horizon/issues/10262)
 
 </details>
 
@@ -380,7 +382,7 @@ Making mods that add machines, magic and mobs work in Horizon, in steps, startin
 
 <details><summary>Technical</summary>
 
-333 of the 496 mods in a big pack (ATM10) contain code. Issue [#1854](https://github.com/horizon-rust/horizon/issues/1854) ranks the gaps (ticking block entities, networking, rendering, menus, inventories) that unlock them in tiers, with machines first as the recommended path. Code mods are native mods now ([docs/native-mods.md](docs/native-mods.md)): each port is a horizon-mixins bundle. The path isn't started yet ([docs/modpacks.md](docs/modpacks.md)).
+333 of the 496 mods in a big pack (ATM10) contain code. Issue [#1854](https://github.com/horizon-rust/horizon/issues/1854) ranks the gaps (ticking block entities, networking, rendering, menus, inventories) that unlock them in tiers, with machines first as the recommended path. Code mods are native mods now ([docs/modding/src/how-to/native-mods.md](docs/modding/src/how-to/native-mods.md)): each port is a horizon-mixins bundle. The path isn't started yet ([docs/modpacks.md](docs/modpacks.md)).
 
 </details>
 
@@ -403,16 +405,6 @@ More of a server managed from its web panel (bans, worlds, logs and crash report
 <details><summary>Technical</summary>
 
 The panel's later features (bans, worlds, server.properties import, logs and crash reports, modpacks) and vanilla's management protocol (the JSON-RPC over WebSocket that the `management-server-*` keys configure), so vanilla's tools can manage a Horizon server. Split from server-admin. [docs/server.md](docs/server.md), [docs/api/server.md](docs/api/server.md).
-
-</details>
-
-#### Ely.by and other sign-in providers
-
-Sign in with other account providers, such as Ely.by or any Yggdrasil-compatible one, beside Microsoft.
-
-<details><summary>Technical</summary>
-
-Issue [#1270](https://github.com/horizon-rust/horizon/issues/1270) asks for Ely.by and Yggdrasil-compatible servers with an account selector in the launcher. It builds on the Microsoft sign-in ([docs/microsoft-account.md](docs/microsoft-account.md)).
 
 </details>
 
@@ -502,7 +494,7 @@ Small mods written as scripts, in the style of KubeJS, with no compiler.
 
 Waits for native mods to settle: a script layer over the native hook points is to be designed.
 
-More: [docs/native-mods.md](docs/native-mods.md)
+More: [docs/modding/src/how-to/native-mods.md](docs/modding/src/how-to/native-mods.md)
 
 </details>
 
@@ -512,7 +504,7 @@ The community mod Orbital Laser, made for a fork of Horizon, running on the norm
 
 <details><summary>Technical</summary>
 
-A native port (a horizon-mixins bundle, docs/native-mods.md) of [https://github.com/Stink-O/orbital-laser](https://github.com/Stink-O/orbital-laser) (MIT), which today runs through its author's fork. Tested in the game, and listed in the registry.
+A native port (a horizon-mixins bundle, docs/modding/src/how-to/native-mods.md) of [https://github.com/Stink-O/orbital-laser](https://github.com/Stink-O/orbital-laser) (MIT), which today runs through its author's fork. Tested in the game, and listed in the registry.
 
 </details>
 
@@ -524,7 +516,7 @@ Built-in versions of the client mods players ask for: block info on hover, a wor
 
 Done: a mod list and menu, minimap, zoom, keystrokes, an FPS counter and a recipe viewer, as native mods (horizon-mods/native/). Asked for: an angled world map that shows hills, overhangs and caves, inventory tweaks (drag and scroll to move items), block info tooltips and schematic overlays.
 
-More: [docs/extras.md](docs/extras.md) · [docs/native-mods.md](docs/native-mods.md)
+More: [docs/extras.md](docs/extras.md) · [docs/modding/src/how-to/native-mods.md](docs/modding/src/how-to/native-mods.md)
 
 </details>
 
@@ -536,6 +528,8 @@ Contraptions and physics like the Create and Aeronautics mods, as a mod for Hori
 
 Issue [#805](https://github.com/horizon-rust/horizon/issues/805) (porting QOL mods) closed with this answer: it would come as a native Horizon mod.
 
+More: [#6302](https://github.com/horizon-rust/horizon/issues/6302) · [#5313](https://github.com/horizon-rust/horizon/issues/5313) · [#5556](https://github.com/horizon-rust/horizon/issues/5556)
+
 </details>
 
 #### Proximity voice chat as a native mod
@@ -544,7 +538,7 @@ Hear nearby players talk, as with the voice chat mods of other Minecraft version
 
 <details><summary>Technical</summary>
 
-A native mod ([docs/native-mods.md](docs/native-mods.md)). It needs a way to carry voice between players and an audio path in the game before anything can be built.
+A native mod ([docs/modding/src/how-to/native-mods.md](docs/modding/src/how-to/native-mods.md)). It needs a way to carry voice between players and an audio path in the game before anything can be built.
 
 </details>
 
@@ -558,6 +552,8 @@ Every past and future Minecraft version prepared for Horizon automatically. When
 
 The port pipeline ([docs/version-ports.md](docs/version-ports.md), `tools/version_port.py`) detects a release, prepares it, diffs its classes against the pinned 26.3, regenerates the data-driven tables, runs every parity harness on it and writes a port report that becomes issues. The goal is as little human work as possible for any version, past or future. Detection and the first slices are merged; the scheduled agent that runs it every day isn't installed yet. Two versions in one build are out of scope.
 
+More: [#4758](https://github.com/horizon-rust/horizon/issues/4758)
+
 </details>
 
 #### Controllers: tested on real pads, and in the launcher
@@ -567,6 +563,8 @@ Make controller support solid: tested with real PlayStation and Xbox pads and a 
 <details><summary>Technical</summary>
 
 The game side is merged ([docs/controllers.md](docs/controllers.md)): pads read with gilrs, menus, rumble, glyphs, remapping and DualSense adaptive triggers, lightbar and haptics, but not yet confirmed on real pads or a Steam Deck (DualSense haptics stay behind a switch until then). Left: a test pass on real hardware, and the same focus navigation in the GPUI launcher.
+
+More: [#10298](https://github.com/horizon-rust/horizon/issues/10298) · [#8678](https://github.com/horizon-rust/horizon/issues/8678)
 
 </details>
 
@@ -668,6 +666,16 @@ A shared resource store keyed by the preparer's digest, no prepare intermediates
 
 </details>
 
+#### A launcher screen readers can read
+
+Screen readers read the launcher's buttons, lists and settings, and every part of it works from the keyboard.
+
+<details><summary>Technical</summary>
+
+Issue [#4537](https://github.com/horizon-rust/horizon/issues/4537): the launcher is GPUI (not Electron), so it exposes nothing to UI Automation, NSAccessibility or AT-SPI yet. Needs an accessibility tree from GPUI (an AccessKit bridge) and a role and label on each widget.
+
+</details>
+
 #### A visible beta label
 
 A clear 'beta' label in the launcher and the game, so nobody is surprised that Horizon is still being built.
@@ -690,6 +698,18 @@ Issue [#1709](https://github.com/horizon-rust/horizon/issues/1709): aarch64 buil
 
 </details>
 
+#### The launcher builds Horizon on other systems
+
+On a system Horizon has no download for, such as FreeBSD, the launcher offers to build the game on your computer, as it already does for native mods.
+
+<details><summary>Technical</summary>
+
+Issue [#4354](https://github.com/horizon-rust/horizon/issues/4354): when no release asset matches the platform, the launcher fetches the tagged source and runs the same pinned-toolchain `cargo build --locked` its native-mod builds use, with a warning about the time it takes. The build is unsigned, so the launcher marks the version as built locally.
+
+More: [docs/native-mods.md](docs/native-mods.md)
+
+</details>
+
 #### Horizon on Windows ARM64
 
 A native Horizon for Windows on ARM computers, such as Snapdragon laptops.
@@ -709,6 +729,8 @@ Versions of Horizon for Android, iOS and web browsers. Nothing official yet; con
 <details><summary>Technical</summary>
 
 No official build. Android was first closed as not planned, with touch controls, a mobile interface, packaging and loading the player's own assets all missing; the roadmap now includes it, iOS and a build for the browser as long-term goals. First pieces from contributors: `horizon-dualsense` compiling on iOS ([#1813](https://github.com/horizon-rust/horizon/issues/1813)) and helper-thread limits on Android ([#1751](https://github.com/horizon-rust/horizon/issues/1751)). Preparing without Java ([#1750](https://github.com/horizon-rust/horizon/issues/1750)) matters here too. Horizon ships none of Mojang's files on any platform.
+
+More: [#9134](https://github.com/horizon-rust/horizon/issues/9134) · [#8069](https://github.com/horizon-rust/horizon/issues/8069) · [#4153](https://github.com/horizon-rust/horizon/issues/4153)
 
 </details>
 
@@ -751,6 +773,8 @@ Record, replay and edit videos without leaving the game: record in a keypress, r
 <details><summary>Technical</summary>
 
 Three stages. Recording: capture gameplay in a keypress with an encoder thread and little frame-time cost. Replay: a replay mode for recorded sessions. Editing: cuts, camera paths, titles and export. None of it exists yet; the agent-control socket ([docs/agent-control.md](docs/agent-control.md)) already lets tools drive the game for scripted shots.
+
+More: [#10025](https://github.com/horizon-rust/horizon/issues/10025)
 
 </details>
 
@@ -841,6 +865,8 @@ Every download Horizon makes is checked against the project's signature, includi
 <details><summary>Technical</summary>
 
 Releases carry signed checksums, and the launcher and `horizon-server update` refuse anything unsigned ([#1011](https://github.com/horizon-rust/horizon/issues/1011), [#1014](https://github.com/horizon-rust/horizon/issues/1014)). Left: the first install through `install.sh` and `install.ps1` still trusts only the checksum GitHub publishes, because verifying Ed25519 signatures needs OpenSSL 3, which macOS doesn't ship ([docs/security.md](docs/security.md)).
+
+More: [#10354](https://github.com/horizon-rust/horizon/issues/10354)
 
 </details>
 

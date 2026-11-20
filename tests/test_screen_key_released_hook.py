@@ -5,6 +5,8 @@ import subprocess
 import tempfile
 import unittest
 
+from native_hook_sources import native_hook_sources
+
 from test_world_input_capture import method
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,11 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 class ScreenKeyReleasedHookTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
     def test_cancelled_release_still_releases_every_binding(self):
-        source = (ROOT / "crates/horizon-client/src/game.rs").read_text(encoding="utf-8")
-        hooks = (ROOT / "crates/horizon-client/src/game/native_hooks.rs").read_text(encoding="utf-8")
+        source = "".join((ROOT / "crates/horizon-client/src" / path).read_text(encoding="utf-8")
+                         for path in ("game/interface/play_input.rs", "game/interface/key_codes.rs", "game/runtime/window_handler.rs", "game.rs"))
+        hooks = native_hook_sources()
         gate = method(hooks.replace("pub(super) fn", "fn"), "screen_key_released")
         mapping = method(source, "mapped_key_event")
-        button = method(source.replace("fn keyboard_button(", "    fn keyboard_button("), "keyboard_button")
+        button = method(source.replace("pub(super) fn keyboard_button(", "    fn keyboard_button("), "keyboard_button")
         start = source.index("            if let WindowEvent::KeyboardInput", source.index("let result: Result<()> = (|| {"))
         opening = source.index("{", source.index("&& self.screen_key_released(key)", start))
         end, depth = opening + 1, 1
@@ -39,6 +42,7 @@ fn gameplay_has_keyboard(screen: bool, title: bool, dialog: bool) -> bool { scre
 BUTTON
 fn container_key_clones(_: i32, _: KeyAction) -> bool { false }
 mod keybinds { pub fn key_name(key: i32) -> Option<&'static str> { (key == 1).then_some("key.keyboard.a") } }
+mod horizon_client { pub(crate) use crate::keybinds; }
 enum Source { Keyboard }
 struct Bindings;
 impl Bindings { fn translate_all(&self, _: i32) -> Vec<std::result::Result<i32, i32>> { vec![Ok(10), Ok(11), Err(2)] } }
@@ -46,7 +50,7 @@ struct Settings { keys: Bindings }
 struct Game { keys: HashSet<i32>, settings: Settings, screen: bool, title: Option<()>, modifiers: u32,
     open: bool, cancel: bool, calls: Cell<usize>, handled: usize, released: Vec<(bool, i32)> }
 impl Game {
-    fn dialog_open(&self) -> bool { false }
+    fn screen_over_playing(&self) -> bool { false }
     fn screen_view_now(&self) -> Option<&'static str> { self.open.then_some("options") }
     fn native_screen_key_released_pre(&self, screen: &&str, name: &str, modifiers: u32, canceled: &mut bool) {
         assert_eq!((*screen, name, modifiers), ("options", "key.keyboard.a", 5));
@@ -55,7 +59,8 @@ impl Game {
     fn mapped_key(&mut self, key: i32, pressed: bool, repeat: bool, raw: i32, _: Source) -> Result<()> {
         assert!(!pressed && !repeat && raw == 1); self.released.push((false, key)); Ok(())
     }
-    fn play_mouse(&mut self, button: i32, pressed: bool) -> Result<()> {
+    fn shared_default_acts(&self, _: i32, _: Option<&str>) -> bool { true }
+    fn mouse_mapping(&mut self, button: i32, pressed: bool, _: Source) -> Result<()> {
         assert!(!pressed); self.released.push((true, button)); Ok(())
     }
     fn inventory_pick_key(&mut self) { panic!("release cannot clone") }

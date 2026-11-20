@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 MARKER = "<!-- overlap-note -->"
@@ -158,9 +159,16 @@ def git(*args: str, check: bool = True) -> str:
     return r.stdout
 
 
-def has_commit(sha: str) -> bool:
-    return bool(sha) and subprocess.run(["git", *SAFE_GIT, "cat-file", "-e", f"{sha}^{{commit}}"],
-                                        capture_output=True).returncode == 0
+def present(shas: list[str]) -> set[str]:
+    """The commits of `shas` this clone already holds, in one git call. Lazy fetching is off: in the blobless clone,
+    git asks the server for each object it misses, one round trip each (82 checks took 134 s)."""
+    shas = [s for s in shas if s]
+    if not shas:
+        return set()
+    r = subprocess.run(["git", *SAFE_GIT, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                       input="".join(f"{s}\n" for s in shas), capture_output=True, text=True,
+                       env={**os.environ, "GIT_NO_LAZY_FETCH": "1"})
+    return {line.split()[0] for line in r.stdout.splitlines() if line.endswith(" commit")}
 
 
 OPEN_PULLS = """
@@ -216,18 +224,23 @@ def fill_functions(pulls: list[Pull], base: str = "origin/main") -> None:
     attrs = ["-c", f"core.attributesFile={f.name}"]
     try:
         # The workflow's clone is blobless: the fetch brings commits and trees, the diff only the blobs it reads.
-        missing = [p.head for p in pulls if not has_commit(p.head)]
+        held = present([p.head for p in pulls])
+        missing = [p.head for p in pulls if p.head and p.head not in held]
         if missing:  # a bare `git fetch origin` would fetch every branch
             git("fetch", "--quiet", "--no-tags", "origin", *missing, check=False)
-        for p in pulls:
-            if not has_commit(p.head):
-                continue  # force-pushed away
+            held = present([p.head for p in pulls])
+
+        def diff(p: Pull) -> str:
             files = [x for x in p.files if not IGNORED.search(x)]
-            if not files:
-                continue
-            diff = git(*attrs, "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", f"{base}...{p.head}",
+            if p.head not in held or not files:
+                return ""  # force-pushed away, or only lists and manifests
+            return git(*attrs, "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", f"{base}...{p.head}",
                        "--", *files, check=False)
-            p.funcs = functions(diff)
+
+        # Each diff fetches its own blobs from the server: in parallel, the waits overlap.
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for p, text in zip(pulls, pool.map(diff, pulls)):
+                p.funcs = functions(text)
     finally:
         os.unlink(f.name)
 
@@ -248,15 +261,18 @@ class Api:
     def __init__(self, repo: str):
         self.repo = repo
 
-    def own_note(self, n: int) -> int | None:
+    def own_note(self, n: int) -> list[int]:
+        """Every marker comment this bot wrote on the pull request, in the order GitHub lists them."""
         raw = gh("api", "--paginate", f"repos/{self.repo}/issues/{n}/comments?per_page=100", "--jq",
                  f'.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("{MARKER}"))) | .id')
-        ids = raw.split()
-        return int(ids[0]) if ids else None
+        return [int(value) for value in raw.split()]
 
-    def write(self, n: int, comment: int | None, text: str) -> None:
-        if comment:
-            gh("api", "-X", "PATCH", f"repos/{self.repo}/issues/comments/{comment}", "-f", f"body={text}")
+    def write(self, n: int, comments: list[int], text: str) -> None:
+        """Edit the one note in place; delete the extras two racing runs may have created (AGENTS.md: one comment)."""
+        if comments:
+            gh("api", "-X", "PATCH", f"repos/{self.repo}/issues/comments/{comments[0]}", "-f", f"body={text}")
+            for extra in comments[1:]:
+                gh("api", "-X", "DELETE", f"repos/{self.repo}/issues/comments/{extra}")
         else:
             gh("api", f"repos/{self.repo}/issues/{n}/comments", "-f", f"body={text}")
 
@@ -272,7 +288,7 @@ def event() -> int:
     text = note(compare(me, pulls))
     api = Api(repo)
     existing = api.own_note(number)
-    if text is None and existing is None:
+    if text is None and not existing:
         return 0
     api.write(number, existing, text or CLEARED)
     return 0

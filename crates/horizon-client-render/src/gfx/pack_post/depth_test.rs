@@ -83,6 +83,7 @@ impl Gpu {
             post,
             T::Rgba8Unorm,
             world,
+            &Default::default(),
         )
         .expect("the pack runs");
         assert!(
@@ -321,7 +322,7 @@ fn check(sampler: &str, stage: Stage, scene: Scene, expected: [u8; 4]) {
     let hand = matches!(scene, Scene::Terrain { hand: true, .. });
     let water = matches!(scene, Scene::Terrain { water: true, .. } | Scene::WaterOnly);
     let inputs=horizon_shaders::GameInputs {
-        terrain:terrain.then(|| horizon_shaders::GbuffersInputs { declarations:"layout(location=0)in vec3 fixture_position;\n".into(),body:"hz_Vertex=vec4(fixture_position,1.0);hz_Color=vec4(1.0);hz_MultiTexCoord0=vec4(0.0);hz_MultiTexCoord1=vec4(240.0);hz_MultiTexCoord2=vec4(240.0);hz_Normal=vec3(0.0,0.0,1.0);\n".into(),attributes:vec![],after:String::new(),alpha_test:None,item_id_declared:false,far_depth:false }),
+        terrain:terrain.then(|| horizon_shaders::GbuffersInputs { declarations:"layout(location=0)in vec3 fixture_position;\n".into(),body:"hz_Vertex=vec4(fixture_position,1.0);hz_Color=vec4(1.0);hz_MultiTexCoord0=vec4(0.0);hz_MultiTexCoord1=vec4(240.0);hz_MultiTexCoord2=vec4(240.0);hz_Normal=vec3(0.0,0.0,1.0);\n".into(),attributes:vec![],after:String::new(),alpha_test:None,parts:None,item_id_declared:false,far_depth:false,paged_maps:false,water_mask:false,water_patches:false }),
         hand:hand.then(crate::gfx::pack_hand::inputs),..Default::default()
     };
     let mut post = gpu.load(
@@ -409,7 +410,7 @@ fn check(sampler: &str, stage: Stage, scene: Scene, expected: [u8; 4]) {
             glint_uv: [0.; 2],
         }
     });
-    let hud = HudBatch::new(SIZE);
+    let hud = HudBatch::scratch(SIZE);
     let mut frame = fixture_frame(&hud);
     if hand {
         frame.hand = &quad;
@@ -425,6 +426,7 @@ fn check(sampler: &str, stage: Stage, scene: Scene, expected: [u8; 4]) {
 
 #[test]
 fn hand_is_in_depth1_and_excluded_from_depth2() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "all",
         Stage::Fragment,
@@ -437,6 +439,7 @@ fn hand_is_in_depth1_and_excluded_from_depth2() {
 }
 #[test]
 fn depth2_only_without_hand_excludes_water() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "depthtex2",
         Stage::Fragment,
@@ -449,6 +452,7 @@ fn depth2_only_without_hand_excludes_water() {
 }
 #[test]
 fn depth1_only_without_hand_excludes_water_control() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "depthtex1",
         Stage::Fragment,
@@ -461,6 +465,7 @@ fn depth1_only_without_hand_excludes_water_control() {
 }
 #[test]
 fn water_only_program_populates_both_opaque_snapshots() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "all",
         Stage::Fragment,
@@ -470,6 +475,7 @@ fn water_only_program_populates_both_opaque_snapshots() {
 }
 #[test]
 fn deferred_depth2_only_excludes_hand() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "depthtex2",
         Stage::Deferred,
@@ -482,6 +488,7 @@ fn deferred_depth2_only_excludes_hand() {
 }
 #[test]
 fn deferred_depth1_contains_hand_control() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "depthtex1",
         Stage::Deferred,
@@ -494,6 +501,7 @@ fn deferred_depth1_contains_hand_control() {
 }
 #[test]
 fn direct_fragment_gets_world_depth_control() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "depthtex0",
         Stage::Fragment,
@@ -503,6 +511,7 @@ fn direct_fragment_gets_world_depth_control() {
 }
 #[test]
 fn attached_compute_gets_world_depth() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "depthtex0",
         Stage::Attached,
@@ -512,6 +521,7 @@ fn attached_compute_gets_world_depth() {
 }
 #[test]
 fn compute_only_gets_world_depth_control() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "depthtex0",
         Stage::ComputeOnly,
@@ -521,6 +531,7 @@ fn compute_only_gets_world_depth_control() {
 }
 #[test]
 fn earlier_compute_child_gets_world_depth() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "depthtex0",
         Stage::EarlierCompute,
@@ -530,6 +541,7 @@ fn earlier_compute_child_gets_world_depth() {
 }
 #[test]
 fn attached_compute_depth1_without_hand_excludes_water() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "depthtex1",
         Stage::Attached,
@@ -542,6 +554,7 @@ fn attached_compute_depth1_without_hand_excludes_water() {
 }
 #[test]
 fn attached_compute_depth2_without_hand_excludes_water() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "depthtex2",
         Stage::Attached,
@@ -554,6 +567,7 @@ fn attached_compute_depth2_without_hand_excludes_water() {
 }
 #[test]
 fn attached_compute_preserves_distinct_hand_snapshots() {
+    let _gpu = crate::gfx::test_gpu::lock();
     check(
         "all",
         Stage::Attached,
@@ -593,6 +607,7 @@ pub(super) fn fixture_frame(hud: &HudBatch) -> Frame<'_> {
         skybox: false,
         end_sky: false,
         end_sky_sprite: None,
+        boss_world_fog: false,
         environment_fog: None,
         water_fog: [0.0; 3],
         fog: None,
@@ -613,6 +628,7 @@ pub(super) fn fixture_frame(hud: &HudBatch) -> Frame<'_> {
         visible_static_block_entity_sections: &[],
         static_block_entity_stats: crate::block_entity_render::StaticCacheFrameStats::default(),
         entity_motion: &[],
+        entity_motion_posed: &[],
         colored_lights: &[],
         emissive_layers: &[],
         shadow_only: &[],
@@ -669,6 +685,31 @@ fn shadow_depth_filtering(nearest: &str) -> Option<Vec<[u8; 4]>> {
 /// `shadow_depth_filtering`'s shadow map read by `reads`: `final`'s code after its declarations
 /// of shadowtex0 and shadowtex1.
 fn shadow_depth_reads(nearest: &str, reads: &str) -> Option<Vec<[u8; 4]>> {
+    // The shadow map's depth runs from 0 at its left edge to 1 at its right.
+    let ramp = [
+        [-1., -1., 0.],
+        [1., -1., 0.],
+        [1., 1., 0.],
+        [-1., -1., 0.],
+        [1., 1., 0.],
+        [-1., 1., 0.],
+    ];
+    shadow_depth_map_reads(
+        nearest,
+        reads,
+        "#version 120\nvoid main(){gl_Position=vec4(gl_Vertex.xy,gl_Vertex.x,1.0);}",
+        ramp,
+    )
+}
+
+/// A shadow map drawn by `shadow_vsh` from the two triangles `positions` (the rest keeps its
+/// clear depth, the far plane), read by `reads` as in `shadow_depth_reads`.
+fn shadow_depth_map_reads(
+    nearest: &str,
+    reads: &str,
+    shadow_vsh: &str,
+    positions: [[f32; 3]; 6],
+) -> Option<Vec<[u8; 4]>> {
     let gpu = Gpu::new()?;
     let color = gpu.texture(T::Rgba8Unorm);
     let depth = gpu.texture(T::Depth32Float);
@@ -689,8 +730,12 @@ fn shadow_depth_reads(nearest: &str, reads: &str) -> Option<Vec<[u8; 4]>> {
             attributes: vec![],
             after: String::new(),
             alpha_test: None,
+            parts: None,
             item_id_declared: false,
             far_depth: false,
+            paged_maps: false,
+            water_mask: false,
+            water_patches: false,
         }),
         ..Default::default()
     };
@@ -704,11 +749,7 @@ fn shadow_depth_reads(nearest: &str, reads: &str) -> Option<Vec<[u8; 4]>> {
                  uniform sampler2D shadowtex0;\nuniform sampler2D shadowtex1;\n{reads}"
             ),
         ),
-        // The shadow map's depth runs from 0 at its left edge to 1 at its right.
-        (
-            "shadow.vsh".into(),
-            "#version 120\nvoid main(){gl_Position=vec4(gl_Vertex.xy,gl_Vertex.x,1.0);}".into(),
-        ),
+        ("shadow.vsh".into(), shadow_vsh.into()),
         (
             "shadow.fsh".into(),
             format!("#version 120\n{settings}void main(){{gl_FragData[0]=vec4(1.0);}}"),
@@ -740,14 +781,6 @@ fn shadow_depth_reads(nearest: &str, reads: &str) -> Option<Vec<[u8; 4]>> {
         inputs,
     );
     assert!(post.has_shadow(), "{:?}", post.notes);
-    let positions: [[f32; 3]; 6] = [
-        [-1., -1., 0.],
-        [1., -1., 0.],
-        [1., 1., 0.],
-        [-1., -1., 0.],
-        [1., 1., 0.],
-        [-1., 1., 0.],
-    ];
     let vertices = gpu
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -755,7 +788,7 @@ fn shadow_depth_reads(nearest: &str, reads: &str) -> Option<Vec<[u8; 4]>> {
             contents: bytemuck::cast_slice(&positions),
             usage: wgpu::BufferUsages::VERTEX,
         });
-    let hud = HudBatch::new(SIZE);
+    let hud = HudBatch::scratch(SIZE);
     let frame = fixture_frame(&hud);
     Some(
         gpu.render(&mut post, &color, &depth, &frame, &mut |rp, list, _, _| {
@@ -769,6 +802,7 @@ fn shadow_depth_reads(nearest: &str, reads: &str) -> Option<Vec<[u8; 4]>> {
 
 #[test]
 fn shadow_depth_is_read_linearly_through_a_plain_sampler() {
+    let _gpu = crate::gfx::test_gpu::lock();
     // Iris 1.11.7 filters both (probe packs of our own; the PR has the readings).
     if let Some(pixels) = shadow_depth_filtering("") {
         all_pixels(&pixels, [255, 255, 0, 255], "shadowtex linear");
@@ -777,6 +811,7 @@ fn shadow_depth_is_read_linearly_through_a_plain_sampler() {
 
 #[test]
 fn shadow_depth_reads_filter_directly_and_with_a_texel_offset() {
+    let _gpu = crate::gfx::test_gpu::lock();
     // texture2D on the sampler itself, and textureOffset one texel to the right: both a quarter
     // texel past a centre, so each moves a quarter of the way to the next texel.
     let reads = "void main() {\n\
@@ -794,7 +829,43 @@ fn shadow_depth_reads_filter_directly_and_with_a_texel_offset() {
 }
 
 #[test]
+fn shadow_depth_filter_weights_are_256ths_as_in_our_iris_readings() {
+    let _gpu = crate::gfx::test_gpu::lock();
+    // The map is at the far plane but for texel (8, 8), which is nearer. Reads between texels
+    // (7, 7) and (8, 8) give (8, 8)'s weight: Iris 1.11.7's filtered reads on our NVIDIA GPU
+    // fit weights of 1/256 along each axis, rounded half up, and a corner's product weight
+    // rounded half up to 1/256 (#8464). Red: a read a + 0.25/256 of the way along x only
+    // moves a/256 (77). Green: at (77.25, 77.25)/256 along both, (8, 8) weighs 23/256
+    // (77 × 77 / 256 = 23.16; exact weights would give 23.31).
+    let reads = "void main() {\n\
+             float far = texelFetch(shadowtex0, ivec2(7, 7), 0).r;\n\
+             float near = texelFetch(shadowtex0, ivec2(8, 8), 0).r;\n\
+             float f = 77.25 / 256.0;\n\
+             float along = texture(shadowtex0, vec2(7.5 + f, 8.5) / 16.0).r;\n\
+             float corner = texture(shadowtex0, vec2(7.5 + f, 7.5 + f) / 16.0).r;\n\
+             float x = (far - along) / (far - near) * 256.0;\n\
+             float w = (far - corner) / (far - near) * 256.0;\n\
+             gl_FragColor = vec4(abs(x - 77.0) < 0.01 ? 1.0 : 0.0,\n\
+                 abs(w - 23.0) < 0.01 ? 1.0 : 0.0, 0.0, 1.0);\n\
+         }\n";
+    // Texel (8, 8) of the 16² map: x and y from 0 to 1/8 in clip space, depth 0.
+    let bump = [
+        [0., 0., -1.],
+        [0.125, 0., -1.],
+        [0.125, 0.125, -1.],
+        [0., 0., -1.],
+        [0.125, 0.125, -1.],
+        [0., 0.125, -1.],
+    ];
+    let vsh = "#version 120\nvoid main(){gl_Position=vec4(gl_Vertex.xyz,1.0);}";
+    if let Some(pixels) = shadow_depth_map_reads("", reads, vsh, bump) {
+        all_pixels(&pixels, [255, 255, 0, 255], "shadowtex filter weights");
+    }
+}
+
+#[test]
 fn shadowtex_nearest_settings_read_the_nearest_texel() {
+    let _gpu = crate::gfx::test_gpu::lock();
     for (line, expected) in [
         ("const bool shadowtex0Nearest = true;", [0, 255, 0, 255]),
         ("const bool shadowtexNearest = true;", [0, 255, 0, 255]),
@@ -811,10 +882,10 @@ fn shadowtex_nearest_settings_read_the_nearest_texel() {
 /// The sky program covers the horizon and downward viewing directions too.
 /// This original probe reports sky colour in RGB and window depth in alpha.
 #[test]
-#[ignore = "requires a host GPU"]
+#[ignore = "daily"]
 fn sky_covers_the_horizon_without_writing_depth_or_overpainting_terrain() {
-    let gpu = Gpu::new().expect("GPU required for the sky coverage regression");
-    assert_ne!(gpu.adapter.get_info().device_type, wgpu::DeviceType::Cpu);
+    let _gpu = crate::gfx::test_gpu::lock();
+    let gpu = Gpu::new().expect("graphics adapter required for the sky coverage regression");
     let color = gpu.texture(T::Rgba8Unorm);
     let depth = gpu.texture(T::Depth32Float);
     let files = vec![
@@ -843,7 +914,7 @@ fn sky_covers_the_horizon_without_writing_depth_or_overpainting_terrain() {
             ..Default::default()
         },
     );
-    let hud = HudBatch::new(SIZE);
+    let hud = HudBatch::scratch(SIZE);
     let mut frame = fixture_frame(&hud);
     frame.title = false;
     frame.skybox = true;

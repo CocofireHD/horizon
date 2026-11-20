@@ -8,6 +8,7 @@ fn trident() -> EntityState {
         kind: "minecraft:trident".into(),
         position: [0.5, 65.5, 0.5],
         velocity: [0.25, 0.0, 0.0],
+        acceleration_power: None,
         ..EntityState::default()
     }
 }
@@ -28,10 +29,12 @@ fn late_pairing_does_not_duplicate_or_spend_the_next_arrow_update() {
         entity_id: 1,
         spectator: false,
         permission: 0,
+        horizon: true,
         moved: false,
         position: [0.5, 64.0, 0.5],
         view_distance: 10,
         chunks: &chunks,
+        sources: None,
         tracker: &mut tracker,
         out: &mut out,
         gone: None,
@@ -42,7 +45,7 @@ fn late_pairing_does_not_duplicate_or_spend_the_next_arrow_update() {
     let mut e = trident();
     level.pair_after_tick(std::slice::from_ref(&e), &riding, &mut viewers, |_| Some(0));
     assert_eq!(level.tick, 1);
-    assert_eq!(level.states[&37].tick, 0);
+    assert_eq!(level.states.get(&37).unwrap().tick, 0);
     assert!(viewers[0].tracker.is_tracking(37));
     assert_eq!(
         viewers[0]
@@ -57,14 +60,14 @@ fn late_pairing_does_not_duplicate_or_spend_the_next_arrow_update() {
     level.pair_after_tick(std::slice::from_ref(&e), &riding, &mut viewers, |_| Some(0));
     assert!(viewers[0].out.is_empty());
     assert!(viewers[0].tracker.take_events().is_empty());
-    assert_eq!(level.states[&37].tick, 0);
+    assert_eq!(level.states.get(&37).unwrap().tick, 0);
     // It hits a block between its introduction and the next tracking pass.
     e.position[0] += 0.25;
     e.velocity = [0.0; 3];
     e.meta.push((10, serializer::BOOLEAN, Value::Bool(true)));
     level.tick(&[&e], &riding, &mut viewers, |_| Some(0));
     assert_eq!(level.tick, 2);
-    assert_eq!(level.states[&37].tick, 1);
+    assert_eq!(level.states.get(&37).unwrap().tick, 1);
     assert!(
         !viewers[0]
             .out
@@ -105,10 +108,12 @@ fn late_pairing_keeps_chunk_range_and_own_entity_filters() {
             entity_id: own,
             spectator: false,
             permission: 0,
+            horizon: true,
             moved: false,
             position: [x, 64.0, 0.5],
             view_distance: 10,
             chunks: &chunks,
+            sources: None,
             tracker: &mut tracker,
             out: &mut out,
             gone: None,
@@ -149,10 +154,12 @@ fn a_vehicle_uses_a_later_passengers_range_in_the_same_late_batch() {
             entity_id: 1,
             spectator: false,
             permission: 0,
+            horizon: true,
             moved: false,
             position: [144.5, 64.0, 0.5],
             view_distance: 10,
             chunks: &chunks,
+            sources: None,
             tracker: &mut tracker,
             out: &mut out,
             gone: None,

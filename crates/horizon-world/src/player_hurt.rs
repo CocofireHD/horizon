@@ -1,7 +1,7 @@
 //! Player difficulty/ability gates and server PvP dispatch before living hurt.
 use crate::{
     food::Difficulty,
-    living_hurt::{self, HurtState, HurtWorld},
+    living_hurt::{self, HurtState, HurtWorld, PendingHurt},
 };
 pub trait PlayerHurtWorld: HurtWorld {
     fn ability_invulnerable(&self) -> bool;
@@ -28,17 +28,26 @@ fn min(a: f32, b: f32) -> f32 {
 pub fn player_hurt_server<W: PlayerHurtWorld>(
     s: &mut HurtState<W::Source>,
     w: &mut W,
-    mut damage: f32,
+    damage: f32,
 ) -> Result<bool, W::Error> {
+    let hit = player_hurt_until_helmet(s, w, damage)?;
+    living_hurt::hurt_from_helmet(s, w, hit)
+}
+/// [`player_hurt_server`] up to `hurtHelmet`; none for a hit refused on the way.
+pub fn player_hurt_until_helmet<W: PlayerHurtWorld>(
+    s: &mut HurtState<W::Source>,
+    w: &mut W,
+    mut damage: f32,
+) -> Result<Option<PendingHurt<W::UseItem>>, W::Error> {
     if w.invulnerable(s)? {
-        return Ok(false);
+        return Ok(None);
     }
     if w.ability_invulnerable() && !w.bypasses_invulnerability(s)? {
-        return Ok(false);
+        return Ok(None);
     }
     s.no_action_time = 0;
     if w.dead_or_dying(s)? {
-        return Ok(false);
+        return Ok(None);
     }
     w.remove_shoulders(s)?;
     if w.scales_with_difficulty(s)? {
@@ -53,9 +62,9 @@ pub fn player_hurt_server<W: PlayerHurtWorld>(
         }
     }
     if damage == 0.0 {
-        return Ok(false);
+        return Ok(None);
     }
-    living_hurt::hurt_server(s, w, damage)
+    living_hurt::hurt_until_helmet(s, w, damage)
 }
 #[derive(Clone, Copy, Debug)]
 pub enum CausingEntity<P, A> {
@@ -86,23 +95,32 @@ pub fn server_player_hurt_server<W: ServerPlayerHurtWorld>(
     w: &mut W,
     damage: f32,
 ) -> Result<bool, W::Error> {
+    let hit = server_player_hurt_until_helmet(s, w, damage)?;
+    living_hurt::hurt_from_helmet(s, w, hit)
+}
+/// [`server_player_hurt_server`] up to `hurtHelmet`; none for a hit refused on the way.
+pub fn server_player_hurt_until_helmet<W: ServerPlayerHurtWorld>(
+    s: &mut HurtState<W::Source>,
+    w: &mut W,
+    damage: f32,
+) -> Result<Option<PendingHurt<W::UseItem>>, W::Error> {
     if w.invulnerable(s)? {
-        return Ok(false);
+        return Ok(None);
     }
     match w.causing_entity(s)? {
         CausingEntity::Player(p) => {
             if !w.can_harm_player(s, p)? {
-                return Ok(false);
+                return Ok(None);
             }
         }
         CausingEntity::Arrow(a) => {
-            if let Some(p) = w.arrow_player_owner(s, a)? {
-                if !w.can_harm_player(s, p)? {
-                    return Ok(false);
-                }
+            if let Some(p) = w.arrow_player_owner(s, a)?
+                && !w.can_harm_player(s, p)?
+            {
+                return Ok(None);
             }
         }
         CausingEntity::Other => {}
     }
-    player_hurt_server(s, w, damage)
+    player_hurt_until_helmet(s, w, damage)
 }

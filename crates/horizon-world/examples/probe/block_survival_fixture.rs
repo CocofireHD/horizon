@@ -1,23 +1,28 @@
 use horizon_core::geometry::VoxelShape;
-use horizon_world::{
-    block_collision::{BlockCollisionRegistry, DynamicCollisionWorld, ShulkerCollisionState},
-    block_properties::BlockPropertiesRegistry,
-    block_support::BlockSupportRegistry,
-    block_survival::{BlockSurvivalRegistry, SurvivalDefinitions, SurvivalRule, SurvivalWorld},
-    collision::CachedCollisionRegistry,
-    dynamic_support::DynamicSupportWorld,
-    fluid::{FluidKind, FluidState, FluidStateTable},
-    nbt::{self, Limits, Tag},
-    registry::{BlockRegistry, BlockStateId},
-    worldgen::tags::TagDefinitions,
-};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, BufRead, Write},
     path::Path,
     sync::Arc,
+};
+use {
+    horizon_core::{
+        nbt,
+        nbt::{Limits, Tag},
+    },
+    horizon_world::{
+        block_collision::{BlockCollisionRegistry, DynamicCollisionWorld, ShulkerCollisionState},
+        block_properties::BlockPropertiesRegistry,
+        block_support::BlockSupportRegistry,
+        block_survival::{BlockSurvivalRegistry, SurvivalDefinitions, SurvivalRule, SurvivalWorld},
+        collision::CachedCollisionRegistry,
+        dynamic_support::DynamicSupportWorld,
+        fluid::{FluidKind, FluidState, FluidStateTable},
+        registry::{BlockRegistry, BlockStateId},
+        worldgen::tags::TagDefinitions,
+    },
 };
 struct World<'a, W> {
     out: &'a mut W,
@@ -219,6 +224,9 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         &definitions,
         &tags.tags,
         &fluid_tags.tags,
+        // These probes run with no worldgen hooks installed, so no state's parts answer
+        // and the ground question changes nothing here.
+        BTreeSet::new(),
     )?;
     let mut out = io::BufWriter::new(fs::File::create(dir.join("rust.txt"))?);
     for line in io::BufReader::new(fs::File::open(dir.join("inputs.txt"))?).lines() {

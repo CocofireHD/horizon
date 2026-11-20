@@ -11,22 +11,27 @@ use horizon_client::{
     mobs::{
         Species,
         data::MobData,
-        spawn_rules::{self, Dimension, SpawnLevel},
+        spawn_rules::{self, SpawnLevel},
         spawn_selection::{self, Heightmap},
         spawning::LocalDifficulty,
     },
     patrol::{self, GameplayAttributes, Member, PatrolLevel, PatrolSpawner},
     raid::{self, Action, BarName, RaidLevel, RaidPlayer, RaiderInfo, Raids},
 };
+use horizon_core::LevelKey;
 use horizon_core::random::{LegacyRandom, RandomSource};
+use horizon_world::dimension_type::DimensionFacts;
 use horizon_world::loot::PackOverlay;
-use horizon_world::{chunk::BlockState, nbt::Tag, registry::BlockStateId};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
     fs,
     path::Path,
+};
+use {
+    horizon_core::nbt::Tag,
+    horizon_world::{chunk::BlockState, registry::BlockStateId},
 };
 
 #[derive(Clone, Copy)]
@@ -74,7 +79,7 @@ struct World<'a> {
     light: i32,
     darken: i32,
     difficulty: i32,
-    dimension: Dimension,
+    dimension: &'static DimensionFacts,
     dimension_id: String,
     unloaded: HashSet<(i32, i32)>,
     no_ticking: HashSet<(i32, i32)>,
@@ -96,14 +101,14 @@ impl World<'_> {
             .map_or((self.sky, self.light), |(_, s, b)| (*s, *b))
     }
     fn min_y(&self) -> i32 {
-        if self.dimension == Dimension::Overworld {
+        if self.dimension.id == "minecraft:overworld" {
             -64
         } else {
             0
         }
     }
     fn max_y(&self) -> i32 {
-        if self.dimension == Dimension::Overworld {
+        if self.dimension.id == "minecraft:overworld" {
             319
         } else {
             255
@@ -175,7 +180,7 @@ impl SpawnLevel for World<'_> {
     fn peaceful(&self) -> bool {
         self.difficulty == 0
     }
-    fn dimension(&self) -> Dimension {
+    fn dimension_type(&self) -> &DimensionFacts {
         self.dimension
     }
     fn surface_slime_chance(&self, _: i32, _: i32, _: i32) -> f32 {
@@ -193,7 +198,7 @@ impl PatrolLevel for World<'_> {
         self.patrols
     }
     fn bright_outside(&self) -> bool {
-        self.dimension == Dimension::Overworld && self.darken < 4
+        self.dimension.id == "minecraft:overworld" && self.darken < 4
     }
     fn patrol_players(&self) -> Vec<([i32; 3], bool)> {
         self.player
@@ -254,16 +259,21 @@ impl RaidLevel for World<'_> {
         self.loaded(c.0, c.1) && !self.no_ticking.contains(&c)
     }
     fn ravager_can_spawn(&self, [x, y, z]: [i32; 3]) -> bool {
-        spawn_rules::is_spawn_position_ok(Species::Ravager, self, x, y, z)
+        spawn_rules::is_spawn_position_ok("minecraft:ravager", Species::Ravager, self, x, y, z)
             || self.s.facts.get(self.state(x, y - 1, z)).name.as_ref() == "minecraft:snow"
                 && self.s.facts.is_air(self.state(x, y, z))
     }
-    fn player(&self) -> Option<RaidPlayer> {
-        self.player.as_ref().map(|p| RaidPlayer {
-            position: p.position,
-            block: p.block(),
-            alive: p.alive,
-        })
+    fn players(&self) -> Vec<RaidPlayer> {
+        self.player
+            .as_ref()
+            .map(|p| RaidPlayer {
+                uuid: horizon_client::lan::playerdata::ints_uuid(PLAYER_UUID),
+                position: p.position,
+                block: p.block(),
+                alive: p.alive,
+            })
+            .into_iter()
+            .collect()
     }
 }
 
@@ -440,7 +450,7 @@ fn run_codec(c: &BTreeMap<&str, &str>) -> Result<String, String> {
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
     let text = String::from_utf8(text).map_err(|e| e.to_string())?;
-    let (tag, _) = horizon_world::nbt::parse_snbt(&text)?;
+    let (tag, _) = horizon_core::nbt::parse_snbt(&text)?;
     let raids = Raids::from_nbt(&tag, 0);
     let fresh = raids.dirty && raids.map.is_empty() && raids.next_id == 1 && raids.tick == 0 && {
         // A fresh Raids is dirty; a decoded one never is.
@@ -470,8 +480,12 @@ pub fn main() -> horizon_client::Result<()> {
     let assets = Assets::load(root)?;
     let registry = assets.registry;
     let facts = BlockFacts::load(root, registry)?;
-    let data = MobData::load(root, &facts);
-    let items = Items::tags_only(root, &PackOverlay::NONE)?;
+    let data = MobData::load(
+        &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+        &facts,
+    );
+    let defaults = horizon_world::item_defaults::read(root)?;
+    let items = Items::tags_only(root, &PackOverlay::NONE, &defaults)?;
     let attributes = GameplayAttributes::load(root);
     let shared = Shared {
         facts: &facts,
@@ -548,11 +562,8 @@ pub fn main() -> horizon_client::Result<()> {
                 .unwrap_or_default()
         };
         let dimension_id = get("dim", "minecraft:overworld");
-        let dimension = match dimension_id.as_str() {
-            "minecraft:the_nether" => Dimension::Nether,
-            "minecraft:the_end" => Dimension::End,
-            _ => Dimension::Overworld,
-        };
+        let dimension =
+            DimensionFacts::of_builtin_level(LevelKey::builtin_or_overworld(&dimension_id));
         let player = c.get("p0").map(|p| {
             let mut parts = p.split('/');
             let v: Vec<f64> = parts

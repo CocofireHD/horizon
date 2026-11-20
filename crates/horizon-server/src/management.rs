@@ -11,7 +11,10 @@ use crate::{
     management_schema as schema, management_tls,
     websocket::{Link, Socket},
 };
-use horizon_server_files::properties::{ServerProperties, SystemEntropy, generate_secret_key};
+use horizon_platform::server_files::properties::{
+    OsEntropy, ServerProperties, SystemEntropy, generate_secret_key,
+};
+use horizon_server_launch::config;
 use serde_json::{Value, json};
 use std::{
     net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
@@ -47,7 +50,7 @@ pub struct Clients {
     heartbeat_cancelled: Mutex<bool>,
 }
 
-/// `DedicatedServer.getStatusHeartbeatInterval`: the seconds between the status notifications, 0 or less for
+/// `DedicatedServer.statusHeartbeatInterval`: the seconds between the status notifications, 0 or less for
 /// none.
 pub fn heartbeat_seconds(shared: &Shared) -> i32 {
     shared.management.heartbeat_seconds.load(Ordering::Relaxed)
@@ -210,11 +213,11 @@ fn valid_secret(secret: &str) -> bool {
 /// The settings when the server is on. Vanilla writes the secret it generates into server.properties; here
 /// it goes into server.toml's `[properties]` too, which writes server.properties.
 fn settings(dir: &Path) -> Result<Option<Settings>, String> {
-    let config = crate::config::Config::load(dir)?;
+    let config = config::Config::load(dir)?;
     config
         .write_properties(dir)
         .map_err(|e| format!("server.properties: {e}"))?;
-    let file = crate::config::read_properties(&dir.join(crate::config::PROPERTIES))?;
+    let file = config::read_properties(&dir.join(config::PROPERTIES))?;
     let generated = file.get("management-server-secret").is_none();
     let p = ServerProperties::new(file, &mut SystemEntropy::default())?;
     if !p.management_server_enabled {
@@ -223,8 +226,8 @@ fn settings(dir: &Path) -> Result<Option<Settings>, String> {
     let heartbeat = p.status_heartbeat_interval;
     let mut secret = p.management_server_secret;
     if generated {
-        secret = generate_secret_key(&mut SystemEntropy::default());
-        crate::config::update_all(
+        secret = generate_secret_key(&mut OsEntropy);
+        config::update_all(
             dir,
             &[(
                 "properties".into(),
@@ -247,7 +250,7 @@ fn settings(dir: &Path) -> Result<Option<Settings>, String> {
                     toml::Value::String(value.into()),
                 )
             };
-            crate::config::update_all(
+            config::update_all(
                 dir,
                 &[
                     key("management-server-tls-keystore", management_tls::GENERATED),
@@ -345,18 +348,30 @@ fn serve(
                     .map(|(_, socket)| socket.clone())
                     .collect();
                 for socket in sockets {
-                    let _ = socket.send_text(&text);
+                    // A write that timed out: that client is closed, its reader ends and
+                    // unregisters it.
+                    if socket.send_text(&text).is_err() {
+                        socket.close(1008);
+                    }
                 }
             }
         })?;
     std::thread::Builder::new()
         .name("management".into())
         .spawn(move || {
+            // Reachable by remote tools before they authenticate: at most `MAX_OPEN` at once.
+            let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             for stream in listener.incoming().flatten() {
+                let Some(slot) = http::Slot::take(&open, http::MAX_OPEN) else {
+                    continue;
+                };
                 let (shared, settings) = (shared.clone(), settings.clone());
                 let _ = std::thread::Builder::new()
                     .name("management-client".into())
-                    .spawn(move || connection(&shared, &settings, &stream));
+                    .spawn(move || {
+                        let _slot = slot;
+                        connection(&shared, &settings, &stream)
+                    });
             }
         })?;
     Ok(())
@@ -365,6 +380,8 @@ fn serve(
 static CONNECTIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn connection(shared: &Arc<Shared>, settings: &Settings, stream: &TcpStream) {
+    // A client that stops reading must not block the notification thread every client shares.
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let link = match &settings.tls {
         Some(tls) => Link::tls(stream, tls.config.clone()),
         None => Link::plain(stream),
@@ -916,6 +933,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn notifications_go_to_every_client_as_vanilla_writes_them() {
         let shared = shared();
         let address = listen_on(shared.clone(), settings());
@@ -959,6 +977,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn the_games_events_become_the_notifications_vanilla_sends() {
         let shared = shared();
         let address = listen_on(shared.clone(), settings());
@@ -1025,6 +1044,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_login_is_an_activity_notification_and_the_heartbeat_carries_the_status() {
         let shared = shared();
         let address = listen_on(
@@ -1061,6 +1081,7 @@ mod tests {
     /// `serversettings/status_heartbeat_interval/set`: the heartbeat of a server that started with none begins
     /// at once, and one that was on stops, with no restart; the interval the server reports follows.
     #[test]
+    #[ignore = "daily"]
     fn the_heartbeat_interval_can_change_while_the_server_runs() {
         let shared = shared();
         let address = listen_on(shared.clone(), settings());
@@ -1136,6 +1157,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_websocket_client_discovers_the_methods() {
         let address = listen(settings());
         let mut refused = std::net::TcpStream::connect(address).unwrap();
@@ -1157,6 +1179,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn over_tls_with_a_generated_keystore() {
         let dir =
             std::env::temp_dir().join(format!("horizon-management-wss-{}", std::process::id()));

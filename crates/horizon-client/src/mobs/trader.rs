@@ -11,10 +11,16 @@ use super::{
 };
 use horizon_core::random::RandomSource;
 
-// Trader state: `point` the wander target, `home` the place it is tied to
-// with `ints[4]` the radius, `ints[5]` the despawn delay, `flag2` whether
+// Trader state: `point` the wander target, `ints[5]` the despawn delay, `flag2` whether
 // a player is trading with it and `using_item` how long it has been
 // drinking.
+
+/// `WanderingTraderSpawner.spawn`: set the trader's visit and home.
+pub fn start_visit(m: &mut Mob, reference: [i32; 3]) {
+    m.extra.ints[5] = DESPAWN_DELAY;
+    m.extra.point = Some(reference.map(f64::from));
+    m.ai.restore_home(reference, 16);
+}
 
 /// `WanderingTraderSpawner`: how long a spawned trader stays.
 pub const DESPAWN_DELAY: i32 = 48000;
@@ -82,10 +88,7 @@ pub fn register(m: &mut Mob) {
     g.add(10, LookAtPlayer::mobs(8.0));
 }
 fn invisible(m: &Mob) -> bool {
-    m.extra.effects.iter().any(|e| e.0 == INVISIBILITY)
-}
-pub fn is_invisible(m: &Mob) -> bool {
-    invisible(m)
+    m.extra.effects.iter().any(|e| e.id == INVISIBILITY)
 }
 /// `UseItemGoal`: drink a potion of invisibility once it is dark outside,
 /// or milk to clear it by day.
@@ -104,7 +107,7 @@ impl Goal for DrinkItem {
         // Level.isDarkOutside / isBrightOutside: a dimension with a fixed
         // time (the Nether and the End) is neither dark nor bright outside,
         // so neither potion is drunk.
-        if cx.w.nether || cx.w.end {
+        if cx.w.dimension_type.has_fixed_time {
             return false;
         }
         if self.dark {
@@ -141,12 +144,12 @@ impl Goal for DrinkItem {
         if m.extra.using_item == 0 {
             return;
         }
-        m.extra.using_item += 1;
+        super::spear_use::count_use_tick(m);
         if m.extra.using_item > DRINK_TICKS {
             // LivingEntity.completeUsingItem: the potion or the milk takes effect.
             if self.dark {
-                m.extra.effects.retain(|e| e.0 != INVISIBILITY);
-                m.extra.effects.push((INVISIBILITY, 3600, 0));
+                m.retain_effects(|e| e.id != INVISIBILITY);
+                m.add_effect(INVISIBILITY, 3600, 0);
                 cx.events.push(MobEvent::Sound(
                     "entity.wandering_trader.drink_potion",
                     m.center(),
@@ -154,7 +157,7 @@ impl Goal for DrinkItem {
                     1.0,
                 ));
             } else {
-                m.extra.effects.clear();
+                m.retain_effects(|_| false);
                 cx.events.push(MobEvent::Sound(
                     "entity.wandering_trader.drink_milk",
                     m.center(),
@@ -174,8 +177,18 @@ impl Goal for TradeWithPlayer {
     fn flags(&self) -> u8 {
         MOVE | JUMP
     }
-    fn can_use(&mut self, m: &mut Mob, _: &mut Cx) -> bool {
-        m.extra.flag2 && m.alive() && !m.fluids.in_water && m.on_ground
+    fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
+        // `TradeWithPlayerGoal.canUse`: alive, dry, on the ground, not hurt
+        // recently, and within four blocks of the trading player.
+        m.extra.flag2
+            && m.alive()
+            && m.hurt_time <= 0
+            && !m.fluids.in_water
+            && m.on_ground
+            && cx
+                .w
+                .selected_player()
+                .is_some_and(|p| m.distance_sqr(p.position) <= 16.0)
     }
     fn start(&mut self, m: &mut Mob, _: &mut Cx) {
         m.nav_stop();
@@ -190,13 +203,13 @@ impl Goal for LookAtTradingPlayer {
         LOOK
     }
     fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
-        m.extra.flag2 && cx.w.player.is_some()
+        m.extra.flag2 && cx.w.selected_player().is_some()
     }
     fn every_tick(&self) -> bool {
         true
     }
     fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
-        if let Some(p) = &cx.w.player {
+        if let Some(p) = cx.w.selected_player() {
             m.look_at([p.position.x, p.eye[1], p.position.z]);
         }
     }
@@ -251,40 +264,49 @@ impl Goal for WanderToPosition {
 }
 /// `Mob.isWithinHome`.
 pub fn within_home(m: &Mob) -> bool {
-    let Some(h) = m.extra.home else { return true };
-    let r = m.extra.ints[4];
-    if r <= 0 {
+    let Some((home, radius)) = m.ai.home else {
         return true;
-    }
-    let d = (h[0] - m.position.x.floor() as i32).pow(2)
-        + (h[1] - m.position.y.floor() as i32).pow(2)
-        + (h[2] - m.position.z.floor() as i32).pow(2);
-    d < r * r
+    };
+    let pos = [
+        m.position.x.floor() as i32,
+        m.position.y.floor() as i32,
+        m.position.z.floor() as i32,
+    ];
+    super::goals::within_home(home, radius, pos)
 }
-/// `MoveTowardsRestrictionGoal`.
+/// `MoveTowardsRestrictionGoal`, also the guardian's priority-5 goal.
 #[derive(Clone, Debug)]
-struct MoveTowardsRestriction {
+pub(crate) struct MoveTowardsRestriction {
     speed: f64,
     wanted: [f64; 3],
+    /// `setFlags(MOVE, LOOK)`, which `Guardian.registerGoals` adds to it.
+    look: bool,
 }
 impl MoveTowardsRestriction {
-    fn new(speed: f64) -> Self {
+    pub(crate) fn new(speed: f64) -> Self {
         Self {
             speed,
             wanted: [0.0; 3],
+            look: false,
         }
+    }
+    pub(crate) fn looking(mut self) -> Self {
+        self.look = true;
+        self
     }
 }
 impl Goal for MoveTowardsRestriction {
     goal_clone!();
     fn flags(&self) -> u8 {
-        MOVE
+        if self.look { MOVE | LOOK } else { MOVE }
     }
     fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
         if within_home(m) {
             return false;
         }
-        let Some(h) = m.extra.home else { return false };
+        let Some((h, _)) = m.ai.home else {
+            return false;
+        };
         let to = [
             f64::from(h[0]) + 0.5,
             f64::from(h[1]),
@@ -317,6 +339,7 @@ pub fn ai_step(m: &mut Mob, _w: &MobWorld) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use horizon_world::dimension_type::DimensionFacts;
 
     #[test]
     fn despawn_delay_is_two_days() {
@@ -326,63 +349,165 @@ mod tests {
     /// `UseItemGoal` for the wandering trader: the End has a fixed time, so
     /// it is neither dark nor bright outside and the trader drinks nothing.
     #[test]
+    #[ignore = "daily"]
     fn a_trader_does_not_drink_in_the_end() {
         use crate::mobs::world::with_test_world;
         use horizon_core::geometry::Vec3;
-        use horizon_core::random::LegacyRandom;
         use std::sync::Arc;
-        let _ = with_test_world(&[], |w, types| {
-            let kind = Arc::new(types.types["minecraft:wandering_trader"].clone());
-            let mut m = Mob::new(1, kind, Vec3::new(0.5, 80.0, 0.5), 0.0);
-            let mut potion = DrinkItem {
-                item: "minecraft:potion",
-                finish_sound: "entity.wandering_trader.disappeared",
-                dark: true,
-            };
-            let mut milk = DrinkItem {
-                item: "minecraft:milk_bucket",
-                finish_sound: "entity.wandering_trader.reappeared",
-                dark: false,
-            };
-            let decide =
-                |world: &MobWorld, m: &mut Mob, potion: &mut DrinkItem, milk: &mut DrinkItem| {
-                    let mut lr = LegacyRandom::new(1);
+        assert!(
+            with_test_world(&[], |w, types| {
+                let kind = Arc::new(types.types["minecraft:wandering_trader"].clone());
+                let mut m = Mob::new(1, kind, Vec3::new(0.5, 80.0, 0.5), 0.0);
+                let mut potion = DrinkItem {
+                    item: "minecraft:potion",
+                    finish_sound: "entity.wandering_trader.disappeared",
+                    dark: true,
+                };
+                let mut milk = DrinkItem {
+                    item: "minecraft:milk_bucket",
+                    finish_sound: "entity.wandering_trader.reappeared",
+                    dark: false,
+                };
+                let decide = |world: &MobWorld,
+                              m: &mut Mob,
+                              potion: &mut DrinkItem,
+                              milk: &mut DrinkItem| {
+                    let mut test_level = crate::health::TestLevel::new(1);
                     let mut events = Vec::new();
                     let mut cx = Cx {
                         w: world,
-                        lr: &mut lr,
+                        level: &mut test_level.level(),
                         events: &mut events,
                     };
                     let dark = potion.can_use(m, &mut cx);
                     let day = milk.can_use(m, &mut cx);
                     (dark, day)
                 };
-            let mut night = w.clone();
-            night.daylight = false;
-            night.end = false;
-            night.nether = false;
-            assert_eq!(
-                decide(&night, &mut m, &mut potion, &mut milk),
-                (true, false)
-            );
-            let mut end_dark = night.clone();
-            end_dark.end = true;
-            assert_eq!(
-                decide(&end_dark, &mut m, &mut potion, &mut milk),
-                (false, false)
-            );
-            m.extra.effects.push((INVISIBILITY, 3600, 0));
-            let mut day = w.clone();
-            day.daylight = true;
-            day.end = false;
-            day.nether = false;
-            assert_eq!(decide(&day, &mut m, &mut potion, &mut milk), (false, true));
-            let mut end_bright = day.clone();
-            end_bright.end = true;
-            assert_eq!(
-                decide(&end_bright, &mut m, &mut potion, &mut milk),
-                (false, false)
-            );
-        });
+                let mut night = w.clone();
+                night.daylight = false;
+                night.dimension_type = DimensionFacts::overworld();
+                assert_eq!(
+                    decide(&night, &mut m, &mut potion, &mut milk),
+                    (true, false)
+                );
+                let mut end_dark = night.clone();
+                end_dark.dimension_type = DimensionFacts::vanilla("minecraft:the_end").unwrap();
+                assert_eq!(
+                    decide(&end_dark, &mut m, &mut potion, &mut milk),
+                    (false, false)
+                );
+                m.extra
+                    .effects
+                    .push(crate::mobs::StoredEffect::new(INVISIBILITY, 3600, 0));
+                let mut day = w.clone();
+                day.daylight = true;
+                day.dimension_type = DimensionFacts::overworld();
+                assert_eq!(decide(&day, &mut m, &mut potion, &mut milk), (false, true));
+                let mut end_bright = day.clone();
+                end_bright.dimension_type = DimensionFacts::vanilla("minecraft:the_end").unwrap();
+                assert_eq!(
+                    decide(&end_bright, &mut m, &mut potion, &mut milk),
+                    (false, false)
+                );
+            }),
+            "vanilla data is missing"
+        );
     }
+}
+
+#[cfg(test)]
+mod trade_start_tests {
+    use super::*;
+    use crate::mobs::world::{test_player, with_test_world};
+    use horizon_core::geometry::Vec3;
+    use std::sync::Arc;
+
+    /// `TradeWithPlayerGoal.canUse`: alive, dry, on the ground, not hurt
+    /// recently and within four blocks of the trading player. A hurt trader,
+    /// or one whose customer walked away, must not start the stand-still goal.
+    #[test]
+    #[ignore = "daily"]
+    fn a_trader_stops_trading_when_hurt_or_out_of_reach() {
+        let mut outcomes = Vec::new();
+        let ran = with_test_world(&[], |w, types| {
+            let kind = Arc::new(types.types["minecraft:wandering_trader"].clone());
+            for (label, hurt_time, distance) in [
+                ("trading", 0, 2.0),
+                ("hurt", 5, 2.0),
+                ("out of reach", 0, 5.0),
+            ] {
+                let mut m = Mob::new(1, kind.clone(), Vec3::new(0.5, 64.0, 0.5), 0.0);
+                m.extra.flag2 = true;
+                m.on_ground = true;
+                m.hurt_time = hurt_time;
+                m.ai.goals.add(1, TradeWithPlayer);
+                let mut world = w.clone();
+                world.player = Some(test_player(Vec3::new(0.5 + distance, 64.0, 0.5)));
+                let mut fixture = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut fixture.level(),
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut m.ai.goals);
+                goals.tick(&mut m, &mut cx);
+                outcomes.push((label, goals.is_running("TradeWithPlayer")));
+                m.ai.goals = goals;
+            }
+        });
+        if !ran {
+            return;
+        }
+        assert_eq!(
+            outcomes,
+            vec![("trading", true), ("hurt", false), ("out of reach", false)],
+            "TradeWithPlayerGoal starts only for an unhurt trader within four blocks"
+        );
+    }
+}
+
+#[cfg(test)]
+mod use_overflow_tests {
+    use super::*;
+    use crate::mobs::world::{test_player, with_test_world};
+    use horizon_core::geometry::Vec3;
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "daily"]
+    fn trader_drink_completes_at_max_use_counter() {
+        assert!(
+            with_test_world(&[], |w, types| {
+                let kind = Arc::new(types.types["minecraft:wandering_trader"].clone());
+                let mut m = Mob::new(1, kind, Vec3::new(0.5, 80.0, 0.5), 0.0);
+                m.extra.using_item = i32::MAX;
+                let mut world = w.clone();
+                world.player = Some(test_player(Vec3::new(2.5, 80.0, 0.5)));
+                let mut goal = DrinkItem {
+                    item: "minecraft:potion",
+                    finish_sound: "entity.wandering_trader.disappeared",
+                    dark: true,
+                };
+                let mut fixture = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                goal.tick(
+                    &mut m,
+                    &mut Cx {
+                        w: &world,
+                        level: &mut fixture.level(),
+                        events: &mut events,
+                    },
+                );
+                assert_eq!(m.extra.using_item, 0);
+                assert!(invisible(&m));
+            }),
+            "prepared mob resources required"
+        );
+    }
+}
+
+/// Whether the wandering trader currently has invisibility.
+pub fn is_invisible(m: &Mob) -> bool {
+    invisible(m)
 }

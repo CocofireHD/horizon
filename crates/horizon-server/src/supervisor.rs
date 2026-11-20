@@ -5,9 +5,12 @@
 
 use crate::{
     api::{self, Phase, Shared},
-    backup, config,
-    config::Config,
-    engine, signals, update,
+    backup, engine, prune, signals,
+    update::{self, UpdateInstall},
+};
+use horizon_server_launch::{
+    self as launch,
+    config::{self, Config},
 };
 use serde_json::json;
 use std::{
@@ -77,7 +80,7 @@ pub(crate) fn retried<T>(mut attempt: impl FnMut() -> Result<T, String>) -> Resu
 
 /// `[prune_chunks]` (prune.rs): a dry run in the background while the game starts, a delete before it
 /// starts. `mode` goes back to "off" first, so a crash halfway never repeats it unasked.
-fn prune_chunks(shared: &Arc<Shared>, dir: &Path, config: &Config) {
+fn prune_chunks(shared: &Arc<Shared>, dir: &Path, config: &Config) -> Result<(), String> {
     use crate::prune;
     let settings = config.prune_chunks.clone();
     if let Err(e) = config::update(
@@ -86,13 +89,14 @@ fn prune_chunks(shared: &Arc<Shared>, dir: &Path, config: &Config) {
         "mode",
         toml::Value::String("off".into()),
     ) {
-        return note(
+        note(
             shared,
             "WARN",
             &format!(
                 "Chunk prune not run: server.toml's prune_chunks.mode can't be set back to \"off\" ({e})"
             ),
         );
+        return Ok(());
     }
     let world = dir.join(&config.world.name);
     let threads = thread::available_parallelism().map_or(2, |n| n.get());
@@ -112,16 +116,21 @@ fn prune_chunks(shared: &Arc<Shared>, dir: &Path, config: &Config) {
         Err(e) => note(
             shared,
             "ERROR",
-            &format!("Chunk prune stopped before deleting anything: {e}"),
+            &format!("Chunk prune failed; some files may already have been changed: {e}"),
         ),
     };
-    if settings.mode == prune::Mode::Delete {
+    if settings.mode == horizon_server_launch::prune::Mode::Delete {
         note(
             shared,
             "INFO",
             "Chunk prune: deleting barely visited chunks before the game starts (server.toml [prune_chunks])",
         );
-        finish(shared, dir, prune::run(&world, &settings, true, threads));
+        let result = prune::run(&world, &settings, true, threads);
+        let failure = result.as_ref().err().cloned();
+        finish(shared, dir, result);
+        if let Some(e) = failure {
+            return Err(e);
+        }
     } else {
         note(
             shared,
@@ -134,6 +143,26 @@ fn prune_chunks(shared: &Arc<Shared>, dir: &Path, config: &Config) {
             finish(&shared, &dir, result);
         });
     }
+    Ok(())
+}
+
+/// Run before every engine start, not only when the one-shot prune setting is still enabled.
+fn prepare_world(shared: &Arc<Shared>, dir: &Path, config: &Config) -> Result<(), String> {
+    let world = dir.join(&config.world.name);
+    prune::recover(&world)?;
+    if config.prune_chunks.mode != horizon_server_launch::prune::Mode::Off
+        && let Err(e) = prune_chunks(shared, dir, config)
+    {
+        // A failed region rolls itself back: with no journal left, the world is whole (the regions
+        // pruned before it stay pruned) and the server starts. Only a pending recovery stops it.
+        prune::recover(&world)?;
+        note(
+            shared,
+            "WARN",
+            &format!("Chunk prune failed, the server starts without the rest of it: {e}"),
+        );
+    }
+    Ok(())
 }
 
 enum Exit {
@@ -164,8 +193,8 @@ struct Watch {
 pub fn run(dir: &Path) -> Result<(), String> {
     signals::install();
     let config = Config::load(dir)?;
-    let program = engine::program(&config, dir)?;
-    let resources = engine::resources(&config, dir, Some(&program))?;
+    let program = launch::program(&config, dir)?;
+    let resources = launch::resources(&config, dir, Some(&program))?;
     // Half-copied game files would only crash the engine again at every restart: name what is missing.
     engine::check_prepared(&resources)?;
     // A game the system can't load would only crash again at every restart: say why at once.
@@ -213,17 +242,20 @@ pub fn run(dir: &Path) -> Result<(), String> {
         // Read again before every start: edits to server.toml apply on the next restart, and so does a
         // switch to another release.
         let config = Config::load(dir)?;
-        if let Ok(found) = engine::program_in(&config, dir, shared.install.as_ref())
-            && let Ok(found_resources) = engine::resources(&config, dir, Some(&found))
+        // Queued while the game ran, stopped or was already stopping: applied before this start,
+        // whatever ended the last game, not left for some later restart.
+        if let Some(w) = apply_queued(&shared, dir, &config) {
+            watch = Some(w);
+        }
+        if let Ok(found) = launch::program_in(&config, dir, shared.install.as_ref())
+            && let Ok(found_resources) = launch::resources(&config, dir, Some(&found))
         {
             (program, resources) = (found, found_resources);
         }
         let written = config
             .write_properties(dir)
             .map_err(|e| format!("server.properties: {e}"))?;
-        if config.prune_chunks.mode != crate::prune::Mode::Off {
-            prune_chunks(&shared, dir, &config);
-        }
+        prepare_world(&shared, dir, &config)?;
         note(
             &shared,
             "INFO",
@@ -235,14 +267,32 @@ pub fn run(dir: &Path) -> Result<(), String> {
         );
         shared.set_phase(Phase::Starting);
         let transfers = config.transfer.engine_arg();
-        let mut child = engine::spawn(
+        // The claims on the folders the game leases live as long as the game: the next start takes
+        // them again on the release `current` points at then.
+        let spawned = engine::spawn(
             &program,
             &resources,
             dir,
             config.engine.low_memory,
+            config.engine.parallel_tick,
+            &config.entities,
             transfers.as_deref(),
-        )
-        .map_err(|e| format!("{}: {e}", program.display()))?;
+        );
+        let (mut child, _leases) = match spawned {
+            Ok(spawned) => spawned,
+            // `apply_queued` has already moved `current` to the new release, so a start that never
+            // produced a game goes back like a game that came up and stopped.
+            Err(error) => match watch.take() {
+                Some(w) => {
+                    roll_back(&shared, dir, &config, &w, &error);
+                    if shared.shutdown.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                None => return Err(error),
+            },
+        };
         {
             let mut state = shared.state.lock().unwrap();
             state.engine_pid = Some(child.id());
@@ -300,36 +350,8 @@ pub fn run(dir: &Path) -> Result<(), String> {
                 return Ok(());
             }
             Exit::NotUp => continue,
-            Exit::Restart => {
-                let restore = shared.restore.lock().unwrap().take();
-                if let Some((name, dimension)) = restore {
-                    let done = match &dimension {
-                        Some(d) => backup::restore_dimension(dir, &config, &name, d),
-                        None => backup::restore(dir, &config, &name),
-                    };
-                    let name = match &dimension {
-                        Some(d) => format!("{name} ({d})"),
-                        None => name,
-                    };
-                    match done {
-                        Ok(Some(old)) => note(
-                            &shared,
-                            "INFO",
-                            &format!(
-                                "Restored {name}; the world it replaced is in {}",
-                                old.display()
-                            ),
-                        ),
-                        Ok(None) => note(&shared, "INFO", &format!("Restored {name}")),
-                        Err(e) => note(&shared, "ERROR", &format!("Could not restore {name}: {e}")),
-                    }
-                }
-                let pending = shared.update.lock().unwrap().pending.take();
-                if let Some((to, timeout)) = pending {
-                    watch = switch(&shared, dir, &config, &to, timeout);
-                }
-                continue;
-            }
+            // A restore or update asked for is applied at the head of the loop, before every start.
+            Exit::Restart => continue,
             Exit::Crashed(status) => status,
         };
         {
@@ -372,6 +394,36 @@ pub fn run(dir: &Path) -> Result<(), String> {
     }
 }
 
+/// The restore and the release switch asked for since the last start, done now: the world is
+/// replaced and `current` moved before the next game starts. The switch's [`Watch`], if any.
+fn apply_queued(shared: &Shared, dir: &Path, config: &Config) -> Option<Watch> {
+    let restore = shared.restore.lock().unwrap().take();
+    if let Some((name, dimension)) = restore {
+        let done = match &dimension {
+            Some(d) => backup::restore_dimension(dir, config, &name, d),
+            None => backup::restore(dir, config, &name),
+        };
+        let name = match &dimension {
+            Some(d) => format!("{name} ({d})"),
+            None => name,
+        };
+        match done {
+            Ok(Some(old)) => note(
+                shared,
+                "INFO",
+                &format!(
+                    "Restored {name}; the world it replaced is in {}",
+                    old.display()
+                ),
+            ),
+            Ok(None) => note(shared, "INFO", &format!("Restored {name}")),
+            Err(e) => note(shared, "ERROR", &format!("Could not restore {name}: {e}")),
+        }
+    }
+    let pending = shared.update.lock().unwrap().pending.take();
+    pending.and_then(|(to, timeout)| switch(shared, dir, config, &to, timeout))
+}
+
 /// With the game stopped: backs the world up, points `current` at the release `to` and checks that its game
 /// loads on this system. What to watch while it starts; `None` when it stayed on the release it was on.
 fn switch(
@@ -381,6 +433,8 @@ fn switch(
     to: &str,
     timeout: Duration,
 ) -> Option<Watch> {
+    // `Instant + Duration` panics past its range: this runs after nothing is switched yet.
+    let timeout = timeout.min(crate::api::MAX_UPDATE_TIMEOUT);
     let Some(install) = shared.install.as_ref() else {
         shared.finish_update(
             false,
@@ -415,7 +469,7 @@ fn switch(
         return None;
     }
     if let Err(e) =
-        engine::program_in(config, dir, Some(install)).and_then(|p| engine::check_starts(&p))
+        launch::program_in(config, dir, Some(install)).and_then(|p| engine::check_starts(&p))
     {
         let back = install
             .switch_back(&from, previous.as_deref())
@@ -562,6 +616,12 @@ fn console_lines() -> mpsc::Receiver<String> {
 
 /// Copies the game's output to ours and to the API's log, line by line; the game's `Done` line means it
 /// is up.
+/// The message of a game's INFO log line (`[12:00:00] [Server thread/INFO]: Done (…`), from the
+/// first `/INFO]: ` on; "" for any other line.
+fn info_message(line: &str) -> &str {
+    line.split_once("/INFO]: ").map_or("", |(_, m)| m)
+}
+
 fn pump(shared: &Arc<Shared>, from: impl Read + Send + 'static, to_stderr: bool) {
     let shared = shared.clone();
     let _ = thread::Builder::new()
@@ -573,7 +633,10 @@ fn pump(shared: &Arc<Shared>, from: impl Read + Send + 'static, to_stderr: bool)
                     eprintln!("{line}");
                 } else {
                     println!("{line}");
-                    if line.contains("/INFO]: Done (") {
+                    // The game's own message, not text a player put in it: chat is logged after
+                    // `/INFO]: <name> `, so a player typing `/INFO]: Stopping server` matches nothing.
+                    let message = info_message(&line);
+                    if message.starts_with("Done (") {
                         let up = {
                             let mut state = shared.state.lock().unwrap();
                             let starting = state.phase == Phase::Starting;
@@ -586,8 +649,11 @@ fn pump(shared: &Arc<Shared>, from: impl Read + Send + 'static, to_stderr: bool)
                             shared.emit("phase", serde_json::json!({ "phase": "running" }));
                             crate::management::started(&shared);
                         }
-                    } else if line.contains("/INFO]: Stopping server") {
-                        // The game's own `stop` (a command in the game, not the supervisor's).
+                    } else if message.starts_with("Stopping server")
+                        || message.starts_with("Stopping in ")
+                    {
+                        // The game's own `stop` (a command in the game, not the supervisor's), or the
+                        // start of the wait `[transfer]` makes before it, so a proxy hears of it then.
                         crate::management::stopping(&shared);
                     }
                 }
@@ -616,7 +682,7 @@ fn sample(shared: Arc<Shared>) {
                     continue;
                 };
                 let now = Instant::now();
-                let cpu = horizon_bench::cpu_seconds(pid);
+                let cpu = horizon_platform::bench::cpu_seconds(pid);
                 let cpu_percent = match (previous, cpu) {
                     (Some((p, at, before)), Some(cpu)) if p == pid => {
                         Some((cpu - before) / now.duration_since(at).as_secs_f64() * 100.0)
@@ -637,7 +703,7 @@ fn sample(shared: Arc<Shared>) {
                         control = None;
                         None
                     });
-                let rss = horizon_bench::rss_bytes(pid);
+                let rss = horizon_platform::bench::rss_bytes(pid);
                 shared.record(json!({
                     "t": std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -670,7 +736,7 @@ fn schedule_backups(shared: Arc<Shared>) {
                 let Ok(config) = Config::load(&shared.dir) else {
                     continue;
                 };
-                let Ok(Some(every)) = backup::interval(&config.backups.every) else {
+                let Ok(Some(every)) = config.backups.interval() else {
                     continue;
                 };
                 if last.elapsed() < every || shared.state.lock().unwrap().phase != Phase::Running {
@@ -777,7 +843,9 @@ fn supervise(
                 shared.set_phase(Phase::Stopping);
                 crate::management::stopping(shared);
                 send_stop(&mut stdin);
-            } else {
+            } else if signal {
+                // A second Ctrl-C (or signal) from a person: at once. A repeated API or management
+                // stop does nothing more, as vanilla's second halt does: the game is saving.
                 note(shared, "WARN", "Stopping the game at once, without saving");
                 let _ = child.kill();
             }
@@ -847,6 +915,104 @@ fn send_stop(stdin: &mut Option<std::process::ChildStdin>) {
 mod tests {
     use super::*;
 
+    /// A restore asked for while the game is stopped is done before the next start (the loop's
+    /// head runs `apply_queued`), not left queued for some later restart.
+    #[test]
+    #[ignore = "daily"]
+    fn a_queued_restore_is_done_before_the_next_start() {
+        let dir =
+            std::env::temp_dir().join(format!("horizon-server-queued-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = Config::default();
+        let world = dir.join("world");
+        std::fs::create_dir_all(&world).unwrap();
+        std::fs::write(world.join("level.dat"), b"before").unwrap();
+        std::fs::write(dir.join("server.toml"), crate::config::TEMPLATE).unwrap();
+        let name = backup::file_name(std::time::SystemTime::now(), None).unwrap();
+        backup::create(&dir, &config, &name).unwrap();
+        std::fs::write(world.join("level.dat"), b"after").unwrap();
+        let shared = Shared::new(&dir);
+        *shared.restore.lock().unwrap() = Some((name, None));
+        assert!(apply_queued(&shared, &dir, &config).is_none());
+        assert_eq!(std::fs::read(world.join("level.dat")).unwrap(), b"before");
+        assert!(shared.restore.lock().unwrap().is_none(), "no longer queued");
+        // Nothing queued: nothing done.
+        std::fs::write(world.join("level.dat"), b"again").unwrap();
+        assert!(apply_queued(&shared, &dir, &config).is_none());
+        assert_eq!(std::fs::read(world.join("level.dat")).unwrap(), b"again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_cannot_pass_for_the_games_own_stopping_line() {
+        let stopping = |line: &str| {
+            let m = info_message(line);
+            m.starts_with("Stopping server") || m.starts_with("Stopping in ")
+        };
+        assert!(stopping("[12:00:00] [Server thread/INFO]: Stopping server"));
+        assert!(stopping(
+            "[12:00:00] [Server thread/INFO]: Stopping in 10 seconds"
+        ));
+        assert!(!stopping(
+            "[12:00:00] [Server thread/INFO]: <Kim> /INFO]: Stopping server"
+        ));
+        assert!(!stopping(
+            "[12:00:00] [Server thread/INFO]: [Kim: Stopping server]"
+        ));
+        assert!(
+            info_message("[12:00:00] [Server thread/INFO]: Done (2.1s)!").starts_with("Done (")
+        );
+    }
+
+    #[test]
+    fn a_prune_that_rolled_back_still_lets_the_server_start() {
+        let (dir, ow) = prune::tests::world("supervisor-rolled-back");
+        // The kept entity record of r.2.0 can't be read: that region fails and rolls back.
+        let entity = ow.join("entities/r.2.0.mca");
+        let mut broken = std::fs::read(&entity).unwrap();
+        broken[8192..8196].copy_from_slice(&u32::MAX.to_be_bytes());
+        std::fs::write(&entity, &broken).unwrap();
+        let terrain = std::fs::read(ow.join("region/r.2.0.mca")).unwrap();
+        std::fs::write(dir.join("server.toml"), crate::config::TEMPLATE).unwrap();
+        let mut config = Config::load(&dir).unwrap();
+        config.prune_chunks.mode = horizon_server_launch::prune::Mode::Delete;
+        config.prune_chunks.spawn_radius = 4;
+        let shared = Shared::with_install(&dir, None);
+        prepare_world(&shared, &dir, &config).unwrap();
+        assert_eq!(std::fs::read(ow.join("region/r.2.0.mca")).unwrap(), terrain);
+        assert_eq!(std::fs::read(&entity).unwrap(), broken);
+        assert!(!ow.join(".horizon-prune").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unrecoverable_prune_blocks_start_even_with_mode_off() {
+        let dir =
+            std::env::temp_dir().join(format!("horizon-server-prune-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("server.toml"), crate::config::TEMPLATE).unwrap();
+        let config = Config::load(&dir).unwrap();
+        assert_eq!(
+            config.prune_chunks.mode,
+            horizon_server_launch::prune::Mode::Off
+        );
+        let dimension = dir.join(&config.world.name);
+        std::fs::create_dir_all(dimension.join("region")).unwrap();
+        let pending = dimension.join(".horizon-prune");
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::write(
+            pending.join("journal.json"),
+            br#"{"name":"r.2.0.mca","kinds":["region"]}"#,
+        )
+        .unwrap();
+        let shared = Shared::with_install(&dir, None);
+        let error = prepare_world(&shared, &dir, &config).unwrap_err();
+        assert!(error.contains("world was not opened"), "{error}");
+        assert!(pending.join("journal.json").is_file());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn backoff_doubles_up_to_five_minutes() {
         let waits: Vec<u64> = (1..=8).map(|n| backoff(n).as_secs()).collect();
@@ -880,12 +1046,13 @@ mod tests {
         let dir = root.join("server");
         std::fs::create_dir_all(dir.join("world")).unwrap();
         std::fs::write(dir.join("world/level.dat"), "before").unwrap();
-        let install = update::Install { root };
+        let install = launch::Install { root };
         (Shared::with_install(&dir, Some(install)), dir)
     }
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "daily"]
     fn a_switch_backs_up_then_rolls_back_world_and_release() {
         let (shared, dir) = installed("rollback", &[("v1", 0), ("v2", 0)]);
         let install = shared.install.clone().unwrap();
@@ -933,6 +1100,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "daily"]
     fn a_game_that_comes_up_ends_the_update_and_prunes_old_releases() {
         let (shared, dir) = installed("prune", &[("v1", 0), ("v2", 0), ("v3", 0)]);
         let install = shared.install.clone().unwrap();
@@ -956,6 +1124,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "daily"]
     fn a_game_that_cant_load_is_never_switched_to() {
         let (shared, dir) = installed("unloadable", &[("v1", 0), ("v2", 127)]);
         let install = shared.install.clone().unwrap();
@@ -1041,6 +1210,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "daily"]
     fn a_management_stop_ends_the_supervisor_and_a_stop_in_game_keeps_it() {
         let dir = std::env::temp_dir().join(format!("horizon-server-stop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -14,6 +14,7 @@
         },
         "engine": {
           "low_memory": false,
+          "parallel_tick": false,
           "path": "",
           "resources": "",
           "restart_on_crash": true
@@ -21,11 +22,16 @@
         "panel": {"allow_public": false, "bind": "127.0.0.1:8130"},
         "properties": {},
         "server": {
+          "accept_older_clients": false,
           "admin_feedback_to_ops": true,
           "bind": "",
           "enforce_whitelist": false,
           "max_players": 20,
           "max_view_distance": 0,
+          "max_viewed_loaded_chunks": 2048,
+          "max_viewed_loaded_chunks_per_level": 16384,
+          "max_viewed_ticking_chunks": 441,
+          "max_viewed_ticking_chunks_per_level": 3528,
           "motd": "A Minecraft Server",
           "online_mode": true,
           "port": 25565,
@@ -38,7 +44,9 @@
           "expect_seconds": 10,
           "max_expect_seconds": 60,
           "max_expected": 64,
-          "max_freeze_seconds": 30
+          "max_freeze_seconds": 30,
+          "max_hold_seconds": 60,
+          "stop_wait_seconds": 10
         },
         "updates": {"keep": 1},
         "world": {

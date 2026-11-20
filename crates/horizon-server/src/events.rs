@@ -146,6 +146,8 @@ pub fn route(shared: &Arc<Shared>, request: &Request) -> Response {
     let shared = shared.clone();
     let mut response = Response::text(200, "text/event-stream", "");
     response.stream = Some(Box::new(move |mut stream| {
+        // A client that stops reading would otherwise hold this thread in a write for good.
+        let _ = stream.set_write_timeout(Some(KEEP_ALIVE * 2));
         let mut quiet_since = Instant::now();
         loop {
             let events = {
@@ -240,6 +242,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_stream_sends_what_happens() {
         use std::io::{BufRead, BufReader};
         let dir =
@@ -295,6 +298,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn event_replies_match_api_v1_goldens() {
         use std::io::Read;
 

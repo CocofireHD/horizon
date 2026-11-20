@@ -9,7 +9,8 @@ widget id instead: the title screen, the options (a slider set by id) and the in
 the options scenario reads and sets options.txt values by key; the events scenario waits for
 states (wait-for) and reads the event log; the consume scenario eats and drinks consumables (a
 golden apple, milk, honey, chorus fruit) and checks their effects, remainders and teleport, then
-holds an eye of ender in use and the sprint key with and without blindness; the use-screen
+holds an eye of ender in use and the sprint key with and without blindness; the copper-chest
+scenario checks a copper chest doesn't weather while a player or a copper golem has it open; the use-screen
 scenario opens the inventory and the chat over an item in use and checks the use is released, not
 eaten behind the GUI; the pick scenario
 middle-clicks slots (AbstractContainerScreen's cloning): a full stack in creative, from the hotbar
@@ -55,10 +56,10 @@ POSITIONAL = {
     'goto': ['x', 'y', 'z'], 'break': ['x', 'y', 'z'], 'place': ['x', 'y', 'z'], 'block': ['x', 'y', 'z'],
     'find_block': ['block', 'radius'], 'entities': ['radius', 'type'], 'click_slot': ['slot'],
     'click_button': ['label'], 'type': ['text'], 'wait': ['ticks'], 'wait_ready': ['seconds'],
-    'command': ['command'], 'look_at_block': ['x', 'y', 'z'], 'click': ['id'], 'set': ['id', 'value'],
+    'command': ['command'], 'look_at_block': ['x', 'y', 'z', 'face'], 'click': ['id'], 'set': ['id', 'value'],
     'give': ['item', 'count'], 'options_get': ['keys'], 'options_set': ['key', 'value'],
     'record_start': ['name'], 'record_replay': ['name'], 'repro_export': ['name', 'path'],
-    'turn': ['dyaw', 'dpitch'],
+    'turn': ['dyaw', 'dpitch'], 'interact': ['x', 'y', 'z', 'face'],
     'wait_for': ['condition', 'value'], 'open': ['world', 'seed', 'mode'], 'select': ['slot'],
     'summon': ['kind', 'x', 'y', 'z'], 'interact_entity': ['id'], 'effect': ['id', 'seconds', 'amplifier'],
     'xp': ['levels'], 'options': ['page'], 'lan': ['action'], 'world_backup': ['folder'],
@@ -73,9 +74,9 @@ class Failed(Exception):
 
 
 def game_env(screen, home=None):
-    """The environment of a game: lab.game_env with HORIZON_HOME `home` (a scratch folder when None), no live-count
-    ping, and on Linux the virtual screen `screen` (macOS and Windows have none)."""
-    extra = {'HORIZON_TELEMETRY_URL': 'off'}  # no live-count ping from test games
+    """The environment of a game: lab.game_env with HORIZON_HOME `home` (a scratch folder when None),
+    and on Linux the virtual screen `screen` (macOS and Windows have none)."""
+    extra = {}
     if home is not None:
         extra['HORIZON_HOME'] = home
     if sys.platform in ('darwin', 'win32'):
@@ -105,11 +106,14 @@ class Cli:
         cmd = tool.replace('_', '-')
         positional = [str(args.pop(k)) for k in POSITIONAL.get(tool, []) if k in args]
         options = []
+        # commands.rs declares flag names with hyphens (no-world, in-place, keep-world); Python
+        # kwargs use underscores, so translate them before building --flag words. A boolean flag
+        # is a bare `--flag`; the BARE names are positional bool opts and stay bare words.
         for k, v in args.items():
             if v is True:
-                options.append(k if k in BARE.get(tool, []) else '--' + k)
+                options.append(k if k in BARE.get(tool, []) else '--' + k.replace('_', '-'))
             elif v is not False and v is not None:
-                options += ['--' + k, str(v)]
+                options += ['--' + k.replace('_', '-'), str(v)]
         # Options first: free text (type, command) runs to the end of the line.
         words = [cmd] + (options + positional if tool in ('type', 'command') else positional + options)
         if tool == 'screenshot':
@@ -335,7 +339,7 @@ def ui_scenario(d, out):
     if 'game' not in widgets(d):  # with no worlds, Singleplayer opens Create New World itself
         d('click', id='create-new-world')
     tree = widgets(d)
-    assert tree['game']['kind'] == 'button' and any(w['kind'] == 'field' for w in tree.values()), tree
+    assert tree['game']['kind'] == 'tab' and any(w['kind'] == 'field' for w in tree.values()), tree
     d('type', field='name', replace=True, text='UI World')
     d('click', id='create-new-world')
     d('wait_for', condition='loaded', timeout=400)  # a few frames later, as in the survival scenario
@@ -403,9 +407,12 @@ def options_scenario(d, out):
     # The options screen shows it: FOV 90 sits at (90 - 30) / 80 of its slider.
     d('click', id='options')
     assert abs(widgets(d)['fov']['value'] - 0.75) < 0.01
-    # Applied at once: a GUI scale of 2 on the 1280x720 window makes the GUI 640x360.
+    # Applied at once: a GUI scale of 2 halves the GUI of scale 1, which is the window's pixels
+    # (1280x720 at 100 % display scaling, 1600x900 at 125 %).
+    d('options_set', key='guiScale', value='1')
+    full = d('ui')['gui_size']
     d('options_set', key='guiScale', value='2')
-    assert d('ui')['gui_size'] == [640, 360], 'the GUI scale did not apply'
+    assert d('ui')['gui_size'] == [(n + 1) // 2 for n in full], 'the GUI scale did not apply'
     d('options_set', key='guiScale', value='0')
     return {'options': len(options)}
 
@@ -652,6 +659,83 @@ def consume_scenario(d, out):
     return {'teleported': [round(m, 2) for m in moved], 'eye_use_ticks': eye['using']['ticks']}
 
 
+def copper_chest_scenario(d, out):
+    # WeatheringCopperChestBlock.randomTick: a copper chest doesn't weather while a player or a copper
+    # golem (CopperGolem.hasContainerOpen) has it open, and does once it closes. Each has a control
+    # nobody opens, so a chest that kept its age can't be down to random ticks not reaching it.
+    d('click', id='singleplayer')
+    if 'game' not in widgets(d):
+        d('click', id='create-new-world')
+    d('type', field='name', replace=True, text='CopperChest')
+    d('click', id='create-new-world')
+    d('wait_for', condition='loaded', timeout=400)
+    d('command', command='tp @s 0.5 201 0.5')
+    d('wait_ready', seconds=120)
+
+    def block(x, z):
+        return d('block', x=x, y=201, z=z)
+
+    def chest(x, z, nbt=''):
+        d('command', command=f'setblock {x} 201 {z} minecraft:copper_chest[facing=south,type=single]{nbt}')
+
+    def weathers(x, z, ticks):
+        for _ in range(ticks // 5):
+            if block(x, z)['block'] != 'minecraft:copper_chest':
+                return True
+            d('wait', ticks=5)
+        return False
+
+    def oxidizes(x, z, ticks):
+        # All three stages: an unprotected chest beside it can't stay fresh that long by luck.
+        for _ in range(ticks // 5):
+            if block(x, z)['block'] == 'minecraft:oxidized_copper_chest':
+                return True
+            d('wait', ticks=5)
+        return False
+
+    d('command', command='fill -6 200 -6 20 200 20 minecraft:stone')
+    d('command', command='fill -6 201 -6 20 206 20 minecraft:air')
+    # The first teleport loaded the chunks; the player fell while they did.
+    d('command', command='tp @s 0.5 201 0.5')
+    d('wait', ticks=5)
+    chest(2, 0)
+    chest(16, 0)
+    d('interact', x=2, y=201, z=0)
+    d('command', command='gamerule random_tick_speed 3000')
+    assert oxidizes(16, 0, 600), 'the control never oxidized'
+    assert block(2, 0)['block'] == 'minecraft:copper_chest', block(2, 0)
+    d('close')
+    assert weathers(2, 0, 400), 'the chest did not weather once the player closed it'
+
+    d('command', command='gamerule random_tick_speed 0')
+    chest(2, 12, '{Items:[{Slot:0b,id:"minecraft:stone",count:16}]}')
+    chest(16, 12)
+    d('command', command='setblock 5 201 12 minecraft:chest[facing=south,type=single]')
+    d('command', command='summon minecraft:copper_golem 3.5 201 14.5')
+    for _ in range(600):
+        if block(2, 12)['lid'] > 0:
+            break
+        d('wait', ticks=5)
+    else:
+        raise Failed('the golem never opened the chest')
+    d('command', command='gamerule random_tick_speed 30000')
+    assert oxidizes(16, 12, 200), 'the control never oxidized'
+    state = block(2, 12)
+    assert state['lid'] > 0, 'the golem closed the chest before the control oxidized'
+    assert state['block'] == 'minecraft:copper_chest', state
+    for _ in range(160):
+        state = block(2, 12)
+        if state['lid'] >= 1:
+            assert state['block'] == 'minecraft:copper_chest', state
+        elif state['block'] != 'minecraft:copper_chest':
+            break
+        d('wait', ticks=5)
+    else:
+        raise Failed('the chest did not weather once the golem closed it')
+    d('command', command='gamerule random_tick_speed 3')
+    d('screenshot', path=str(out / f'copper-chest-{d.name}.png'))
+
+
 def use_screen_scenario(d, out):
     """An item in use is released by the keybind screen that opens over it.
 
@@ -859,7 +943,7 @@ def manage_scenario(d, out):
     d('xp', levels=5)
     assert d('lan', action='status') is not None
     d('options', page='horizon')
-    assert 'graphics' in widgets(d), widgets(d).keys()
+    assert 'ai-agent' in widgets(d), widgets(d).keys()
     d('close')
     d('pause')
     d('click', id='save-and-quit-to-title')
@@ -907,7 +991,7 @@ def pause_save_scenario(d, out):
 
 
 SCENARIOS = {'survival': scenario, 'ui': ui_scenario, 'options': options_scenario, 'events': events_scenario,
-             'consume': consume_scenario, 'use-screen': use_screen_scenario, 'pick': pick_scenario,
+             'consume': consume_scenario, 'copper-chest': copper_chest_scenario, 'use-screen': use_screen_scenario, 'pick': pick_scenario,
              'suggestions': suggestions_scenario, 'manage': manage_scenario, 'pause-save': pause_save_scenario,
              'repro': repro_scenario}
 
@@ -943,9 +1027,9 @@ def no_ai_check(mode, ctl, resources):
                 reply = json.loads(r.stdout.strip().splitlines()[-1])
                 log(mode, words, reply)
                 assert r.returncode == 4 and reply == {'error': REFUSAL, 'kind': 'denied'}, (r.returncode, reply)
-            client = ctl.with_name('horizon-client')
+            client = lab.binary(ctl.parent, 'horizon-client')
             args = [str(client), '--control-socket', str(socket), '--world', 'NoAi', '--world-frames', '30']
-            if sys.platform == 'darwin':
+            if sys.platform == 'darwin' or os.environ.get('HORIZON_E2E_HEADLESS'):
                 args.append('--offscreen')
             r = subprocess.run(args, cwd=work, env=env, capture_output=True, text=True, timeout=600)
             text = r.stdout + r.stderr + ''.join(
@@ -985,7 +1069,7 @@ def setting_check(mode, ctl, out, resources):
     socket = work / 'c.sock'
     env['HORIZON_CONTROL'] = str(socket)  # the default endpoint, this home's
     (work / 'horizon-extras.txt').write_text('agentControl:true\n')
-    args = [str(ctl.with_name('horizon-client'))]
+    args = [str(lab.binary(ctl.parent, 'horizon-client'))]
     if sys.platform == 'darwin':
         args.append('--offscreen')
     game = subprocess.Popen(args, cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1049,11 +1133,13 @@ def run(mode, ctl, out, resources, which='survival'):
     driver = (Cli if mode == 'cli' else Mcp)(ctl, socket, work, env)
     started = time.time()
     try:
-        driver('launch', wait=False, offscreen=sys.platform == 'darwin')
+        driver('launch', wait=False,
+               offscreen=sys.platform == 'darwin' or bool(os.environ.get('HORIZON_E2E_HEADLESS')))
         summary = SCENARIOS[which](driver, out)
         print(f'[{mode}] PASS in {time.time() - started:.0f} s: {summary}')
         return True
-    except (Failed, AssertionError, StopIteration) as e:
+    except (Failed, AssertionError, StopIteration, json.JSONDecodeError, IndexError,
+            subprocess.TimeoutExpired) as e:
         print(f'[{mode}] FAIL: {e!r}')
         log_file = socket.with_suffix('.log')
         if log_file.exists():
@@ -1061,12 +1147,19 @@ def run(mode, ctl, out, resources, which='survival'):
         return False
     finally:
         try:
-            driver('quit')
-        except Exception:
-            pass
-        driver.close()
-        time.sleep(2)
-        shutil.rmtree(work, ignore_errors=True)
+            try:
+                driver('quit')
+            except Exception:
+                pass
+            try:
+                driver.close()
+            except Exception:
+                pass
+        finally:
+            # Cleanup must run even if a shutdown call raises, and a shutdown failure must not
+            # replace the scenario's result (Mcp.close can raise TimeoutExpired on stdin EOF).
+            time.sleep(2)
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def main():
@@ -1079,7 +1172,7 @@ def main():
     if args.bin_dir:
         bins = Path(args.bin_dir).resolve()
     else:
-        subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-client', '-p', 'horizon-client-lib', '--bins'],
+        subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-game', '-p', 'horizon-client-lib', '--bins'],
                        cwd=ROOT, check=True)
         meta = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--no-deps'], cwd=ROOT,
                                          capture_output=True, text=True, check=True).stdout)
@@ -1091,7 +1184,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     modes = ['cli', 'mcp'] if args.mode == 'both' else [args.mode]
     scenarios = [*SCENARIOS, 'no-ai', 'setting'] if args.scenario == 'all' else [args.scenario]
-    results = {f'{m}/{s}': run(m, bins / 'horizon-ctl', out, resources, s) for m in modes for s in scenarios}
+    results = {f'{m}/{s}': run(m, lab.binary(bins, 'horizon-ctl'), out, resources, s) for m in modes for s in scenarios}
     print(json.dumps(results))
     sys.exit(0 if all(results.values()) else 1)
 

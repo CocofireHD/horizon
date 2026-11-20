@@ -3,6 +3,20 @@
 //! (`getMaxHeadXRot`, `getAmbientSoundInterval`, `getWaterSlowDown`...).
 use super::{Brain, Flags, anim::Anim};
 
+impl super::MobType {
+    /// The vanilla entity type whose class this type's mobs are: the type
+    /// itself, or the template a content mod's living type copies. What a
+    /// class saves and syncs of its own (`Zombie.addAdditionalSaveData`, its
+    /// entity data) follows it; the saved and sent id stays [`Self::id`].
+    pub fn class_id(&self) -> &str {
+        if self.id.starts_with("minecraft:") {
+            &self.id
+        } else {
+            vanilla_id(self.species)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Species {
     Tadpole,
@@ -1324,6 +1338,65 @@ pub const ALL: &[Def] = &[
 pub fn def(s: Species) -> &'static Def {
     ALL.iter().find(|d| d.species == s).unwrap_or(&ALL[0])
 }
+/// `AgeableMob.canBeABaby`: the species `Mob::is_baby` can ever answer `true`
+/// for, which is what lets `getAge() < 0` mean "a baby" rather than "an age".
+///
+/// `canBeABaby` is `true` across the ageable tree but for the six classes
+/// that override it to `false` — `Frog`, `Parrot`, `ZombieNautilus`,
+/// `CamelHusk`, `Slime` and `MagmaCube`, the last two being `AbstractCubeMob`s
+/// and so `AgeableMob`s themselves — and the zombies, the piglins and the
+/// zoglin answer a synced `DATA_BABY_ID` rather than an age. Everything else
+/// inherits `LivingEntity.isBaby`, which is `false`: a `Giant`, a `Creeper`,
+/// a `PiglinBrute` or a `Tadpole` stays an adult however negative its `Age`.
+pub fn can_be_a_baby(s: Species) -> bool {
+    use Species as S;
+    matches!(
+        s,
+        S::Armadillo
+            | S::Axolotl
+            | S::Bee
+            | S::Camel
+            | S::Cat
+            | S::Chicken
+            | S::Cow
+            | S::Dolphin
+            | S::Donkey
+            | S::Drowned
+            | S::Fox
+            | S::GlowSquid
+            | S::Goat
+            | S::HappyGhast
+            | S::Hoglin
+            | S::Horse
+            | S::Husk
+            | S::Llama
+            | S::Mooshroom
+            | S::Mule
+            | S::Nautilus
+            | S::Ocelot
+            | S::Panda
+            | S::Pig
+            | S::Piglin
+            | S::PolarBear
+            | S::Rabbit
+            | S::Sheep
+            | S::SkeletonHorse
+            | S::Sniffer
+            | S::Squid
+            | S::Strider
+            | S::SulfurCube
+            | S::TraderLlama
+            | S::Turtle
+            | S::Villager
+            | S::WanderingTrader
+            | S::Wolf
+            | S::Zoglin
+            | S::Zombie
+            | S::ZombieHorse
+            | S::ZombieVillager
+            | S::ZombifiedPiglin
+    )
+}
 /// The vanilla entity type of a species, `minecraft:` and its [`Def::name`].
 pub fn vanilla_id(s: Species) -> &'static str {
     static IDS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
@@ -1467,6 +1540,7 @@ impl Def {
             flying: matches!(s, S::Ghast | S::Phantom | S::HappyGhast),
             climber: matches!(s, S::Spider | S::CaveSpider),
             lava_walker: s == S::Strider,
+            powder_snow_walkable: false,
             omnidirectional: matches!(s, S::Bee | S::Parrot),
             fire_immune: fire_immune
                 || matches!(
@@ -1495,9 +1569,9 @@ impl Def {
                     | S::ZombieNautilus
             ),
             undead,
-            // `#can_breathe_under_water`, and the iron golem, whose
-            // `decreaseAirSupply` keeps its air. Not the dolphin: it holds its
-            // breath (4800 ticks) and surfaces for air.
+            // `#can_breathe_under_water`. Not the dolphin: it holds its breath
+            // (4800 ticks) and surfaces for air; nor the iron golem, which keeps
+            // its air through its own `decreaseAirSupply` (`ai.rs`).
             breathes_water: (aquatic && s != S::Dolphin)
                 || undead
                 || matches!(
@@ -1507,7 +1581,6 @@ impl Def {
                         | S::Turtle
                         | S::Guardian
                         | S::ElderGuardian
-                        | S::IronGolem
                         | S::CopperGolem
                         | S::Nautilus
                 ),
@@ -1584,6 +1657,7 @@ impl Def {
             S::Goat => "goat_food",
             S::Sniffer => "sniffer_food",
             S::HappyGhast => "happy_ghast_food",
+            S::Camel => "camel_food",
             S::CamelHusk => "camel_husk_food",
             S::Nautilus | S::ZombieNautilus => "nautilus_food",
             S::SulfurCube => "sulfur_cube_food",

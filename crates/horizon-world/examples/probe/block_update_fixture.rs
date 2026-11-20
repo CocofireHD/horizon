@@ -7,14 +7,6 @@ use horizon_core::{
     position::{BlockPos, ChunkPos},
     random::{LegacyRandom, RandomSource},
 };
-use horizon_world::{
-    level::{
-        Behaviours, Dimension, EntityQuery, GameRules, LevelAccess, LevelEvent, Ticks,
-        data::load_registry,
-        removal::{PreRemove, drop_item_stack, pre_remove},
-    },
-    registry::BlockStateId,
-};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -22,8 +14,20 @@ use std::{
     io::{BufRead, Write},
     path::Path,
 };
+use {
+    horizon_core::dimension::Dimension,
+    horizon_world::{
+        level::{
+            Behaviours, EntityQuery, GameRules, LevelAccess, LevelEvent, Ticks,
+            data::load_registry,
+            removal::{PreRemove, drop_item_stack, pre_remove},
+        },
+        registry::BlockStateId,
+    },
+};
 
 struct Cells {
+    border: Option<horizon_world::level::portal_travel::BorderBounds>,
     cells: HashMap<BlockPos, BlockStateId>,
     air: BlockStateId,
     random: LegacyRandom,
@@ -38,7 +42,11 @@ struct Cells {
     /// `preRemoveSideEffects` of each state's block entity.
     removals: std::rc::Rc<Vec<PreRemove>>,
 }
+impl horizon_world::level::BlockEntityNeighbors for Cells {}
 impl LevelAccess for Cells {
+    fn within_world_border(&self, pos: BlockPos) -> bool {
+        self.border.is_none_or(|border| border.contains_block(pos))
+    }
     fn block_state(&self, pos: BlockPos) -> BlockStateId {
         self.cells.get(&pos).copied().unwrap_or(self.air)
     }
@@ -57,7 +65,7 @@ impl LevelAccess for Cells {
     /// Fresh block entities hold nothing, but a lectern whose state has a book
     /// reads page progress 1 of an empty book: signal 14.
     fn block_entity_analog_signal(
-        &self,
+        &mut self,
         _pos: BlockPos,
         state: BlockStateId,
         _direction: Direction,
@@ -148,6 +156,7 @@ impl LevelAccess for Cells {
                     id: 1011,
                     pos,
                     data: 0,
+                    source: None,
                 });
             }
             Some(PreRemove::Beacon) => self.events.push(LevelEvent::Sound {
@@ -245,6 +254,20 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         let before = cells.clone();
         let light = case.get("light").and_then(|v| v.as_array());
         let mut level = Cells {
+            border: case.get("border").map(|v| {
+                let c = v.as_array().unwrap();
+                let (x, z, size) = (
+                    c[0].as_f64().unwrap(),
+                    c[1].as_f64().unwrap(),
+                    c[2].as_f64().unwrap(),
+                );
+                horizon_world::level::portal_travel::BorderBounds {
+                    min_x: x - size / 2.0,
+                    min_z: z - size / 2.0,
+                    max_x: x + size / 2.0,
+                    max_z: z + size / 2.0,
+                }
+            }),
             cells,
             air,
             random: LegacyRandom::new(case["seed"].as_i64().unwrap()),
@@ -273,6 +296,15 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut result = format!("case {index}\n");
         let origin = pos_of(&case["pos"]);
         match case["mode"].as_str().unwrap() {
+            "piston_event" => {
+                behaviours.client_block_event(
+                    &mut level,
+                    &mut ticks,
+                    origin,
+                    case["event"].as_i64().unwrap() as i32,
+                    case["dir"].as_i64().unwrap() as i32,
+                );
+            }
             "shape" => {
                 let dir = Direction::ALL[case["dir"].as_u64().unwrap() as usize];
                 let neighbour = BlockStateId(case["neighbor"].as_i64().unwrap() as u32);
@@ -315,7 +347,11 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let snap = op.get("snap").and_then(|v| v.as_bool()).unwrap_or(false);
                             for _ in 0..op["n"].as_i64().unwrap() {
                                 level.time += 1;
+                                // The due ticks run inside the level tick's
+                                // `handlingTick` (ServerLevel.java:360, :412).
+                                ticks.begin_handling_tick();
                                 behaviours.tick_scheduled(&mut level, &mut ticks);
+                                ticks.end_handling_tick();
                                 if snap {
                                     let _ = writeln!(result, "tick {}", level.time);
                                     summary(&level, &before, &mut result);
@@ -368,7 +404,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         for event in &level.events {
             match event {
-                LevelEvent::LevelEvent { id, pos, data } => {
+                LevelEvent::LevelEvent { id, pos, data, .. } => {
                     let _ = writeln!(result, "L {} {} {}", id, p(*pos), data);
                 }
                 LevelEvent::Sound { pos, sound, .. } => {
@@ -383,6 +419,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let short = short.replacen("wall_", "", 1);
                     let _ = writeln!(result, "D minecraft:blocks/{short}");
                 }
+                // Block updates place no templates.
+                LevelEvent::ContainerLootTable { .. } => {}
                 LevelEvent::FallingBlock { .. } => {
                     let _ = writeln!(result, "E minecraft:falling_block");
                 }
@@ -432,7 +470,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // `BrushableBlockEntity.checkReset` has nothing to reset. A
                 // fresh structure block has no structure name, so its trigger
                 // neither saves nor loads. A test block's trigger and reset
-                // live on its block entity: `game/test_blocks.rs` runs them.
+                // live on its block entity: `game/administration/test_blocks.rs` runs them.
                 // `Block.pushEntitiesUp` lifts only the entities in the new
                 // block's box, and these cases have none: nothing moves.
                 LevelEvent::BlockEvent {

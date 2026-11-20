@@ -14,6 +14,9 @@ use horizon_core::geometry::trig::{DEG_TO_RAD, Mth};
 use horizon_core::{geometry::Vec3, random::RandomSource};
 use std::f32::consts::PI;
 
+/// The target selector of `Pillager.registerGoals`,
+/// `Vindicator.registerGoals` and `Evoker.registerGoals`; the evoker's player
+/// and villager goals keep an unseen target 300 ticks (`setUnseenMemoryTicks`).
 fn targets(m: &mut Mob, villagers_seen: bool) {
     let mut hurt = HurtByTarget::new().alert();
     hurt.ignore = vec![
@@ -26,13 +29,20 @@ fn targets(m: &mut Mob, villagers_seen: bool) {
         Species::Ravager,
     ];
     m.ai.targets.add(1, hurt);
-    m.ai.targets.add(2, NearestTarget::player(true));
+    let memory = if m.species() == Species::Evoker {
+        300
+    } else {
+        60
+    };
+    m.ai.targets
+        .add(2, NearestTarget::player(true).unseen_memory(memory));
     m.ai.targets.add(
         3,
         NearestTarget::species(
             &[Species::Villager, Species::WanderingTrader],
             villagers_seen,
-        ),
+        )
+        .unseen_memory(memory),
     );
     m.ai.targets
         .add(3, NearestTarget::species(&[Species::IronGolem], true));
@@ -69,18 +79,26 @@ pub fn register_vindicator(m: &mut Mob) {
     g.add(9, LookAtPlayer::new(3.0).probability(1.0));
     g.add(10, LookAtPlayer::mobs(8.0));
     targets(m, true);
-    // VindicatorJohnnyAttackGoal: a vindicator named Johnny attacks any
-    // living entity, other raiders included.
+    // VindicatorJohnnyAttackGoal: a vindicator that was named Johnny attacks
+    // any living entity, other raiders included. The flag is a latch
+    // (`Vindicator.setCustomName` sets it and never clears it), not the name in
+    // front of the mob now, so a rename keeps the goal.
     m.ai.targets.add(
         4,
         NearestTarget::new(Prey::Filter(|_| true), true)
             .interval(0)
-            .when(|m, _| m.custom_name.as_deref() == Some("Johnny")),
+            .when(|m, _| m.extra.johnny),
     );
 }
 /// `Vindicator.customServerAiStep`: its navigation opens doors while a raid
 /// is at its position.
 pub fn vindicator_server_ai_step(m: &mut Mob) {
+    // `Vindicator.setCustomName`'s latch, taken from the live name: a name that
+    // became `Johnny` sets it, and nothing clears it (`addAdditionalSaveData`
+    // saves it for the next load).
+    if m.custom_name.as_deref() == Some("Johnny") {
+        m.extra.johnny = true;
+    }
     if super::doors::can_navigate_ground(m) {
         m.ai.nav.can_open_doors = super::raider::state(m).is_some_and(|s| s.raided);
     }
@@ -216,7 +234,10 @@ impl Goal for UseSpell {
         if self.spell == Spell::Wololo {
             // EvokerWololoSpellGoal.canUse: a blue sheep within the box
             // (16 sideways, 4 up or down) and `range(16)`, no target, griefing on.
-            if m.ai.target.is_some() || m.extra.counter > 0 || age < self.next || !cx.w.mob_griefing
+            if m.ai.target.is_some()
+                || m.extra.counter > 0
+                || age < self.next
+                || !cx.w.can_grief(m.id)
             {
                 return false;
             }
@@ -231,7 +252,14 @@ impl Goal for UseSpell {
                             && (s.position.x - p.x).abs() <= 16.0
                             && (s.position.y - p.y).abs() <= 4.0
                             && (s.position.z - p.z).abs() <= 16.0
-                            && s.position.distance_squared(p) <= 16.0 * 16.0
+                            && {
+                                // `TargetingConditions.forNonCombat().range(16)`:
+                                // `getVisibilityPercent` scales the range, with a
+                                // floor of 2. The sheep's `isInvisible` is the
+                                // flag (or the effect, which sets it).
+                                let range = cx.w.reach_sqr(s.id, m, 16.0).sqrt();
+                                s.position.distance_squared(p) <= range * range
+                            }
                     })
                     .map(|s| s.id)
                     .collect();
@@ -461,7 +489,7 @@ pub fn charge_ticks(m: &Mob) -> i32 {
     25 - 5 * super::gear::level(m, super::gear::MAIN, "minecraft:quick_charge") as i32
 }
 fn holding_crossbow(m: &Mob) -> bool {
-    m.extra.main_hand.as_deref() == Some("minecraft:crossbow")
+    m.extra.main_hand_id() == Some("minecraft:crossbow")
 }
 
 /// `CrossbowItem.setCharged`: the loaded arrow lives in the stack's
@@ -509,9 +537,9 @@ impl Goal for CrossbowAttack {
                 .is_some_and(|t| t.alive && !(t.is_player && t.creative));
         valid && holding_crossbow(m)
     }
-    fn stop(&mut self, m: &mut Mob, _: &mut Cx) {
+    fn stop(&mut self, m: &mut Mob, cx: &mut Cx) {
         m.ai.aggressive = false;
-        m.ai.target = None;
+        m.set_ai_target(cx.w, None);
         self.see_time = 0;
         m.extra.flag = false;
         m.extra.using_item = 0;
@@ -570,7 +598,8 @@ impl Goal for CrossbowAttack {
                 }
             }
             Crossbow::Charging => {
-                m.extra.using_item += 1;
+                // A mod may have set the use's ticks left to anything.
+                m.extra.using_item = m.extra.using_item.saturating_add(1);
                 if m.extra.using_item >= charge_ticks(m) {
                     m.extra.using_item = 0;
                     m.extra.flag = false;
@@ -640,9 +669,20 @@ fn shoot_crossbow(m: &mut Mob, who: Who, cx: &mut Cx) {
         Some(Who::Mob(m.id)),
     );
     p.set_bonus(super::gear::arrow_bonus(m));
+    if let Some(state) = p.arrow.as_mut() {
+        state.fired_from_weapon = if m.extra.using_off_hand {
+            m.extra
+                .slot_stack(horizon_items::equipment::OFFHAND)
+                .cloned()
+        } else {
+            m.extra.main_hand_stack().cloned()
+        };
+        if state.fired_from_weapon.is_some() {
+            p.bonus.damage = 0.0;
+        }
+    }
     // rangedAttackUncertainty: 14 - 4 * difficulty.
-    p.shoot(
-        &mut crate::projectiles::own_random(m),
+    p.shoot_own(
         [dx, dy, dz],
         1.6,
         (14 - i32::from(cx.w.difficulty.id) * 4) as f32,
@@ -755,7 +795,7 @@ pub fn anim_pose(m: &Mob, s: &State, p: &mut Poses, pose: ArmPose) {
     }
     match pose {
         ArmPose::Attacking => {
-            if m.extra.main_hand.is_none() {
+            if m.extra.main_hand_id().is_none() {
                 // animateZombieArms + bobArms
                 let swing = s.swing;
                 let a = (swing * PI).msin();
@@ -916,6 +956,56 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "daily"]
+    fn spellcasters_remember_an_unseen_player() {
+        use crate::mobs::world::{test_player, with_test_world};
+        let ran = with_test_world(&[], |w, types| {
+            let mut w = w.clone();
+            w.player = Some(test_player(Vec3::new(3.5, 64.0, 0.5)));
+            for name in [
+                "minecraft:evoker",
+                "minecraft:illusioner",
+                "minecraft:pillager",
+            ] {
+                let kind = Arc::new(types.types[name].clone());
+                let mut mob = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+                let mut goals = std::mem::take(&mut mob.ai.targets);
+                let mut events = Vec::new();
+                let mut test_level = crate::health::TestLevel::new(0);
+                let mut cx = Cx {
+                    w: &w,
+                    level: &mut test_level.level(),
+                    events: &mut events,
+                };
+                for _ in 0..100 {
+                    mob.ai.seen_cache.clear();
+                    goals.tick(&mut mob, &mut cx);
+                    if mob.ai.target.is_some() {
+                        break;
+                    }
+                }
+                assert_eq!(mob.ai.target, Some(Who::Player), "{name} acquired player");
+                let limit = if name == "minecraft:pillager" {
+                    30
+                } else {
+                    150
+                };
+                for _ in 0..limit {
+                    mob.ai.seen_cache = vec![(Who::Player, false)];
+                    goals.tick(&mut mob, &mut cx);
+                    assert_eq!(mob.ai.target, Some(Who::Player), "{name} lost player early");
+                }
+                mob.ai.seen_cache = vec![(Who::Player, false)];
+                goals.tick(&mut mob, &mut cx);
+                assert_eq!(mob.ai.target, None, "{name} should forget player");
+            }
+        });
+        // Without the vanilla data under .local/horizon-client the world
+        // cannot be built: the test has nothing to check.
+        assert!(ran, "vanilla data is missing");
+    }
+
     fn pillager() -> Mob {
         let mut kind = kind();
         let k = Arc::make_mut(&mut kind);
@@ -967,6 +1057,7 @@ mod tests {
     /// sturdy up face, not for a full cube. Soul sand is 14/16 high and still
     /// supports a fang, which a full-collision test drops into the block.
     #[test]
+    #[ignore = "daily"]
     fn a_fang_stands_on_a_soul_sand_floor() {
         let build = |world: &mut crate::world::World,
                      registry: &horizon_world::registry::BlockRegistry| {
@@ -992,6 +1083,168 @@ mod tests {
             // the first sturdy block and the fang sits at 65.
             assert_eq!(fang_floor(w, 0.5, 0.5, 64.0, 65.875), Some(65.0));
         });
-        let _ = ran;
+        assert!(ran, "vanilla data is missing");
+    }
+
+    /// `Vindicator.setCustomName` latches `isJohnny` the first time the name is
+    /// `Johnny`, and nothing clears it: the Johnny goal keeps attacking every
+    /// living entity after the mob is renamed, and `addAdditionalSaveData`
+    /// saves the flag (only when set) so a reload keeps it. Horizon read the live name each
+    /// tick and saved no flag, so a renamed vindicator stopped, and a reloaded
+    /// one that was named Johnny but is now Bob never started.
+    #[test]
+    fn a_vindicator_that_was_named_johnny_stays_johnny() {
+        use horizon_core::nbt::Tag;
+        let mut m = Mob::new(
+            1,
+            {
+                let mut kind = kind();
+                let k = Arc::make_mut(&mut kind);
+                k.id = "minecraft:vindicator".into();
+                k.species = Species::Vindicator;
+                kind
+            },
+            Vec3::new(0.5, 64.0, 0.5),
+            0.0,
+        );
+        assert_eq!(i8::from(m.extra.johnny), 0, "a vindicator with no name");
+        m.custom_name = Some("Bob".into());
+        vindicator_server_ai_step(&mut m);
+        assert_eq!(i8::from(m.extra.johnny), 0, "another name is no Johnny");
+        m.custom_name = Some("Johnny".into());
+        vindicator_server_ai_step(&mut m);
+        assert_eq!(i8::from(m.extra.johnny), 1, "the name sets the latch");
+        // Renamed, it stays Johnny: `setCustomName` only ever sets the flag.
+        m.custom_name = Some("Bob".into());
+        vindicator_server_ai_step(&mut m);
+        assert_eq!(
+            i8::from(m.extra.johnny),
+            1,
+            "a rename does not clear the latch"
+        );
+        // `Vindicator.addAdditionalSaveData` writes the flag, false or true.
+        let types = [("minecraft:vindicator".into(), m.kind.clone())].into();
+        let saved = crate::entity_nbt::mob_to_nbt(&m, [0; 4], None, None, |_| None);
+        assert_eq!(saved.get("Johnny"), Some(&Tag::Byte(1)));
+        let back = crate::entity_nbt::mob_from_nbt(&saved, &types, 2, None).unwrap();
+        assert_eq!(i8::from(back.extra.johnny), 1, "the reloaded flag");
+        // `readAdditionalSaveData`: `Johnny` absent is false, whatever the name
+        // in the compound is.
+        let mut silent = Tag::compound([
+            ("id", Tag::String("minecraft:vindicator".into())),
+            (
+                "Pos",
+                Tag::List(vec![
+                    Tag::Double(0.5_f64.to_bits()),
+                    Tag::Double(64.0_f64.to_bits()),
+                    Tag::Double(0.5_f64.to_bits()),
+                ]),
+            ),
+            ("CustomName", Tag::String("Johnny".into())),
+        ]);
+        let loaded = crate::entity_nbt::mob_from_nbt(&silent, &types, 3, None).unwrap();
+        assert_eq!(i8::from(loaded.extra.johnny), 0, "a save without the flag");
+        // `addAdditionalSaveData` writes nothing for a vindicator that is not
+        // Johnny, even over a compound that still carries `Johnny: 0b`.
+        if let Tag::Compound(c) = &mut silent {
+            c.insert("Johnny".into(), Tag::Byte(0));
+        }
+        let saved = crate::entity_nbt::mob_to_nbt(&loaded, [0; 4], Some(&silent), None, |_| None);
+        assert_eq!(saved.get("Johnny"), None);
+    }
+    /// `EvokerWololoSpellGoal` finds blue sheep with
+    /// `TargetingConditions.forNonCombat().range(16)`: an invisible sheep at
+    /// five blocks is out of range, one at two blocks is not.
+    #[test]
+    #[ignore = "daily"]
+    fn an_invisible_blue_sheep_is_not_wololoed_from_five_blocks() {
+        use crate::mobs::world::with_test_world;
+        let mut outcomes = Vec::new();
+        if !with_test_world(&[], |w, _| {
+            for invisible in [false, true] {
+                let mut world = w.clone();
+                world.mob_griefing = true;
+                let mut sheep_kind = (*kind()).clone();
+                sheep_kind.species = Species::Sheep;
+                let mut sheep = Mob::new(2, Arc::new(sheep_kind), Vec3::new(5.5, 64.0, 0.5), 0.0);
+                sheep.extra.color = 11;
+                if invisible {
+                    sheep.add_effect("minecraft:invisibility", 200, 0);
+                }
+                let seen = [sheep.seen(None, &crate::items::Items::empty())];
+                let world = crate::mobs::MobWorld {
+                    others: &seen,
+                    ..world
+                };
+                let mut m = evoker(0);
+                m.position = Vec3::new(0.5, 64.0, 0.5);
+                m.ai.goals.add(6, UseSpell::new(Spell::Wololo));
+                let mut lr = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut lr.level(),
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut m.ai.goals);
+                goals.tick(&mut m, &mut cx);
+                outcomes.push(goals.is_running("UseSpell"));
+                m.ai.goals = goals;
+            }
+        }) {
+            return;
+        }
+        assert_eq!(
+            outcomes,
+            vec![true, false],
+            "a visible sheep is chosen at five; an invisible one is not"
+        );
+    }
+    /// The same `TargetingConditions.forNonCombat().range(16)` against the
+    /// `invisible` entity flag rather than the effect: `getVisibilityPercent`
+    /// reads the flag, so a flagged sheep at fourteen blocks is out of range
+    /// (0.07 of 16, floored to 2) while a visible one is picked.
+    #[test]
+    #[ignore = "daily"]
+    fn a_flagged_invisible_blue_sheep_is_not_wololoed_from_fourteen_blocks() {
+        use crate::mobs::world::with_test_world;
+        let mut outcomes = Vec::new();
+        if !with_test_world(&[], |w, _| {
+            for invisible in [false, true] {
+                let mut world = w.clone();
+                world.mob_griefing = true;
+                let mut sheep_kind = (*kind()).clone();
+                sheep_kind.species = Species::Sheep;
+                let mut sheep = Mob::new(2, Arc::new(sheep_kind), Vec3::new(14.5, 64.0, 0.5), 0.0);
+                sheep.extra.color = 11;
+                sheep.invisible = invisible;
+                let seen = [sheep.seen(None, &crate::items::Items::empty())];
+                let world = crate::mobs::MobWorld {
+                    others: &seen,
+                    ..world
+                };
+                let mut m = evoker(0);
+                m.position = Vec3::new(0.5, 64.0, 0.5);
+                m.ai.goals.add(6, UseSpell::new(Spell::Wololo));
+                let mut test_level = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut test_level.level(),
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut m.ai.goals);
+                goals.tick(&mut m, &mut cx);
+                outcomes.push(goals.is_running("UseSpell"));
+                m.ai.goals = goals;
+            }
+        }) {
+            return;
+        }
+        assert_eq!(
+            outcomes,
+            vec![true, false],
+            "a visible sheep is chosen at fourteen; a flagged invisible one is not"
+        );
     }
 }

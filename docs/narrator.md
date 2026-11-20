@@ -52,9 +52,9 @@ the game runs and the narrator is "Not Available".
 | `ScreenNarrationCollector` (what changed since the last run), `Screen`'s timing (`afterMouseMove`, `afterKeyboardAction`, the suppression after `init`), `findNarratableWidget` | `crates/horizon-narrator/src/screen.rs` |
 | What a frame's screen and widgets narrate (`ScreenInfo`, `Narratable`, `What`), recorded while drawing | `crates/horizon-client-render/src/widgets.rs` |
 | The driver: reads the last drawn frame, runs `updateNarrationState` and says what is due | `crates/horizon-client/src/screen_narrator.rs` |
-| Game glue: start and stop, the options, Ctrl+B, the toast, the input events the driver hears | `crates/horizon-client/src/game/narrator.rs` |
-| Screens whose narration is their own (chat, level loading, books, confirm screens) | `crates/horizon-client/src/game/screen_info.rs` |
-| Chat and system messages | `game.rs`, `game/remote.rs` and the other callers of `horizon_narrator::say_*`, where vanilla narrates |
+| Game glue: start and stop, the options, Ctrl+B, the toast, the input events the driver hears | `crates/horizon-client/src/game/interface/narrator.rs` |
+| Screens whose narration is their own (chat, level loading, books, confirm screens) | `crates/horizon-client/src/game/interface/screen_info.rs` |
+| Chat and system messages | `game.rs`, `game/network/remote/mod.rs` and the other callers of `horizon_narrator::say_*`, where vanilla narrates |
 
 ## How screens record their narration
 
@@ -126,10 +126,8 @@ vanilla's widget trees but not always all the way:
   Tab follows reading order rather than vanilla's add order.
 - "Screen element i out of n" counts widgets in the order screens record
   them; most follow vanilla's add order, a few approximate it.
-- Some screens narrate less than vanilla's: a dialog's body text, the
-  command box's suggestion list (`narration.suggestion`), the stats screen
-  while it loads (and the focus it gives its tabs once loaded), and the
-  server list's "incompatible version" status.
+- Some screens narrate less than vanilla's: a dialog's body text, and the
+  stats screen while it loads (and the focus it gives its tabs once loaded).
 - A click focuses the widget under the mouse even where a scrolled list
   hides it behind the header or footer.
 - The macOS backend has no `crashed` state: a failing synthesizer message

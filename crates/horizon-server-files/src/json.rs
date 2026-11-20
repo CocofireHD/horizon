@@ -22,7 +22,7 @@ impl Json {
             _ => None,
         }
     }
-    /// JsonElement.getAsString for primitives.
+    /// Gson's string view for primitives.
     pub fn as_string(&self) -> Option<String> {
         match self {
             Json::String(s) | Json::Number(s) => Some(s.clone()),
@@ -30,7 +30,7 @@ impl Json {
             _ => None,
         }
     }
-    /// JsonObject.addProperty: a null value is JsonNull, which the writers skip.
+    /// Gson's property add: a null value is JsonNull, which the writers skip.
     pub fn add(&mut self, key: &str, value: Json) {
         if let Json::Object(m) = self {
             if let Some(slot) = m.iter_mut().find(|(k, _)| k == key) {
@@ -41,7 +41,7 @@ impl Json {
         }
     }
 
-    /// JsonElement.toString: compact, not HTML-safe, nulls in objects written.
+    /// Gson's compact element text: not HTML-safe, nulls in objects written.
     pub fn compact(&self) -> String {
         let mut out = String::new();
         self.write_compact(&mut out);
@@ -171,7 +171,7 @@ impl Json {
     }
 }
 
-/// JsonWriter.string.
+/// Gson's string escaping.
 fn quote(out: &mut String, s: &str, html_safe: bool) {
     out.push('"');
     for c in s.chars() {
@@ -196,11 +196,17 @@ fn quote(out: &mut String, s: &str, html_safe: bool) {
 }
 
 /// A strict JSON document: one value, optionally followed only by whitespace
-/// when `whole` is set.
+/// when `whole` is set. One U+FEFF at the very start (a UTF-8 byte-order mark,
+/// which Windows editors add) is skipped, as Gson's `JsonReader` skips it; a
+/// second one, or one after whitespace, is an error as in Gson.
 pub fn parse(text: &str, whole: bool) -> Result<Json, String> {
     let chars: Vec<char> = text.chars().collect();
-    let mut p = Parser { c: &chars, i: 0 };
-    let v = p.value()?;
+    let start = usize::from(chars.first() == Some(&'\u{feff}'));
+    let mut p = Parser {
+        c: &chars,
+        i: start,
+    };
+    let v = p.value(0)?;
     if whole {
         p.ws();
         if p.i != chars.len() {
@@ -209,6 +215,10 @@ pub fn parse(text: &str, whole: bool) -> Result<Json, String> {
     }
     Ok(v)
 }
+
+/// The deepest nesting a document may parse: a file past this is not a list
+/// the server reads, and the recursion is bounded (serde's own limit is 128).
+const MAX_DEPTH: usize = 128;
 
 struct Parser<'a> {
     c: &'a [char],
@@ -224,7 +234,10 @@ impl Parser<'_> {
             self.i += 1;
         }
     }
-    fn value(&mut self) -> Result<Json, String> {
+    fn value(&mut self, depth: usize) -> Result<Json, String> {
+        if depth >= MAX_DEPTH {
+            return Err("Nesting too deep".into());
+        }
         self.ws();
         match self.c.get(self.i) {
             None => Err("End of input".into()),
@@ -247,7 +260,7 @@ impl Parser<'_> {
                         return Err("Expected ':'".into());
                     }
                     self.i += 1;
-                    let v = self.value()?;
+                    let v = self.value(depth + 1)?;
                     if let Some(slot) = m.iter_mut().find(|(n, _)| *n == k) {
                         slot.1 = v;
                     } else {
@@ -273,7 +286,7 @@ impl Parser<'_> {
                     return Ok(Json::Array(items));
                 }
                 loop {
-                    items.push(self.value()?);
+                    items.push(self.value(depth + 1)?);
                     self.ws();
                     match self.c.get(self.i) {
                         Some(',') => self.i += 1,
@@ -362,7 +375,7 @@ impl Parser<'_> {
     }
 }
 
-/// JSON number syntax (JsonReader.peekNumber in strict mode).
+/// JSON number syntax (Gson's strict reader).
 fn is_number(w: &str) -> bool {
     let b = w.as_bytes();
     let mut i = 0;
@@ -405,6 +418,22 @@ fn is_number(w: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Gson's `JsonReader` skips one byte-order mark at the start of the text (checked with Gson 2.14.0:
+    /// `\uFEFF[]` is an empty array; two marks, a mark after a space and a mark after the value are errors).
+    #[test]
+    fn a_leading_byte_order_mark_is_skipped() {
+        assert_eq!(parse("\u{feff}[]", true).unwrap().compact(), "[]");
+        assert_eq!(
+            parse("\u{feff}[{\"name\":\"Alex\"}]", false)
+                .unwrap()
+                .compact(),
+            r#"[{"name":"Alex"}]"#
+        );
+        for bad in ["\u{feff}\u{feff}[]", " \u{feff}[]"] {
+            assert!(parse(bad, true).is_err(), "{bad:?}");
+        }
+        assert!(parse("[]\u{feff}", true).is_err());
+    }
     #[test]
     fn round_trips() {
         let v = parse(r#" { "a" : 1.50 , "b":[true,null,"x<"] , "a": 2 } "#, true).unwrap();
@@ -418,5 +447,16 @@ mod tests {
         );
         assert_eq!(Json::Array(vec![]).pretty(), "[]");
         assert!(parse("{a:1}", true).is_err());
+    }
+
+    /// A document nested past the cap is refused, not recursed into forever:
+    /// files and remote responses the server reads can be any nesting.
+    #[test]
+    fn nesting_is_bounded() {
+        let ok = "[".repeat(MAX_DEPTH) + &"]".repeat(MAX_DEPTH);
+        let deep = "[".repeat(MAX_DEPTH + 1) + &"]".repeat(MAX_DEPTH + 1);
+        assert!(parse(&ok, true).is_ok());
+        assert!(parse(&deep, true).is_err());
+        assert!(parse(&deep, false).is_err());
     }
 }

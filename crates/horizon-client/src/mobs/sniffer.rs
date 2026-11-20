@@ -87,12 +87,15 @@ pub fn ai_step(m: &mut Mob, events: &mut Vec<MobEvent>) {
             table: "minecraft:gameplay/sniffer_digging",
             at: [f64::from(h[0]), f64::from(h[1]), f64::from(h[2])],
         });
-        events.push(MobEvent::Sound(
-            "entity.sniffer.drop_seed",
-            m.center(),
-            1.0,
-            1.0,
-        ));
+        // Sniffer.dropSeed's this.playSound: silence mutes it.
+        if !m.silent {
+            events.push(MobEvent::Sound(
+                "entity.sniffer.drop_seed",
+                m.center(),
+                1.0,
+                1.0,
+            ));
+        }
     }
     // The searching sound is the client's (`playSearchingSound`).
     // onPathfindingStart / Done: water only blocks the way while it is dry.
@@ -122,8 +125,8 @@ pub fn animate(m: &mut Mob) {
 }
 /// The brain memory holding the explored positions
 /// (`SNIFFER_EXPLORED_POSITIONS`).
-pub fn to_nbt(m: &Mob, map: &mut horizon_world::nbt::Compound) {
-    use horizon_world::nbt::Tag;
+pub fn to_nbt(m: &Mob, map: &mut horizon_core::nbt::Compound) {
+    use horizon_core::nbt::Tag;
     let list: Vec<Tag> = m
         .extra
         .positions
@@ -135,7 +138,7 @@ pub fn to_nbt(m: &Mob, map: &mut horizon_world::nbt::Compound) {
             ])
         })
         .collect();
-    let mut memories = horizon_world::nbt::Compound::new();
+    let mut memories = horizon_core::nbt::Compound::new();
     if !list.is_empty() {
         memories.insert(
             "minecraft:sniffer_explored_positions".into(),
@@ -147,8 +150,8 @@ pub fn to_nbt(m: &Mob, map: &mut horizon_world::nbt::Compound) {
         Tag::compound([("memories", Tag::Compound(memories))]),
     );
 }
-pub fn from_nbt(m: &mut Mob, tag: &horizon_world::nbt::Tag) {
-    use horizon_world::nbt::Tag;
+pub fn from_nbt(m: &mut Mob, tag: &horizon_core::nbt::Tag) {
+    use horizon_core::nbt::Tag;
     let Some(Tag::List(list)) = tag
         .get("Brain")
         .and_then(|b| b.get("memories"))
@@ -214,3 +217,7 @@ mod tests {
         assert!(!can_mate_state(DIGGING));
     }
 }
+
+#[cfg(test)]
+#[path = "sniffer_silence_tests.rs"]
+mod sniffer_silence_tests;

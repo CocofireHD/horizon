@@ -1,7 +1,7 @@
 //! Login state: offline/online hello, encryption request, compression,
 //! login plugin queries and the finished game profile.
 use crate::{
-    buf::{Bool, Bytes, Ident, Opt, Rest, Str, StrN, Uuid, VarInt},
+    buf::{Bool, Bytes, Ident, Opt, RestN, Str, StrN, Uuid, VarInt},
     packet, packet_enum,
     packets::Empty,
 };
@@ -19,7 +19,8 @@ packet!(
     GameProfile {
         uuid: u128 => Uuid,
         name: String => StrN<16>,
-        properties: Vec<Property> => crate::buf::List<Property>,
+        // ByteBufCodecs.GAME_PROFILE_PROPERTIES: at most 16.
+        properties: Vec<Property> => crate::buf::ListN<Property, 16>,
     }
 );
 packet!(Disconnect { reason_json: String => StrN<262144> });
@@ -31,7 +32,13 @@ packet!(Hello {
 });
 packet!(LoginFinished { profile: GameProfile => GameProfile, session: u128 => Uuid });
 packet!(Compression { threshold: i32 => VarInt });
-packet!(CustomQuery { transaction: i32 => VarInt, channel: String => Ident, data: Vec<u8> => Rest });
+/// `ClientboundCustomQueryPacket.MAX_PAYLOAD_SIZE` and `ServerboundCustomQueryAnswerPacket.MAX_PAYLOAD_SIZE`.
+pub const MAX_QUERY_PAYLOAD: usize = 1_048_576;
+packet!(CustomQuery {
+    transaction: i32 => VarInt,
+    channel: String => Ident,
+    data: Vec<u8> => RestN<MAX_QUERY_PAYLOAD>,
+});
 packet!(CookieRequest { key: String => Ident });
 
 packet_enum!(Clientbound, crate::ids::login::clientbound {
@@ -45,8 +52,11 @@ packet_enum!(Clientbound, crate::ids::login::clientbound {
 
 packet!(ServerHello { name: String => StrN<16>, uuid: u128 => Uuid });
 packet!(Key { key: Vec<u8> => Bytes, challenge: Vec<u8> => Bytes });
-packet!(CustomQueryAnswer { transaction: i32 => VarInt, payload: Option<Vec<u8>> => Opt<Rest> });
-packet!(CookieResponse { key: String => Ident, payload: Option<Vec<u8>> => Opt<Bytes> });
+packet!(CustomQueryAnswer {
+    transaction: i32 => VarInt,
+    payload: Option<Vec<u8>> => Opt<RestN<MAX_QUERY_PAYLOAD>>,
+});
+packet!(CookieResponse { key: String => Ident, payload: Option<Vec<u8>> => Opt<crate::buf::BytesN<{ super::configuration::MAX_COOKIE }>> });
 
 packet_enum!(Serverbound, crate::ids::login::serverbound {
     Hello(ServerHello) = HELLO,
@@ -56,9 +66,51 @@ packet_enum!(Serverbound, crate::ids::login::serverbound {
     CookieResponse(CookieResponse) = COOKIE_RESPONSE,
 });
 
+// Generated retained-allocation traversals; regenerate with protocol-retained-gen.
+
+// End generated retained traversals.
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookies_and_profile_properties_keep_vanillas_caps() {
+        use crate::buf::{Reader, Writer};
+        let response = |n: usize| {
+            let mut w = Writer::new();
+            w.string("a:b");
+            w.bool(true);
+            w.byte_array(&vec![7; n]);
+            w.data
+        };
+        let read = |data: &[u8]| {
+            <CookieResponse as crate::buf::Codec<CookieResponse>>::read(&mut Reader::new(data))
+        };
+        assert!(read(&response(5120)).is_ok());
+        assert!(read(&response(5121)).is_err());
+        let profile = |n: usize| GameProfile {
+            uuid: 1,
+            name: "Kim".into(),
+            properties: (0..n)
+                .map(|i| Property {
+                    name: format!("p{i}"),
+                    value: String::new(),
+                    signature: None,
+                })
+                .collect(),
+        };
+        let bytes = |p: &GameProfile| {
+            let mut w = Writer::new();
+            <GameProfile as crate::buf::Codec<GameProfile>>::write(p, &mut w);
+            w.data
+        };
+        let read = |data: &[u8]| {
+            <GameProfile as crate::buf::Codec<GameProfile>>::read(&mut Reader::new(data))
+        };
+        assert!(read(&bytes(&profile(16))).is_ok());
+        assert!(read(&bytes(&profile(17))).is_err());
+    }
     use crate::packets::round_trip;
 
     #[test]
@@ -130,5 +182,58 @@ mod tests {
         })
         .encode();
         assert!(Serverbound::decode(0, &long[1..]).is_err());
+    }
+
+    /// `ClientboundCustomQueryPacket` and `ServerboundCustomQueryAnswerPacket` read what is left
+    /// of the packet after their fixed fields as the payload, and refuse more than 1048576 bytes
+    /// ("Payload may not be larger than 1048576 bytes"); exactly that many is read.
+    #[test]
+    fn a_login_query_payload_is_at_most_a_mebibyte() {
+        const MAX: usize = 1_048_576;
+        let query = |n: usize| {
+            Clientbound::CustomQuery(CustomQuery {
+                transaction: 3,
+                channel: "velocity:player_info".into(),
+                data: vec![7; n],
+            })
+            .encode()
+        };
+        let answer = |n: usize| {
+            Serverbound::CustomQueryAnswer(CustomQueryAnswer {
+                transaction: 3,
+                payload: Some(vec![7; n]),
+            })
+            .encode()
+        };
+        let query_id = crate::ids::login::clientbound::CUSTOM_QUERY;
+        let answer_id = crate::ids::login::serverbound::CUSTOM_QUERY_ANSWER;
+        for n in [0, 1, MAX] {
+            match Clientbound::decode(query_id, &query(n)[1..]).unwrap() {
+                Clientbound::CustomQuery(q) => assert_eq!(q.data.len(), n),
+                other => panic!("{other:?}"),
+            }
+            match Serverbound::decode(answer_id, &answer(n)[1..]).unwrap() {
+                Serverbound::CustomQueryAnswer(a) => {
+                    assert_eq!(a.payload.map(|p| p.len()), Some(n));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // (Not `unwrap_err`: it would print the whole payload if one were read.)
+        let Err(too_big) = Clientbound::decode(query_id, &query(MAX + 1)[1..]) else {
+            panic!("a query payload one byte over the cap was read");
+        };
+        assert!(too_big.0.contains("1048576"), "{too_big:?}");
+        let Err(too_big) = Serverbound::decode(answer_id, &answer(MAX + 1)[1..]) else {
+            panic!("an answer payload one byte over the cap was read");
+        };
+        assert!(too_big.0.contains("1048576"), "{too_big:?}");
+        // An answer with no payload is still read.
+        let none = Serverbound::CustomQueryAnswer(CustomQueryAnswer {
+            transaction: 3,
+            payload: None,
+        })
+        .encode();
+        assert!(Serverbound::decode(answer_id, &none[1..]).is_ok());
     }
 }

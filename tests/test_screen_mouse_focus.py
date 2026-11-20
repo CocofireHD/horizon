@@ -22,8 +22,8 @@ class ScreenMouseFocusTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
     def test_accepted_press_focus(self):
-        source = (ROOT / "crates/horizon-client/src/game/pad_menu.rs").read_text()
-        source = source.replace("pub(super) fn", "fn")
+        source = (next(ROOT.glob('crates/horizon-client/src/game/*/pad_menu/keys.rs'))).read_text()
+        source = source.replace("pub(in crate::game) fn", "fn")
         fixture = r"""
 #[derive(Clone, Copy, PartialEq)]
 enum ElementState { Pressed, Released }
@@ -37,6 +37,7 @@ struct Pad { menu: Menu }
 struct Game { pad: Pad, cursor: (f32, f32), in_menu: bool }
 impl Game {
     fn pad_in_menu(&self) -> bool { self.in_menu }
+    fn key_focus_screen(&self) -> bool { self.in_menu }
     fn key_targets(&self) -> Vec<Target> { vec![Target { rect: [0., 0., 10., 10.] }] }
     METHOD
 }

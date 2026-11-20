@@ -146,9 +146,7 @@ impl Launcher {
                                 .text_color(t.ink)
                                 .child(choice_name(choice)),
                         )
-                        .when(chosen, |d| {
-                            d.child(div().size(px(6.)).rounded_full().bg(t.accent))
-                        })
+                        .when(chosen, |d| d.child(div().size(px(6.)).bg(t.accent)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.pick_language(choice, cx)
                         })),
@@ -161,7 +159,7 @@ impl Launcher {
         let said = self.settings.language.is_none().then(|| {
             div()
                 .child(trf(
-                    "System follows your computer's language: {language} here. A string not \
+                    "System follows your computer's language: {language} here. Text not \
                      translated yet shows in English.",
                     &[("language", Language::system().name())],
                 ))

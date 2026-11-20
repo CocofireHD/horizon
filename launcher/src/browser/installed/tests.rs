@@ -66,6 +66,7 @@ fn project(id: &str, kind: Kind) -> Project {
         kind,
         game_versions: vec![GAME.into()],
         loaders: vec!["minecraft".into()],
+        blocked: None,
     }
 }
 
@@ -235,6 +236,39 @@ fn modpacks_download_checked() {
     fs::remove_dir_all(&home).unwrap();
 }
 
+impl Fake {
+    /// Gives `id`'s newest file the name its source lists.
+    fn name_newest(&self, id: &str, name: &str) {
+        self.versions.lock().unwrap().get_mut(id).unwrap()[0].files[0].name = name.into();
+    }
+}
+
+#[test]
+fn a_source_name_with_a_colon_is_saved_and_recorded_under_a_plain_name() {
+    let home = home("colon");
+    let mut fake = Fake::default();
+    // Modrinth names a pack's file after its project: "Yet Another Bingo: Ultimate" (#18263).
+    fake.add(project("bingo", Kind::Modpack));
+    fake.release("bingo", "2.15.1", &[], b"mrpack", false);
+    fake.name_newest("bingo", "Yet Another Bingo: Ultimate-2.15.1.mrpack");
+    let downloads = home.join("downloads");
+    let path = fetch_modpack(&fake, &fake.project("bingo").unwrap(), &downloads, &|_| {}).unwrap();
+    assert_eq!(
+        path,
+        downloads.join("Yet Another Bingo- Ultimate-2.15.1.mrpack")
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"mrpack");
+
+    fake.add(project("tools", Kind::ResourcePack));
+    fake.release("tools", "1", &[], b"pack", false);
+    fake.name_newest("tools", "Tools: \"Extra\"?-1.zip");
+    let done = install(&fake, &fake.project("tools").unwrap(), false, &home, NONE).unwrap();
+    assert_eq!(done[0].file, "resourcepacks/Tools- -Extra---1.zip");
+    assert_eq!(fs::read(home.join(&done[0].file)).unwrap(), b"pack");
+    assert_eq!(Installed::load(&home).entries[0].file, done[0].file);
+    fs::remove_dir_all(&home).unwrap();
+}
+
 /// A NeoForge jar with `files` beside its `neoforge.mods.toml` for mod `id`.
 fn mod_jar(id: &str, files: &[(&str, &str)]) -> Vec<u8> {
     use std::io::Write;
@@ -317,6 +351,190 @@ fn java_mods_are_ported_turned_on_refused_on_clashes_and_removed() {
     fs::remove_dir_all(&home).unwrap();
 }
 
+/// A source with Fabric mod `a-b` (one block, so it Works), and the jar's bytes.
+fn hyphenated_mod() -> (Fake, Vec<u8>) {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, text) in [
+        (
+            "fabric.mod.json",
+            r#"{"schemaVersion": 1, "id": "a-b", "version": "1.0"}"#,
+        ),
+        (
+            "assets/a-b/blockstates/chair.json",
+            r#"{"variants": {"": {"model": "a-b:block/chair"}}}"#,
+        ),
+    ] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(text.as_bytes()).unwrap();
+    }
+    let jar = zip.finish().unwrap().into_inner();
+    let mut fake = Fake::default();
+    let mut p = project("ab", Kind::Mod);
+    p.loaders = vec!["fabric".into()];
+    fake.add(p);
+    fake.release("ab", "1", &[], &jar, false);
+    (fake, jar)
+}
+
+#[test]
+fn a_cached_refusal_of_a_hyphenated_id_is_checked_again() {
+    let home = home("hyphen-cache");
+    let (fake, jar) = hyphenated_mod();
+    // The check an older launcher kept for this jar: refused for its id.
+    let sha: String = sha2::Sha512::digest(&jar)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let dir = home.join("mod-browser/checks-1").join(&sha[..40]);
+    let jar_path = home.join("a-b.jar");
+    fs::write(&jar_path, &jar).unwrap();
+    let mut old = horizon_port_pack::check::check(&jar_path, &dir).unwrap();
+    let _ = fs::remove_dir_all(dir.join("carry"));
+    old.verdict = horizon_port_pack::check::Verdict::No;
+    old.summary = "Can't be carried over: mod id \"a-b\" is not [a-z0-9_]{1,64}: rename it before carrying over".into();
+    fs::write(dir.join("check.json"), serde_json::to_string(&old).unwrap()).unwrap();
+    let file = fake.versions.lock().unwrap()["ab"][0].files[0].clone();
+    assert!(super::super::java::cached(&home, &file).is_none());
+
+    let done = install(&fake, &fake.project("ab").unwrap(), false, &home, NONE).unwrap();
+    assert_eq!(done[0].file, "horizon-mods/a_b");
+    assert_eq!(done[0].verdict.as_deref(), Some("Works"));
+    assert!(home
+        .join("horizon-mods/a_b/assets/a-b/blockstates/chair.json")
+        .is_file());
+
+    // Any other cached refusal stands.
+    old.summary = "Nothing in it ports.".into();
+    fs::write(dir.join("check.json"), serde_json::to_string(&old).unwrap()).unwrap();
+    assert!(super::super::java::cached(&home, &file).is_some());
+    fs::remove_dir_all(&home).unwrap();
+}
+
+/// A valid `.hmod` at `horizon-mods/.backup.hmod` whose manifest says mod id `a_b`: the game
+/// finds it by its manifest, not its name.
+fn backup_archive(home: &Path) {
+    use std::io::Write;
+    let path = home.join("horizon-mods/.backup.hmod");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    zip.start_file("horizon-mod.toml", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(
+        b"id = \"a_b\"
+name = \"Backup\"
+version = \"1.0\"
+api = \"0.2\"
+side = \"both\"
+capabilities = [\"registries\"]
+",
+    )
+    .unwrap();
+    zip.finish().unwrap();
+    let found = horizon_platform::mod_package::find(&home.join("horizon-mods"));
+    assert_eq!(found, std::slice::from_ref(&path));
+    let package = horizon_platform::mod_package::Package::read(&path).unwrap();
+    assert_eq!(package.manifest.id, "a_b");
+    fs::write(
+        home.join("horizon-mods.txt"),
+        "mod.a_b:true
+",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_hyphenated_id_that_another_installed_mod_has_is_refused() {
+    let home = home("hyphen-clash");
+    let (fake, _) = hyphenated_mod();
+    backup_archive(&home);
+    let refused = install(&fake, &fake.project("ab").unwrap(), false, &home, NONE).unwrap_err();
+    assert!(
+        refused.contains("Another mod already uses the id a_b"),
+        "{refused}"
+    );
+    assert!(!home.join("horizon-mods/a_b").exists());
+    assert_eq!(
+        fs::read_to_string(home.join("horizon-mods.txt")).unwrap(),
+        "mod.a_b:true
+"
+    );
+    assert!(Installed::load(&home).entries.is_empty());
+    fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn an_install_interrupted_before_publishing_can_be_retried() {
+    let home = home("hyphen-retry");
+    let (fake, _) = hyphenated_mod();
+    // What a failed move into place leaves: the staging copy, with its manifest.
+    let part = home.join("horizon-mods/.a_b.part");
+    fs::create_dir_all(&part).unwrap();
+    fs::write(
+        part.join("horizon-mod.toml"),
+        "id = \"a_b\"
+name = \"a-b\"
+version = \"1.0\"
+api = \"0.2\"
+side = \"both\"
+capabilities = [\"registries\"]
+",
+    )
+    .unwrap();
+    let found = horizon_platform::mod_package::find(&home.join("horizon-mods"));
+    assert_eq!(found, std::slice::from_ref(&part));
+    assert_eq!(
+        horizon_platform::mod_package::Package::read(&part)
+            .unwrap()
+            .manifest
+            .id,
+        "a_b"
+    );
+    let done = install(&fake, &fake.project("ab").unwrap(), false, &home, NONE).unwrap();
+    assert_eq!(done[0].file, "horizon-mods/a_b");
+    assert!(home.join("horizon-mods/a_b/horizon-mod.toml").is_file());
+    assert!(!part.exists());
+    fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn a_refused_install_installs_none_of_its_dependencies() {
+    let home = home("hyphen-clash-deps");
+    let (mut fake, jar) = hyphenated_mod();
+    // `a-b` needs `ruby`, a mod that runs.
+    let mut ruby = project("ruby", Kind::Mod);
+    ruby.loaders = vec!["neoforge".into()];
+    fake.add(ruby);
+    let block = r#"{"variants": {"": {"model": "ruby:block/ruby_block"}}}"#;
+    fake.release(
+        "ruby",
+        "1",
+        &[],
+        &mod_jar(
+            "ruby",
+            &[("assets/ruby/blockstates/ruby_block.json", block)],
+        ),
+        false,
+    );
+    fake.release("ab", "2", &["ruby"], &jar, false);
+    backup_archive(&home);
+    let refused = install(&fake, &fake.project("ab").unwrap(), false, &home, NONE).unwrap_err();
+    assert!(
+        refused.contains("Another mod already uses the id a_b"),
+        "{refused}"
+    );
+    assert!(!home.join("horizon-mods/ruby").exists());
+    assert!(!home.join("horizon-mods/a_b").exists());
+    assert_eq!(
+        fs::read_to_string(home.join("horizon-mods.txt")).unwrap(),
+        "mod.a_b:true
+"
+    );
+    assert!(Installed::load(&home).entries.is_empty());
+    fs::remove_dir_all(&home).unwrap();
+}
+
 #[test]
 fn shader_packs_older_launchers_installed_are_left_alone() {
     let home = home("old-shader-pack");
@@ -381,7 +599,7 @@ fn data_packs_go_into_a_world_when_something_in_them_runs() {
         "terrain",
         "1.0",
         &[],
-        &datapack_zip(&["data/t/worldgen/biome/b.json"]),
+        &datapack_zip(&["data/t/worldgen/world_preset/w.json"]),
         false,
     );
     let tools = fake.project("tools").unwrap();
@@ -393,7 +611,7 @@ fn data_packs_go_into_a_world_when_something_in_them_runs() {
     assert_eq!(done.number, "2.0");
     assert_eq!(
         done.coverage.summary(),
-        "Runs its 2 functions, 1 function tag. Not read yet: 1 recipe."
+        "Runs its 2 functions, 1 function tag, 1 recipe."
     );
     assert!(world.join("datapacks/tools-2.0.zip").is_file());
     // Nothing of it in the browser's own list.
@@ -409,9 +627,24 @@ fn data_packs_go_into_a_world_when_something_in_them_runs() {
         .unwrap();
     assert_eq!(
         refused,
-        "Pack terrain would change nothing in Horizon yet: it has no functions, predicates or \
-         item modifiers, and Horizon doesn't read its 1 worldgen yet."
+        "Pack terrain would change nothing in Horizon yet: Horizon doesn't read its 1 worldgen \
+         world preset."
     );
+    // A pack of only recipes, or only worldgen, now does something.
+    for (slug, file) in [
+        ("recipes", "data/t/recipe/r.json"),
+        ("biomes", "data/t/worldgen/biome/b.json"),
+    ] {
+        let mut only = project(slug, Kind::DataPack);
+        only.loaders = vec!["datapack".into()];
+        fake.add(only);
+        fake.release(slug, "1", &[], &datapack_zip(&[file]), false);
+        let only = fake.project(slug).unwrap();
+        assert!(
+            install_datapack(&fake, &only, false, &world, off).is_ok(),
+            "{slug}"
+        );
+    }
     let jar = fake.project("jar").unwrap();
     assert!(install_datapack(&fake, &jar, false, &world, off).is_err());
 
@@ -425,6 +658,6 @@ fn data_packs_go_into_a_world_when_something_in_them_runs() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names.len(), 2, "{names:?}");
+    assert_eq!(names.len(), 4, "{names:?}");
     fs::remove_dir_all(world.parent().unwrap().parent().unwrap()).unwrap();
 }

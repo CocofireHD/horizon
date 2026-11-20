@@ -16,10 +16,12 @@ use super::{
     path::PathType,
 };
 use crate::blocks::Fluid;
+use crate::health::DamageLevel;
 use horizon_core::{
     geometry::{Vec3, trig},
     random::RandomSource,
 };
+use horizon_world::move_gate::MoveGate;
 
 /// `Turtle.registerGoals`, and the path maluses and navigation `Turtle` and
 /// `TurtlePathNavigation` give it.
@@ -154,12 +156,18 @@ pub fn move_control(m: &mut Mob) {
 /// `Turtle.travelInWater`: swims at 0.1 move speed with 0.9 drag, and sinks
 /// slowly unless it has a target or is going home and near its home. On
 /// land the usual travel.
-pub fn travel(m: &mut Mob, w: &MobWorld, input: Vec3, events: &mut Vec<MobEvent>) -> bool {
+pub fn travel(
+    m: &mut Mob,
+    w: &MobWorld,
+    level: &mut DamageLevel<'_>,
+    input: Vec3,
+    events: &mut Vec<MobEvent>,
+) -> bool {
     if !m.fluids.in_water {
         return false;
     }
     m.move_relative(0.1, input);
-    m.do_move(w, events);
+    m.do_move(w, level, events, &mut MoveGate::new());
     m.velocity = m.velocity.scale(0.9);
     if m.ai.target.is_none() && (!going_home(m) || !close_to_home(m, 20.0)) {
         m.velocity.y -= 0.005;
@@ -235,7 +243,9 @@ impl Goal for LayEgg {
             set_laying_egg(m, true);
         } else if m.extra.counter > 200 {
             let at = [m.position.x, m.position.y, m.position.z];
-            let pitch = 0.9 + m.random.next_float() * 0.2;
+            // `TurtleLayEggGoal` plays the sound with the level's random, then
+            // draws the egg count from the turtle's own.
+            let pitch = 0.9 + cx.level.random().next_float() * 0.2;
             cx.events
                 .push(MobEvent::Sound("entity.turtle.lay_egg", at, 0.3, pitch));
             // Blocks.TURTLE_EGG with EGGS = nextInt(4) + 1 above the sand.
@@ -250,8 +260,16 @@ impl Goal for LayEgg {
                 });
             let b = self.0.block;
             if let Some(state) = state {
-                cx.events.push(MobEvent::SetBlock {
-                    pos: [b[0], b[1] + 1, b[2]],
+                let pos = [b[0], b[1] + 1, b[2]];
+                cx.events.push(MobEvent::SetBlock { pos, state });
+                cx.events.push(MobEvent::GameEvent {
+                    event: "minecraft:block_place",
+                    at: [
+                        f64::from(pos[0]) + 0.5,
+                        f64::from(pos[1]) + 0.5,
+                        f64::from(pos[2]) + 0.5,
+                    ],
+                    source: m.id,
                     state,
                 });
             }
@@ -612,8 +630,8 @@ mod tests {
     #[test]
     fn water_speed_is_cut_away_from_home_and_for_babies() {
         // updateSpeed in water near home: no cut, the lerp climbs towards
-        // 0.25, and it lifts the turtle 0.005 a tick. (Only the control's
-        // speed: Turtle.travelInWater is not ported.)
+        // 0.25, and it lifts the turtle 0.005 a tick. (Tests only the move
+        // control's speed; Turtle.travelInWater is ported in travel().)
         let mut m = strolling_turtle();
         m.on_ground = false;
         m.fluids.in_water = true;
@@ -687,5 +705,70 @@ mod tests {
         move_control(&mut m);
         assert_eq!(m.yaw, 60.0 + (target - 60.0) + 360.0);
         assert_eq!(m.body_yaw, m.yaw);
+    }
+
+    /// `Turtle.TurtleLayEggGoal.tick`: the pitch comes from the level's
+    /// random, the egg count from the turtle's, and the egg it sets is
+    /// followed by `block_place` from the turtle at the new block.
+    #[test]
+    #[ignore = "daily"]
+    fn laying_an_egg_posts_block_place_with_the_level_s_pitch_and_its_own_eggs() {
+        let ran = crate::mobs::world::with_test_world(&[], |w, _| {
+            use horizon_core::random::LegacyRandom;
+            let mut m = strolling_turtle();
+            m.position = Vec3::new(0.5, 0.0, 0.5);
+            m.extra.flag = true;
+            m.extra.counter = 201;
+            m.random = horizon_core::random::EntityRandom::own(LegacyRandom::new(7));
+            let mut lr = crate::health::TestLevel::new(11);
+            let mut level = lr.random().clone();
+            let pitch = 0.9_f32 + level.next_float() * 0.2_f32;
+            let mut own = m.random.clone();
+            let eggs = own.next_int_bound(4).unwrap() + 1;
+            let mut events = Vec::new();
+            let mut cx = Cx {
+                w,
+                level: &mut lr.level(),
+                events: &mut events,
+            };
+            let mut goal = LayEgg(MoveToBlock {
+                reached: true,
+                block: [0, -1, 0],
+                ..Default::default()
+            });
+            goal.tick(&mut m, &mut cx);
+            let base = w.registry.default_state("minecraft:turtle_egg").unwrap();
+            let mut state = w.registry.state(base).unwrap().clone();
+            state.properties.insert("eggs".into(), eggs.to_string());
+            let egg = w.registry.resolve(&state).unwrap();
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    MobEvent::Sound("entity.turtle.lay_egg", _, _, p) if *p == pitch
+                )),
+                "the sound's pitch is the level random's: {events:?}"
+            );
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, MobEvent::SetBlock { pos: [0, 0, 0], state } if *state == egg)
+                ),
+                "the turtle's random picked the egg count: {events:?}"
+            );
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    MobEvent::GameEvent {
+                        event: "minecraft:block_place",
+                        at: [0.5, 0.5, 0.5],
+                        source: 1,
+                        state,
+                    } if *state == egg
+                )),
+                "the new egg posts block_place from the turtle: {events:?}"
+            );
+            assert_eq!(lr.random().state(), level.state());
+            assert_eq!(m.random.state(), own.state());
+        });
+        assert!(ran, "vanilla data is missing");
     }
 }

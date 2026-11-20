@@ -1,16 +1,16 @@
 use super::*;
-use horizon_world::nbt::Tag;
+use horizon_core::nbt::Tag;
 use std::{
     fs,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-struct Fixture {
+pub(super) struct Fixture {
     root: PathBuf,
-    title: Title,
+    pub(super) title: Title,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
             "horizon-world-menu-{}-{}",
@@ -19,11 +19,11 @@ impl Fixture {
         ));
         fs::create_dir_all(root.join("saves")).unwrap();
         Self {
-            title: Title::new(root.join("saves"), &root),
+            title: Title::new(root.join("saves"), &root, ""),
             root,
         }
     }
-    fn world(&self, folder: &str, name: &str) {
+    pub(super) fn world(&self, folder: &str, name: &str) {
         crate::save::write_dat(
             &self.title.saves.join(folder).join("level.dat"),
             Tag::compound([
@@ -50,7 +50,7 @@ impl Fixture {
         )
         .unwrap();
     }
-    fn click(&mut self, label: &str) -> Action {
+    pub(super) fn click(&mut self, label: &str) -> Action {
         self.click_with_sound(label).0
     }
     fn click_with_sound(&mut self, label: &str) -> (Action, bool) {
@@ -84,19 +84,148 @@ impl Fixture {
         self.title.finish_preparing();
         assert!(matches!(self.title.creation_packs(), Some((_, _))));
     }
-    fn finish_backup(&mut self) {
-        self.title.backup_shown.set(true);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while matches!(self.title.mode, Mode::Backup { .. }) {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            self.title.poll_backup();
+}
+include!("preset_tests.rs");
+
+/// Join a Friend needs a resolver; these tests stand one in (`net::JOINS_FRIENDS_IN_TEST`).
+fn with_resolver() -> Fixture {
+    crate::net::JOINS_FRIENDS_IN_TEST.set(true);
+    Fixture::new()
+}
+
+#[test]
+fn without_a_resolver_the_friends_icon_is_inactive_and_opens_nothing() {
+    crate::net::JOINS_FRIENDS_IN_TEST.set(false);
+    let mut f = Fixture::new();
+    let icons: Vec<_> = f
+        .title
+        .buttons(480.0, 262.0)
+        .into_iter()
+        .filter(|b| b.icon.is_some())
+        .map(|b| (b.label.clone(), b.enabled, b.x))
+        .collect();
+    // Same place and look as with one, only greyed; Language and Accessibility stay active.
+    let friends = icons.iter().find(|(label, ..)| label == "Friends").unwrap();
+    assert!(!friends.1);
+    assert!(
+        icons
+            .iter()
+            .filter(|(label, ..)| label != "Friends")
+            .all(|(_, on, _)| *on)
+    );
+    assert_eq!(f.click("Friends"), Action::None);
+    assert!(matches!(f.title.mode, Mode::Main));
+    crate::net::JOINS_FRIENDS_IN_TEST.set(true);
+    let with: Vec<_> = f
+        .title
+        .buttons(480.0, 262.0)
+        .into_iter()
+        .filter(|b| b.icon.is_some())
+        .map(|b| (b.label.clone(), b.x, b.y))
+        .collect();
+    assert_eq!(
+        with.iter()
+            .map(|(l, x, _)| (l.clone(), *x))
+            .collect::<Vec<_>>(),
+        icons
+            .iter()
+            .map(|(l, _, x)| (l.clone(), *x))
+            .collect::<Vec<_>>()
+    );
+    crate::net::JOINS_FRIENDS_IN_TEST.set(false);
+}
+
+mod multiplayer_parent_navigation {
+    use super::*;
+    use crate::multiplayer::{Outcome, Screen};
+
+    #[test]
+    fn friend_cancel_returns_to_title() {
+        let mut f = with_resolver();
+        f.click("Friends");
+        assert!(matches!(
+            f.title.mode,
+            Mode::Multiplayer(Screen::Friend { .. })
+        ));
+        assert_eq!(f.click("Cancel"), Action::None);
+        assert!(matches!(f.title.mode, Mode::Main));
+    }
+
+    #[test]
+    fn friend_escape_returns_to_title() {
+        let mut f = with_resolver();
+        f.click("Friends");
+        assert!(matches!(
+            f.title.mode,
+            Mode::Multiplayer(Screen::Friend { .. })
+        ));
+        f.title.escape();
+        assert!(matches!(f.title.mode, Mode::Main));
+    }
+
+    #[test]
+    fn friend_from_server_list_cancel_and_escape_return_to_list() {
+        for escape in [false, true] {
+            let mut f = Fixture::new();
+            f.click("Multiplayer");
+            f.click("Proceed");
+            // The legacy entry has a click handler but no visible button.
+            assert!(matches!(
+                f.title
+                    .multiplayer_click(Some(47), 0.0, 0.0, (480.0, 262.0)),
+                Outcome::None
+            ));
+            assert!(matches!(
+                f.title.mode,
+                Mode::Multiplayer(Screen::Friend { .. })
+            ));
+            if escape {
+                f.title.escape();
+            } else {
+                assert_eq!(f.click("Cancel"), Action::None);
+            }
+            assert!(matches!(
+                f.title.mode,
+                Mode::Multiplayer(Screen::List { .. })
+            ));
         }
     }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+
+    #[test]
+    fn direct_and_add_edit_cancel_and_escape_return_to_list() {
+        for screen in [
+            Screen::Direct {
+                address: String::new(),
+            },
+            Screen::Edit {
+                index: None,
+                name: String::new(),
+                address: String::new(),
+                focus: 0,
+                packs: None,
+            },
+            Screen::Edit {
+                index: Some(0),
+                name: String::new(),
+                address: String::new(),
+                focus: 0,
+                packs: None,
+            },
+        ] {
+            for escape in [false, true] {
+                let mut f = Fixture::new();
+                f.title.mode = Mode::Multiplayer(screen.clone());
+                if escape {
+                    f.title.escape();
+                } else {
+                    assert_eq!(f.click("Cancel"), Action::None);
+                }
+                assert!(matches!(
+                    f.title.mode,
+                    Mode::Multiplayer(Screen::List { .. })
+                ));
+            }
+        }
     }
 }
 
@@ -130,6 +259,7 @@ fn direct_connection_remembers_the_address_on_cancel_escape_and_join() {
         Action::Connect {
             address: "localhost:25569".into(),
             lan: false,
+            realm: false,
         }
     );
     assert_eq!(f.title.last_server, "localhost:25569");
@@ -140,7 +270,44 @@ fn direct_connection_remembers_the_address_on_cancel_escape_and_join() {
     assert!(f.title.focused_field().unwrap().1.is_empty());
 }
 
+/// While the game gates the title (a mod listens to the screen hooks), the
+/// multiplayer list's own steps are asked for, not applied: the game fires
+/// `screen_opening` first, then applies them (`take_requested`).
 #[test]
+fn a_gated_title_asks_for_the_multiplayer_lists_steps() {
+    use crate::multiplayer::Screen;
+    let mut f = Fixture::new();
+    f.title.last_server = "localhost:25566".into();
+    f.click("Multiplayer");
+    f.click("Proceed");
+    f.title.gated = true;
+    f.click("Direct Connection");
+    assert!(matches!(
+        f.title.mode,
+        Mode::Multiplayer(Screen::List { .. })
+    ));
+    let next = f
+        .title
+        .take_requested()
+        .expect("Direct Connection is asked for");
+    assert!(matches!(
+        &next,
+        Mode::Multiplayer(Screen::Direct { address }) if address == "localhost:25566"
+    ));
+    f.title.mode = next;
+    f.title.escape();
+    assert!(matches!(
+        f.title.mode,
+        Mode::Multiplayer(Screen::Direct { .. })
+    ));
+    assert!(matches!(
+        f.title.take_requested(),
+        Some(Mode::Multiplayer(Screen::List { .. }))
+    ));
+}
+
+#[test]
+#[ignore = "daily"]
 fn f5_reloads_the_server_list() {
     let mut f = Fixture::new();
     f.click("Multiplayer");
@@ -384,7 +551,7 @@ fn backup_zip_preserves_nested_files_excludes_lock_and_keeps_duplicate_backups()
     )
     .unwrap();
     for _ in 0..2 {
-        assert!(world_management::backup(&f.title.saves, "World").unwrap() > 0);
+        assert!(world_management::backup(&f.title.saves, "World").unwrap().1 > 0);
     }
     let archives: Vec<_> = fs::read_dir(f.root.join("backups"))
         .unwrap()
@@ -430,7 +597,7 @@ fn backup_screen_blocks_navigation_and_returns_to_the_selected_world() {
         matches!(&f.title.mode, Mode::Select { worlds, selected: Some(i) } if worlds[*i].folder == "World")
     );
     assert!(
-        matches!(&f.title.toast, Some((_, WorldToast::Created { folder, bytes })) if folder == "World" && *bytes > 0)
+        matches!(&f.title.pending_toast, Some(WorldToast::Created { folder, bytes }) if folder == "World" && *bytes > 0)
     );
     assert_eq!(
         Level::read(&f.title.saves.join("World")).unwrap().name,
@@ -452,7 +619,7 @@ fn failed_backup_returns_to_the_selected_world_with_an_error_toast() {
     assert!(
         matches!(&f.title.mode, Mode::Select { worlds, selected: Some(i) } if worlds[*i].folder == "World")
     );
-    let Some((_, WorldToast::Failed(error))) = &f.title.toast else {
+    let Some(WorldToast::Failed(error)) = &f.title.pending_toast else {
         panic!("backup failures should produce an error toast");
     };
     assert!(!error.is_empty());
@@ -481,7 +648,7 @@ fn stopped_backup_worker_returns_to_the_list_with_an_error_toast() {
         matches!(&f.title.mode, Mode::Select { worlds, selected: Some(i) } if worlds[*i].folder == "World")
     );
     assert!(
-        matches!(&f.title.toast, Some((_, WorldToast::Failed(error))) if error == "Backup worker stopped")
+        matches!(&f.title.pending_toast, Some(WorldToast::Failed(error)) if error == "Backup worker stopped")
     );
 }
 
@@ -494,17 +661,27 @@ fn backup_toast_slides_in_and_out_with_its_sounds() {
     f.click("Make Backup");
     f.title.poll_backup();
     f.finish_backup();
+    assert!(!f.title.has_toast(), "candidate waits for the game Host");
+    let candidate = f.title.take_pending_toast().unwrap();
+    f.title.apply_toast(candidate);
     assert_eq!(f.title.update_toast(1.0), Some("minecraft:ui.toast.in"));
     assert_eq!(f.title.update_toast(1.0), None);
     let age = |f: &mut Fixture, ms: u64| {
-        let (slide, _) = f.title.toast.as_mut().unwrap();
-        let origin = slide.origin.as_mut().unwrap();
+        let origin = f
+            .title
+            .toast
+            .as_mut()
+            .unwrap()
+            .slide
+            .origin
+            .as_mut()
+            .unwrap();
         *origin -= std::time::Duration::from_millis(ms);
     };
     // Half way in: (300 / 600)² of its width shows.
     age(&mut f, 300);
     assert_eq!(f.title.update_toast(1.0), None);
-    let portion = f.title.toast.as_ref().unwrap().0.portion;
+    let portion = f.title.toast.as_ref().unwrap().slide.portion;
     assert!((portion - 0.25).abs() < 0.02, "{portion}");
     // Shown in full for the display time, then out.
     age(&mut f, 300);
@@ -631,7 +808,13 @@ fn only_the_vertical_wheel_cycles_a_create_world_button() {
         else {
             panic!("not on Create World");
         };
-        create_world::buttons(size.0, size.1, *creative, options)
+        create_world::buttons(
+            size.0,
+            size.1,
+            *creative,
+            options,
+            f.title.preset_data.is_some(),
+        )
     };
     let button = labels(&f)
         .into_iter()
@@ -759,7 +942,11 @@ fn offer_data_packs_with_a_feature_asks_and_the_confirm_screen_decides() {
     );
     // Back (`onAbort`): the Data Packs screen reopens with the selection
     // it had, the confirm screen is gone.
-    let atlas = crate::hud::HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
+    let atlas =
+        crate::hud::HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            (Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+        ))
+        .unwrap();
     // confirm_experiments::footer_pair's Back, for a 480-wide screen
     // (COLUMN_SPACING is 10).
     let back_x = ((480.0_f32 - (150.0 * 2.0 + 10.0)) / 2.0).trunc() + 150.0 + 10.0 + 1.0;
@@ -875,7 +1062,7 @@ fn a_world_open_elsewhere_stays_closed_behind_a_toast() {
         Action::None
     );
     assert!(
-        matches!(&f.title.toast, Some((_, WorldToast::AccessFailure(folder))) if folder == "World")
+        matches!(&f.title.pending_toast, Some(WorldToast::AccessFailure(folder)) if folder == "World")
     );
     assert!(matches!(f.title.mode, Mode::Select { .. }));
     drop(open);
@@ -1000,30 +1187,145 @@ fn delete_removes_links_without_following_them() {
     assert!(outside.join("keep.txt").is_file());
 }
 
-#[test]
-fn hovered_buttons_ask_for_the_hand_or_not_allowed() {
-    use crate::widgets::Cursor;
-    let mut f = Fixture::new();
-    let atlas = crate::hud::HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
-    let cursor_over = |title: &Title, label: Option<&str>| {
-        let mouse = label.map_or((0.0, 0.0), |label| {
-            let buttons = title.buttons(480.0, 262.0);
-            let b = buttons.iter().find(|b| b.label == label).unwrap();
-            (b.x + b.w / 2.0, b.y + 10.0)
-        });
-        let _ = crate::widgets::take_cursor();
-        title.draw(&atlas, &mut HudBatch::new([480, 262]), mouse, true);
-        crate::widgets::take_cursor()
-    };
-    assert_eq!(
-        cursor_over(&f.title, Some("Singleplayer")),
-        Cursor::PointingHand
+#[path = "draw_cursor_tests.rs"]
+mod draw_cursor_tests;
+
+/// 26.3's en_us strings for the buttons' tooltips, standing in for the
+/// prepared resources.
+struct TooltipStrings;
+impl crate::lang::ResourceSource for TooltipStrings {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        (path == "assets/minecraft/lang/en_us.json").then(|| {
+            br#"{
+                "gui.friends.open.tooltip": "Friends",
+                "options.language.tooltip": "Change Language",
+                "options.accessibility.tooltip": "Accessibility Settings"
+            }"#
+            .to_vec()
+        })
+    }
+}
+
+/// Draws `title` at 480 x 262 in English with the pointer at `mouse`: the
+/// frame's tooltip as the narrator gets it, and what was drawn.
+fn draw_hovered(
+    title: &Title,
+    atlas: &crate::hud::HudAtlas,
+    mouse: (f32, f32),
+    frame: &mut u64,
+) -> (Option<String>, Vec<crate::hud::HudVertex>) {
+    crate::widgets::end_frame(*frame);
+    let _ = crate::widgets::take_last_narration();
+    let mut batch = HudBatch::new(
+        [480, 262],
+        crate::hud::GuiScale {
+            requested: 1,
+            unicode: false,
+        },
     );
-    assert_eq!(cursor_over(&f.title, None), Cursor::Arrow);
-    // The world list's footer is inactive until a world is selected.
-    f.world("A", "Alpha");
-    f.title.enter_singleplayer();
-    assert_eq!(cursor_over(&f.title, Some("Edit")), Cursor::NotAllowed);
+    let english = crate::lang::Language::load(&[&TooltipStrings], "en_us");
+    crate::lang::scoped(english, || {
+        title.draw(atlas, &mut batch, mouse, true, &mut |_, _| {})
+    });
+    crate::widgets::end_frame(*frame + 1);
+    *frame += 2;
+    (
+        crate::widgets::take_last_narration().tooltip,
+        batch.vertices,
+    )
+}
+
+/// The middle of the button `id` at 480 x 262.
+fn button_middle(title: &Title, id: u8) -> (f32, f32) {
+    let buttons = title.buttons(480.0, 262.0);
+    let b = buttons.iter().find(|b| b.id == id).unwrap();
+    (b.x + b.w / 2.0, b.y + 10.0)
+}
+
+/// The icon row's buttons carry vanilla's tooltips (`CommonButtons.language`,
+/// `accessibility`, `FriendsButton`), shown while the pointer is on one, beside
+/// it as `MenuTooltipPositioner` puts them (#12067).
+#[test]
+fn icon_buttons_show_their_tooltip_while_hovered() {
+    let f = Fixture::new();
+    let atlas =
+        crate::hud::HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            Path::new("/nonexistent/horizon-test-assets").to_path_buf(),
+        ))
+        .unwrap();
+    crate::widgets::set_narrating(true);
+    let mut frame = 12_067_000;
+    let (none, plain) = draw_hovered(&f.title, &atlas, (0.0, 0.0), &mut frame);
+    assert_eq!(none, None);
+    // The icons sit at y 185, 20 high. Over the middle of one (y 195),
+    // MenuTooltipPositioner puts the text 12 right of the pointer and at
+    // 195 + 3 + round(lerp(13 / 20, 17, 5)) = 198 + 9 = 207.
+    for (id, text, top_left) in [
+        (5, "Friends", (240.0, 207.0)),
+        (6, "Change Language", (264.0, 207.0)),
+        (7, "Accessibility Settings", (288.0, 207.0)),
+    ] {
+        let mouse = button_middle(&f.title, id);
+        let (tooltip, drawn) = draw_hovered(&f.title, &atlas, mouse, &mut frame);
+        assert_eq!(tooltip.as_deref(), Some(text), "icon button {id}");
+        // The test atlas has no widget or tooltip sprites, so everything past
+        // the plain frame's vertices is the tooltip's text.
+        assert!(
+            drawn.len() > plain.len(),
+            "icon button {id} drew no tooltip"
+        );
+        let tail = &drawn[plain.len()..];
+        let min_x = tail.iter().map(|v| v.pos[0]).fold(f32::MAX, f32::min);
+        let min_y = tail.iter().map(|v| v.pos[1]).fold(f32::MAX, f32::min);
+        assert_eq!((min_x, min_y), top_left, "icon button {id}");
+    }
+    // A text button without a tooltip shows none.
+    let singleplayer = button_middle(&f.title, 1);
+    assert_eq!(
+        draw_hovered(&f.title, &atlas, singleplayer, &mut frame).0,
+        None
+    );
+    crate::widgets::set_narrating(false);
+}
+
+/// `AccessibilityOnboardingScreen.init` builds its Accessibility Settings...
+/// and Language... buttons with the same `CommonButtons`, tooltips and all.
+#[test]
+fn onboarding_common_buttons_show_their_tooltip_while_hovered() {
+    let mut f = Fixture::new();
+    f.title.start_onboarding();
+    let atlas =
+        crate::hud::HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            Path::new("/nonexistent/horizon-test-assets").to_path_buf(),
+        ))
+        .unwrap();
+    crate::widgets::set_narrating(true);
+    let mut frame = 12_067_100;
+    // The first frame also wraps the message the buttons are laid out under.
+    let (none, plain) = draw_hovered(&f.title, &atlas, (0.0, 0.0), &mut frame);
+    assert_eq!(none, None);
+    for (id, text) in [
+        (onboarding::ACCESSIBILITY, "Accessibility Settings"),
+        (onboarding::LANGUAGE, "Change Language"),
+    ] {
+        let mouse = button_middle(&f.title, id);
+        let (tooltip, drawn) = draw_hovered(&f.title, &atlas, mouse, &mut frame);
+        assert_eq!(tooltip.as_deref(), Some(text), "onboarding button {id}");
+        assert!(
+            drawn.len() > plain.len(),
+            "onboarding button {id} drew no tooltip"
+        );
+    }
+    for id in [
+        onboarding::NARRATOR,
+        onboarding::SOUNDS,
+        onboarding::CONTINUE,
+    ] {
+        let mouse = button_middle(&f.title, id);
+        let (tooltip, _) = draw_hovered(&f.title, &atlas, mouse, &mut frame);
+        assert_eq!(tooltip, None, "onboarding button {id}");
+    }
+    crate::widgets::set_narrating(false);
 }
 
 #[test]
@@ -1031,10 +1333,14 @@ fn world_search_hint_is_gray_and_only_shown_empty_and_unfocused() {
     let mut f = Fixture::new();
     f.world("World", "World");
     f.select();
-    let atlas = crate::hud::HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
+    let atlas =
+        crate::hud::HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            (Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+        ))
+        .unwrap();
     let draw = |title: &Title| {
-        let mut batch = HudBatch::new([480, 262]);
-        title.draw(&atlas, &mut batch, (0.0, 0.0), true);
+        let mut batch = HudBatch::scratch([480, 262]);
+        title.draw(&atlas, &mut batch, (0.0, 0.0), true, &mut |_, _| {});
         batch
     };
     let has_hint = |batch: &HudBatch| {
@@ -1071,9 +1377,14 @@ fn scrolled_world_list_draws_inside_the_list_and_drags_its_scroller() {
     f.title.release();
     f.title.drag((bar.0, 60.0), size);
     assert_eq!(f.title.scroll.get().amount, moved);
-    let atlas = crate::hud::HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
-    let mut batch = HudBatch::new([480, 262]);
-    f.title.draw(&atlas, &mut batch, (0.0, 0.0), true);
+    let atlas =
+        crate::hud::HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            (Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+        ))
+        .unwrap();
+    let mut batch = HudBatch::scratch([480, 262]);
+    f.title
+        .draw(&atlas, &mut batch, (0.0, 0.0), true, &mut |_, _| {});
     assert!(!batch.vertices.is_empty());
 }
 
@@ -1493,6 +1804,31 @@ fn world_list_names_every_game_mode_and_hardcore_in_red() {
 }
 
 #[test]
+fn a_last_played_that_cannot_be_a_time_lists_the_world_with_its_files_time() {
+    let f = Fixture::new();
+    // i64::MAX milliseconds overflows SystemTime on Windows.
+    for (folder, millis) in [("Huge", i64::MAX), ("Negative", -5_000)] {
+        f.world(folder, folder);
+        let path = f.title.saves.join(folder).join("level.dat");
+        let mut root = crate::save::read_dat(&path).unwrap();
+        if let Some(Tag::Compound(data)) = root.get_mut("Data") {
+            data.insert("LastPlayed".into(), Tag::Long(millis));
+        }
+        crate::save::write_dat(&path, root).unwrap();
+    }
+
+    let worlds = list_worlds(&f.title.saves);
+    assert_eq!(worlds.len(), 2);
+    for w in &worlds {
+        let changed = fs::metadata(f.title.saves.join(&w.folder).join("level.dat"))
+            .and_then(|m| m.modified())
+            .unwrap();
+        assert_eq!(w.modified, changed, "{}", w.folder);
+        assert!(!w.corrupted, "{}", w.folder);
+    }
+}
+
+#[test]
 fn world_with_unreadable_level_dat_stays_in_the_world_list() {
     let f = Fixture::new();
     f.world("Broken", "My World");
@@ -1712,7 +2048,7 @@ fn set_world_gen(f: &Fixture, folder: &str, change: impl FnOnce(&mut Tag)) {
     crate::save::write_dat(&path, root).unwrap();
 }
 
-fn only_world(f: &Fixture) -> WorldEntry {
+pub(super) fn only_world(f: &Fixture) -> WorldEntry {
     let worlds = list_worlds(&f.title.saves);
     assert_eq!(worlds.len(), 1);
     worlds[0].clone()
@@ -1874,10 +2210,12 @@ fn a_world_opened_by_name_with_unreadable_level_data_shows_the_recovery_screen()
 }
 
 fn old_entity_chunk(f: &Fixture, folder: &str) -> PathBuf {
-    use horizon_world::{
-        compression::Compression,
-        nbt::{Limits, NamedTag},
-        region::{ChunkRecord, RegionFile},
+    use {
+        horizon_core::nbt::{Limits, NamedTag},
+        horizon_world::{
+            compression::Compression,
+            region::{ChunkRecord, RegionFile},
+        },
     };
     let file = f
         .title
@@ -1908,7 +2246,7 @@ fn old_entity_chunk(f: &Fixture, folder: &str) -> PathBuf {
 }
 
 fn chunk_version(file: &Path) -> i32 {
-    use horizon_world::{nbt::Limits, region::RegionFile};
+    use {horizon_core::nbt::Limits, horizon_world::region::RegionFile};
     let record = RegionFile::open(file)
         .unwrap()
         .read(horizon_core::position::ChunkPos::new(0, 0))
@@ -2015,7 +2353,7 @@ fn optimizing_after_a_backup_starts_when_the_backup_is_done() {
     assert!(matches!(f.title.mode, Mode::Backup { .. }));
     f.finish_backup();
     assert!(matches!(f.title.mode, Mode::Optimize { .. }));
-    assert!(f.title.toast.is_some());
+    assert!(f.title.pending_toast.is_some());
     wait_while_optimizing(&mut f);
     assert_eq!(chunk_version(&file), horizon_world::DATA_VERSION);
 }
@@ -2082,7 +2420,10 @@ fn a_finished_optimization_stamps_the_level_data() {
 /// 590 px World Type label on Create World, `hi_in`'s Join Server).
 #[test]
 fn a_button_label_wider_than_its_button_stays_inside_it() {
-    let atlas = HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets")).unwrap();
+    let atlas = HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+        (std::path::Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+    ))
+    .unwrap();
     let mut b = Button {
         x: 100.0,
         y: 40.0,
@@ -2095,7 +2436,7 @@ fn a_button_label_wider_than_its_button_stays_inside_it() {
         action: None,
     };
     assert!(HudBatch::text_width(&atlas, &b.label) > b.w - 4.0);
-    let mut batch = HudBatch::new([640, 480]);
+    let mut batch = HudBatch::scratch([640, 480]);
     b.draw_label(&mut batch, &atlas, u32::MAX);
     assert!(!batch.vertices.is_empty());
     for v in &batch.vertices {
@@ -2109,7 +2450,7 @@ fn a_button_label_wider_than_its_button_stays_inside_it() {
     // A label that fits is centred in the button, as `centered_left` does.
     b.label = "Done".into();
     let width = HudBatch::text_width(&atlas, &b.label);
-    let mut batch = HudBatch::new([640, 480]);
+    let mut batch = HudBatch::scratch([640, 480]);
     b.draw_label(&mut batch, &atlas, u32::MAX);
     let lo = batch
         .vertices
@@ -2199,6 +2540,7 @@ fn the_single_biome_preset_is_customized_into_the_generator() {
         options.world_gen(),
         None,
         options.single_biome(),
+        None,
     )
     .unwrap();
     let settings = crate::save::world_gen_settings(&dir).unwrap();
@@ -2221,6 +2563,7 @@ fn the_single_biome_preset_is_customized_into_the_generator() {
         &crate::save::Level::read(&dir).unwrap_or_default(),
         false,
         &dir,
+        crate::gamerules::rule_registry(),
     );
     assert_eq!(options.single_biome, "minecraft:jungle");
 }
@@ -2291,7 +2634,10 @@ mod text_and_icon {
     use super::*;
 
     fn atlas() -> HudAtlas {
-        HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets")).unwrap()
+        HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+            (std::path::Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+        ))
+        .unwrap()
     }
     fn button(label: &str, icon: Option<(&'static str, f32)>) -> Button {
         Button {
@@ -2345,12 +2691,12 @@ mod text_and_icon {
         let half = width(&atlas, &text) / 2;
         assert!(right - half < center, "{text}: {}", width(&atlas, &text));
         let drawn_from = |from: i32| {
-            let mut batch = HudBatch::new([640, 480]);
+            let mut batch = HudBatch::scratch([640, 480]);
             batch.text(&atlas, &text, from as f32, 46.0, u32::MAX, true);
             xs(&batch)
         };
         let draw = |b: &Button, now_ms: i64| {
-            let mut batch = HudBatch::new([640, 480]);
+            let mut batch = HudBatch::scratch([640, 480]);
             b.draw_label_at(&mut batch, &atlas, u32::MAX, now_ms);
             xs(&batch)
         };
@@ -2374,7 +2720,7 @@ mod text_and_icon {
         assert!(width(&atlas, &text) > 130 - 2);
         let mut seen = std::collections::BTreeSet::new();
         for now_ms in (0..40_000).step_by(250) {
-            let mut batch = HudBatch::new([640, 480]);
+            let mut batch = HudBatch::scratch([640, 480]);
             b.draw_label_at(&mut batch, &atlas, u32::MAX, now_ms);
             let xs = xs(&batch);
             assert!(!xs.is_empty());
@@ -2397,10 +2743,14 @@ mod text_and_icon {
 fn a_create_world_tab_label_wider_than_its_tab_stays_inside_it() {
     let mut f = Fixture::new();
     f.click("Singleplayer");
-    let atlas = HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets")).unwrap();
+    let atlas = HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+        (std::path::Path::new("/nonexistent/horizon-test-assets")).to_owned(),
+    ))
+    .unwrap();
     // 90 px wide: three 20 px tabs from x = 14, too narrow for "Game".
-    let mut batch = HudBatch::new([90, 262]);
-    f.title.draw(&atlas, &mut batch, (0.0, 100.0), true);
+    let mut batch = HudBatch::scratch([90, 262]);
+    f.title
+        .draw(&atlas, &mut batch, (0.0, 100.0), true, &mut |_, _| {});
     let labels: Vec<f32> = batch
         .vertices
         .iter()
@@ -2431,7 +2781,7 @@ fn a_create_world_tab_label_wider_than_its_tab_stays_inside_it() {
 }
 
 /// The ids native mods see for the title's screens (`Mode::id`, the screen
-/// hooks' `NativeScreenView.id`): one per screen, stable across releases.
+/// hooks' `ScreenView.id`): one per screen, stable across releases.
 #[test]
 fn the_title_screens_have_their_own_ids() {
     let mut f = Fixture::new();
@@ -2486,6 +2836,7 @@ fn the_multiplayer_screens_have_their_own_ids() {
     );
     assert_eq!(
         M::Friend {
+            from_title: false,
             code: String::new(),
             relay: String::new(),
             focus: 0,
@@ -2495,11 +2846,236 @@ fn the_multiplayer_screens_have_their_own_ids() {
     );
     assert_eq!(
         M::Disconnected {
-            reason: String::new(),
+            reason: Text::empty(),
             retry: None,
             lines: std::cell::Cell::new(1),
+            to_title: false,
         }
         .id(),
         "disconnected"
     );
+}
+
+#[test]
+fn creation_rules_keep_injected_registry_and_selected_values() {
+    use crate::gamerules::{GameRules, Rule, RuleRegistry, Value};
+    use std::sync::Arc;
+    let rule = Rule {
+        name: "example:enabled".into(),
+        category: "example:machines".into(),
+        default: Value::Bool(true),
+        min: 0,
+        max: 0,
+    };
+    let registry =
+        Arc::new(RuleRegistry::with_mod_rules(&["example:machines".into()], &[rule]).unwrap());
+    let mut fixture = Fixture::new();
+    fixture.title.set_rule_registry(registry.clone());
+    fixture.title.enter_singleplayer();
+    let Mode::Create { options, .. } = &fixture.title.mode else {
+        panic!("creation")
+    };
+    assert!(Arc::ptr_eq(options.rules.registry(), &registry));
+    assert_eq!(
+        options.rules.get("example:enabled"),
+        Some(Value::Bool(true))
+    );
+    fixture.title.close_rules(Exit::Apply(vec![(
+        "example:enabled".into(),
+        Value::Bool(false),
+    )]));
+    let Action::Create { options, .. } = fixture.title.create_action() else {
+        panic!("create")
+    };
+    assert!(Arc::ptr_eq(options.rules.registry(), &registry));
+    assert_eq!(
+        options.rules.get("example:enabled"),
+        Some(Value::Bool(false))
+    );
+    let reopened = GameRules::with_registry(registry, &[]);
+    assert_eq!(reopened.get("example:enabled"), Some(Value::Bool(true)));
+}
+
+#[test]
+fn recreate_rules_load_saved_values_and_default_new_rules() {
+    use crate::gamerules::{GameRules, Rule, RuleRegistry, Value};
+    use std::sync::Arc;
+    let fixture = Fixture::new();
+    let dir = fixture.root.join("world");
+    let definitions = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| Rule {
+                name: format!("example:{name}"),
+                category: "example:machines".into(),
+                default: Value::Bool(true),
+                min: 0,
+                max: 0,
+            })
+            .collect::<Vec<_>>()
+    };
+    let old = Arc::new(
+        RuleRegistry::with_mod_rules(&["example:machines".into()], &definitions(&["old"])).unwrap(),
+    );
+    let mut rules = GameRules::with_registry(old, &[]);
+    rules.set("example:old", Value::Bool(false));
+    rules.save(&dir).unwrap();
+    let current = Arc::new(
+        RuleRegistry::with_mod_rules(&["example:machines".into()], &definitions(&["old", "new"]))
+            .unwrap(),
+    );
+    let options =
+        WorldOptions::of_world(&crate::save::Level::default(), false, &dir, current.clone());
+    assert!(Arc::ptr_eq(options.rules.registry(), &current));
+    assert_eq!(options.rules.get("example:old"), Some(Value::Bool(false)));
+    assert_eq!(options.rules.get("example:new"), Some(Value::Bool(true)));
+}
+
+#[test]
+fn vanilla_creation_rules_keep_original_nbt_bytes() {
+    use crate::gamerules::{GameRules, RuleRegistry};
+    let mut fixture = Fixture::new();
+    fixture
+        .title
+        .set_rule_registry(std::sync::Arc::new(RuleRegistry::vanilla()));
+    fixture.title.enter_singleplayer();
+    let Mode::Create { options, .. } = &fixture.title.mode else {
+        panic!("creation")
+    };
+    let encode = |rules: &GameRules| {
+        horizon_core::nbt::write_named(&rules.to_nbt(), horizon_core::nbt::Limits::default())
+            .unwrap()
+    };
+    assert_eq!(encode(&options.rules), encode(&GameRules::default()));
+}
+
+#[test]
+fn late_registry_handoff_preserves_open_creation_edits() {
+    use crate::gamerules::{Rule, RuleRegistry, Value};
+    let rule = Rule {
+        name: "example:enabled".into(),
+        category: "example:machines".into(),
+        default: Value::Bool(true),
+        min: 0,
+        max: 0,
+    };
+    let registry = std::sync::Arc::new(
+        RuleRegistry::with_mod_rules(&["example:machines".into()], &[rule]).unwrap(),
+    );
+    let mut fixture = Fixture::new();
+    fixture.title.enter_singleplayer();
+    fixture.title.close_rules(Exit::Apply(vec![(
+        "minecraft:keep_inventory".into(),
+        Value::Bool(true),
+    )]));
+    fixture.title.set_rule_registry(registry.clone());
+    let Action::Create { options, .. } = fixture.title.create_action() else {
+        panic!("creation")
+    };
+    assert!(std::sync::Arc::ptr_eq(options.rules.registry(), &registry));
+    assert_eq!(
+        options.rules.get("minecraft:keep_inventory"),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        options.rules.get("example:enabled"),
+        Some(Value::Bool(true))
+    );
+}
+
+/// `RealmsCreateWorldFlow.createWorld`: the reset screen's Generate New World tile opens
+/// Create New World; its Create uploads instead of making a local world.
+#[test]
+fn a_realms_new_world_uploads_instead_of_creating_locally() {
+    let mut f = Fixture::new();
+    f.title.mode = Mode::Create {
+        name: "New World".into(),
+        seed: String::new(),
+        creative: false,
+        focus: 0,
+        options: WorldOptions::default(),
+    };
+    f.title.realms_create = Some(crate::realms::CreateWorldRequest {
+        server: crate::realms::client::RealmServer::default(),
+        slot: 1,
+        kind: crate::realms::ResetKind::Empty,
+        creation: None,
+    });
+    let action = f.title.create_or_upload();
+    assert!(matches!(action, Action::None), "no local world is entered");
+    assert!(f.title.realms_create.is_none());
+    // Without the account's session the upload cannot start: the failure the service's
+    // refusal would show, over the reset screen.
+    let Mode::Realms(screen) = &f.title.mode else {
+        panic!("the upload is a Realms screen");
+    };
+    assert!(matches!(
+        screen.subscreen,
+        crate::realms::SubScreen::Error { .. }
+    ));
+    assert!(!f.title.saves.join("New World").exists());
+    let _ = fs::remove_dir_all(&f.root);
+}
+
+/// `CreateWorldScreen.openFresh`'s cancel for the tile: the screen the reset screen was
+/// opened from (the configuration screen), not the world list.
+#[test]
+fn cancelling_a_realms_new_world_returns_to_the_realm() {
+    let mut f = Fixture::new();
+    f.title.mode = Mode::Create {
+        name: "New World".into(),
+        seed: String::new(),
+        creative: false,
+        focus: 0,
+        options: WorldOptions::default(),
+    };
+    f.title.realms_create = Some(crate::realms::CreateWorldRequest {
+        server: crate::realms::client::RealmServer::default(),
+        slot: 1,
+        kind: crate::realms::ResetKind::Empty,
+        creation: None,
+    });
+    f.title.cancel_create();
+    let Mode::Realms(screen) = &f.title.mode else {
+        panic!("the reset's Realm returns");
+    };
+    assert!(matches!(
+        screen.subscreen,
+        crate::realms::SubScreen::Configure { .. }
+    ));
+    let _ = fs::remove_dir_all(&f.root);
+}
+#[cfg(test)]
+mod hidden_features {
+    use super::*;
+    #[test]
+    fn experiments_done_preserves_hidden_selection_when_visible_switch_changes() {
+        let mut f = Fixture::new();
+        f.enter_create_world_for_packs();
+        if let Mode::Create { options, .. } = &mut f.title.mode {
+            options.data_packs = vec!["vanilla".into(), "hidden".into(), "visible".into()];
+        } else {
+            panic!("expected Create mode");
+        }
+        *f.title.experiments.borrow_mut() = Some(experiments::ExperimentsScreen::new(vec![
+            experiments::Flag {
+                id: "visible".into(),
+                title: Text::literal("Visible"),
+                description: Text::literal("Feature fixture"),
+                enabled: false,
+            },
+        ]));
+        let atlas = crate::hud::HudAtlas::build(
+            &horizon_assets::resource_source::ResourceSource::directory(
+                "/nonexistent/horizon-test-assets".into(),
+            ),
+        )
+        .unwrap();
+        f.title.press_rules(&atlas, (100.0, 240.0), (480.0, 262.0));
+        assert!(f.title.experiments.borrow().is_none());
+        assert_eq!(
+            f.title.creation_packs().map(|(_, ids)| ids),
+            Some(vec!["vanilla".to_owned(), "hidden".to_owned()])
+        );
+    }
 }

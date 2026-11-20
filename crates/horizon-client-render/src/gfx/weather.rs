@@ -1,7 +1,7 @@
 //! Weather's unsplit quads, using the entity atlas/lightmap resources.
 use crate::weather::{Time, Vertex};
 
-pub(super) struct Weather {
+pub struct Weather {
     pipeline: wgpu::RenderPipeline,
     /// The layouts of groups 0 (the entities') and 1 (the fall clock), for a native pack's
     /// weather pipeline.
@@ -14,9 +14,10 @@ pub(super) struct Weather {
     count: u32,
 }
 impl Weather {
+    /// The weather's pipeline onto a frame of `format`, holding linear light when `linear`.
     pub fn new(
         device: &wgpu::Device,
-        format: wgpu::TextureFormat,
+        (format, linear): (wgpu::TextureFormat, bool),
         entities: &wgpu::BindGroupLayout,
         shader: &wgpu::ShaderModule,
     ) -> Self {
@@ -62,7 +63,10 @@ impl Weather {
             fragment: Some(wgpu::FragmentState {
                 module: shader,
                 entry_point: Some("fs_weather"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &super::linear_blend::frame_constants(format, linear),
+                    ..Default::default()
+                },
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -135,33 +139,24 @@ impl Weather {
         pipeline: &wgpu::RenderPipeline,
         entities: &wgpu::BindGroup,
     ) {
-        if self.count == 0 {
-            return;
-        }
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, entities, &[]);
-        pass.set_bind_group(1, &self.group, &[]);
-        pass.set_vertex_buffer(0, self.vertices.slice(..));
-        pass.draw_indexed(0..self.count / 4 * 6, 0, 0..1);
+        self.draw_bound(pass, entities, |pass| pass.set_pipeline(pipeline));
     }
-    /// Draws the streaks, through a native pack's weather stage when `native` is given (its
-    /// pipeline and the pack's frame group).
-    pub fn draw(
+    /// Draws the streaks.
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, entities: &wgpu::BindGroup) {
+        self.draw_bound(pass, entities, |pass| pass.set_pipeline(&self.pipeline));
+    }
+    /// Draws the streaks, if any, through the pipeline `bind` sets with any groups of its own
+    /// beyond 0 and 1.
+    pub fn draw_bound(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         entities: &wgpu::BindGroup,
-        native: Option<(&wgpu::RenderPipeline, &wgpu::BindGroup)>,
+        bind: impl FnOnce(&mut wgpu::RenderPass<'_>),
     ) {
         if self.count == 0 {
             return;
         }
-        match native {
-            Some((pipeline, frame)) => {
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(horizon_shader_api::stages::GROUP, frame, &[]);
-            }
-            None => pass.set_pipeline(&self.pipeline),
-        }
+        bind(pass);
         pass.set_bind_group(0, entities, &[]);
         pass.set_bind_group(1, &self.group, &[]);
         pass.set_vertex_buffer(0, self.vertices.slice(..));
@@ -217,15 +212,19 @@ struct HorizonWeatherOut {
         textureDimensions(horizon_entity_atlas));
     let color = textureLoad(horizon_entity_atlas, texel, 0) * in.color;
     if color.a < 0.1 { discard; }
-    return weather(WeatherInput(color, in.light, in.position, in.snow != 0u));
+    let input = WeatherInput(vec4(horizon_line_in(color.rgb), color.a), in.light, in.position,
+        in.snow != 0u);
+    let out = weather(input);
+    return vec4(horizon_line_out(out.rgb), out.a);
 }
 ";
 
 /// The shader of a native pack's weather stage `source`.
-fn native_source(source: &str) -> String {
+fn native_source(source: &str, linear: bool) -> String {
     format!(
-        "{source}\n// Horizon's weather (entity.wgsl)\n{}{NATIVE_ENTRIES}",
-        super::wgsl_prefix::prefixed(&super::entity_shader(), "horizon_entity_")
+        "{source}\n// Horizon's weather (entity.wgsl)\n{}{}{NATIVE_ENTRIES}",
+        super::wgsl_prefix::prefixed(&super::entity_shader(), "horizon_entity_"),
+        super::native_post::line_helpers(linear)
     )
 }
 
@@ -242,7 +241,7 @@ pub(super) fn native_pipeline(
     constants: &[(String, f64)],
 ) -> Result<wgpu::RenderPipeline, String> {
     use horizon_shader_api::stages::GROUP;
-    let text = native_source(&stage.source);
+    let text = native_source(&stage.source, frame.linear);
     let module = naga::front::wgsl::parse_str(&text)
         .map_err(|e| format!("{}: {}", stage.file, e.emit_to_string(&text)))?;
     let present = super::native_post::present_constants(&module, constants);
@@ -255,9 +254,10 @@ pub(super) fn native_pipeline(
         bind_group_layouts: &groups,
         ..Default::default()
     });
-    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(&stage.label),
+        label: Some(&super::dx12_compiler::module_label(&stage.label)),
         source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
     });
     let options = wgpu::PipelineCompilationOptions {
@@ -293,7 +293,7 @@ pub(super) fn native_pipeline(
                 format,
                 blend: Some(wgpu::BlendState {
                     color: wgpu::BlendState::ALPHA_BLENDING.color,
-                    // The frame's alpha stays as the surfaces left it (entities mark it 0).
+                    // The frame's alpha stays as the surfaces left it.
                     alpha: wgpu::BlendComponent {
                         src_factor: wgpu::BlendFactor::Zero,
                         dst_factor: wgpu::BlendFactor::One,
@@ -306,7 +306,8 @@ pub(super) fn native_pipeline(
         multiview_mask: None,
         cache: None,
     });
-    if let Some(e) = pollster::block_on(scope.pop()) {
+    let internal = pollster::block_on(internal.pop());
+    if let Some(e) = internal.or(pollster::block_on(validation.pop())) {
         return Err(format!("{}: {e}", stage.file));
     }
     Ok(pipeline)
@@ -322,7 +323,7 @@ mod tests {
         let source = StageKind::Weather.prelude()
             + "fn weather(input: WeatherInput) -> vec4<f32> {\n    \
                return input.color * vec4(input.light, input.position.x, f32(input.snow));\n}\n";
-        let text = native_source(&source);
+        let text = native_source(&source, false);
         let module = naga::front::wgsl::parse_str(&text)
             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&text)));
         naga::valid::Validator::new(
@@ -361,6 +362,7 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan/Metal/DX12 adapter"]
     fn weather_shader_uvs_match_legacy_bits() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let instance = crate::gfx::test_gpu::instance();
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
@@ -451,16 +453,16 @@ mod tests {
         let source = format!(
             "{math}\n{}",
             r#"
-struct Case { animation: vec4<f32>, bases: vec4<u32>, time: vec4<f32>, uv: vec2<f32>, snow: u32, pad: u32 }
-@group(0) @binding(0) var<storage, read> cases: array<Case>;
-@group(0) @binding(1) var<storage, read_write> results: array<vec4<u32>>;
-@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    struct Case { animation: vec4<f32>, bases: vec4<u32>, time: vec4<f32>, uv: vec2<f32>, snow: u32, pad: u32 }
+    @group(0) @binding(0) var<storage, read> cases: array<Case>;
+    @group(0) @binding(1) var<storage, read_write> results: array<vec4<u32>>;
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= arrayLength(&cases) { return; }
     let c = cases[id.x];
     let uv = c.uv + weather_phase(c.animation, c.bases, c.snow, c.time);
     let texel = weather_texel(uv, vec4(0.25, 0.5, 0.015625, 0.03125), vec2(1024u));
     results[id.x] = vec4(bitcast<vec2<u32>>(uv), vec2<u32>(texel));
-}"#
+    }"#
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Weather parity"),

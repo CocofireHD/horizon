@@ -44,10 +44,13 @@ pub fn control_args() -> Vec<String> {
 /// The endpoint a game listens on when nothing names one, which is where Agent Control opens it.
 /// The launcher runs whichever version is installed, so this is a contract with every game
 /// rather than shared code: `control::default_path` in horizon-client, and `horizon-ctl help`.
+/// `shared_uid` is the user's id when `temp` is shared by every user (`/tmp`): the game then
+/// keeps its socket in a folder of that user's own there, `horizon-<uid>`.
 fn default_endpoint(
     control: Option<OsString>,
     runtime: Option<OsString>,
     temp: PathBuf,
+    shared_uid: Option<u32>,
 ) -> PathBuf {
     if let Some(path) = control {
         return path.into();
@@ -55,9 +58,34 @@ fn default_endpoint(
     if !cfg!(unix) {
         return temp.join("horizon-control.json");
     }
-    runtime
-        .map_or(temp, PathBuf::from)
-        .join("horizon-control.sock")
+    match (runtime, shared_uid) {
+        (Some(runtime), _) => PathBuf::from(runtime),
+        (None, Some(uid)) => temp.join(format!("horizon-{uid}")),
+        (None, None) => temp,
+    }
+    .join("horizon-control.sock")
+}
+
+/// The user's id when the temporary directory is shared by every user (`control::fallback_dir`
+/// in horizon-client): the owner of `/proc/self`, else of the home folder.
+fn shared_temp_uid(temp: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let shared = std::fs::metadata(temp).is_ok_and(|m| m.permissions().mode() & 0o002 != 0);
+        if !shared {
+            return None;
+        }
+        std::fs::metadata("/proc/self")
+            .ok()
+            .or_else(|| std::fs::metadata(std::env::var_os("HOME")?).ok())
+            .map(|m| m.uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = temp;
+        None
+    }
 }
 
 /// The endpoint to talk to: the game `play` started, else the game answering on the default
@@ -77,6 +105,7 @@ fn current_endpoint() -> PathBuf {
             std::env::var_os("HORIZON_CONTROL"),
             std::env::var_os("XDG_RUNTIME_DIR"),
             std::env::temp_dir(),
+            shared_temp_uid(&std::env::temp_dir()),
         ),
     )
 }
@@ -301,14 +330,38 @@ mod tests {
         });
     }
 
-    /// What a crashed game leaves: the file, and nothing on its port.
+    /// The token of a crashed game's file: no live endpoint here accepts it.
+    const STALE_TOKEN: &str = "crashed-game";
+
+    /// What a crashed game leaves: the file, and nothing on its port. The system may hand that
+    /// port to anything, a parallel test's live endpoint included, so the file's token is one no
+    /// live endpoint here accepts.
     fn stale_endpoint(path: &Path) {
         let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        write_endpoint(path, port, "secret");
+        write_endpoint(path, port, STALE_TOKEN);
+    }
+
+    /// The race behind a Windows red: a stale file's port reused by another test's live endpoint.
+    #[test]
+    fn a_stale_endpoint_whose_port_another_game_took_does_not_answer() {
+        let dir = scratch("reused");
+        let (own, default, live) = (
+            dir.join("game-control.json"),
+            dir.join("default.json"),
+            dir.join("live.json"),
+        );
+        live_endpoint(&live);
+        let port = serde_json::from_str::<Value>(&std::fs::read_to_string(&live).unwrap()).unwrap()
+            ["port"]
+            .as_u64()
+            .unwrap() as u16;
+        write_endpoint(&default, port, STALE_TOKEN);
+        assert_eq!(choose_endpoint(own.clone(), default), own);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -369,21 +422,32 @@ mod tests {
         let temp = PathBuf::from("temp");
         let runtime = || Some(OsString::from("run"));
         assert_eq!(
-            default_endpoint(Some("mine.sock".into()), runtime(), temp.clone()),
+            default_endpoint(
+                Some("mine.sock".into()),
+                runtime(),
+                temp.clone(),
+                Some(1000)
+            ),
             PathBuf::from("mine.sock")
         );
         if cfg!(unix) {
             assert_eq!(
-                default_endpoint(None, runtime(), temp.clone()),
+                default_endpoint(None, runtime(), temp.clone(), Some(1000)),
                 Path::new("run").join("horizon-control.sock")
             );
+            // A temporary directory of the user's own, as macOS's.
             assert_eq!(
-                default_endpoint(None, None, temp.clone()),
+                default_endpoint(None, None, temp.clone(), None),
                 temp.join("horizon-control.sock")
+            );
+            // A shared one: the user's own folder in it.
+            assert_eq!(
+                default_endpoint(None, None, temp.clone(), Some(1000)),
+                temp.join("horizon-1000/horizon-control.sock")
             );
         } else {
             assert_eq!(
-                default_endpoint(None, runtime(), temp.clone()),
+                default_endpoint(None, runtime(), temp.clone(), None),
                 temp.join("horizon-control.json")
             );
         }

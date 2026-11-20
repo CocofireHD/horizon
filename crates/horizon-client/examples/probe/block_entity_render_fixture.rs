@@ -1,7 +1,7 @@
 //! Headless transport for the block-entity render parity gate: replays each
 //! case (block state, light, partial tick and ticked block-entity fields)
 //! through `BlockEntityRenderer` at the block origin and writes the quads
-//! (texture, sprite-local UVs, baked colour, light) and sign text calls.
+//! (texture, sprite-local UVs, tint, normal, light) and sign text calls.
 #![forbid(unsafe_code)]
 use glam::{DVec3, Mat4, Quat, Vec3};
 use horizon_client::{
@@ -10,6 +10,7 @@ use horizon_client::{
     block_entity_anim::EnchantingBook,
     block_entity_render::{
         BlockAnim, BlockEntityRenderer, END_GATEWAY_LAYER, END_PORTAL_LAYER, Scene, TextCall,
+        push_text,
     },
     chunk::{Chunk, Light},
     hud::{HudAtlas, Rect},
@@ -86,12 +87,19 @@ fn find_state(registry: &BlockRegistry, spec: &str) -> Option<u32> {
 
 fn sign_side(v: &Value) -> SignText {
     let mut side = SignText::default();
-    for (line, text) in side
-        .lines
-        .iter_mut()
-        .zip(v["lines"].as_array().into_iter().flatten())
+    for (i, value) in v["lines"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(4)
+        .enumerate()
     {
-        *line = text.as_str().unwrap_or_default().to_owned();
+        let line = horizon_client::scoreboard::comp_text(value);
+        side.lines[i] = line.plain();
+        side.saved[i] = Some(horizon_client::signs::SavedLine {
+            text: line.plain(),
+            component: horizon_client::lan::data::json_to_nbt(value),
+        });
     }
     let color = v["color"].as_str().unwrap_or("black");
     side.color = DYE_TEXT.iter().position(|(n, _)| *n == color).unwrap_or(15) as u8;
@@ -117,10 +125,23 @@ pub fn main() -> Result<()> {
     };
     let assets = Assets::load(root)?;
     let registry = assets.registry;
-    let renderer = BlockEntityRenderer::load(root, registry)?;
-    let atlas = HudAtlas::build(root)?;
-    let banners = Banners::load(root);
-    let items = ItemRenderer::load(root)?;
+    let item_data = crate::test_resources::item_data(
+        root,
+        horizon_world::native_load_context::DataLoadOrigin::ClientPreload,
+    )?;
+    let renderer = BlockEntityRenderer::load(
+        &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+        registry,
+        item_data.defaults(),
+    )?;
+    let atlas = HudAtlas::build(&horizon_assets::resource_source::ResourceSource::directory(
+        root.to_path_buf(),
+    ))?;
+    let banners = Banners::load(root, item_data.defaults());
+    let items = ItemRenderer::load(
+        &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+        &item_data,
+    )?;
     let (sprites, names, grid) = fake_sprites(textures)?;
     let air = registry.default_state("minecraft:air").ok_or("no air")?;
     let mut out = BufWriter::new(fs::File::create(output)?);
@@ -350,6 +371,8 @@ pub fn main() -> Result<()> {
         let texts = RefCell::new(Vec::<TextCall>::new());
         let scene = Scene {
             camera,
+            // No player in the oracle: `isOutlineVisible` falls back to the distance.
+            spyglass_outline: false,
             orientation: Quat::from_euler(
                 glam::EulerRot::YXZ,
                 std::f32::consts::PI - yaw * (std::f32::consts::PI / 180.0),
@@ -373,6 +396,7 @@ pub fn main() -> Result<()> {
             skull: &|_| None,
             glyph: &|c| atlas.glyph_cell(c),
             glyphs: atlas.font.epoch(),
+            font: Some(&atlas.font),
             dynamic_visible: None,
         };
         let mut verts = Vec::new();
@@ -417,7 +441,8 @@ pub fn main() -> Result<()> {
                         ])
                     })
                     .collect();
-                json!({"texture": texture, "v": v, "color": q[0].color, "light": q[0].light})
+                json!({"texture": texture, "v": v, "color": q[0].color, "light": q[0].light,
+                       "normal": q[0].normal})
             })
             .collect();
         let texts: Vec<Value> = texts
@@ -425,8 +450,26 @@ pub fn main() -> Result<()> {
             .iter()
             .filter(|t| !t.text.is_empty())
             .map(|t| {
+                let mut x = t.x;
+                let glyphs: Vec<_> = t.text.chars().map(|c| {
+                    let g = json!({"matrix": t.matrix.to_cols_array(), "x": x, "y": t.y,
+                        "text": c.to_string(), "color": t.color,
+                        "light": ((t.light & 0xFF) << 16 | (t.light >> 8 & 0xFF)),
+                        "style": [t.style.is_bold(), t.style.is_italic(), t.style.underlined == Some(true),
+                                  t.style.strikethrough == Some(true), t.style.obfuscated == Some(true)]});
+                    x += atlas.font.advance(c, &t.style);
+                    g
+                }).collect();
+                let mut vertices = Vec::new();
+                let mut local = t.clone();
+                local.matrix = Mat4::IDENTITY;
+                push_text(&|c| atlas.font.glyph_styled(c, &t.style), Some(atlas.font.white()), &local.run(), &mut vertices);
+                let vertices: Vec<_> = vertices.iter().map(|v| {
+                    let c = v.color;
+                    json!([v.pos[0], v.pos[1], v.pos[2], (c & 0xff00ff00) | (c & 255) << 16 | (c >> 16 & 255)])
+                }).collect();
                 json!({"matrix": t.matrix.to_cols_array(), "x": t.x, "y": t.y, "text": t.text,
-                       "color": t.color, "outline": t.outline,
+                       "color": t.color, "outline": t.outline, "glyphs": glyphs, "textVertices": vertices,
                        "light": ((t.light & 0xFF) << 16 | (t.light >> 8 & 0xFF))})
             })
             .collect();

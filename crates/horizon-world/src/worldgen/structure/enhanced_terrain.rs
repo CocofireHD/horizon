@@ -1,13 +1,8 @@
 //! Structure libraries' enhanced terrain adaptation: YUNG's API's and
 //! MoogsStructureLib's, which their Beardifier mixins add to vanilla's
 //! density. Carried as `"horizon:enhanced_terrain_adaptation"` on a structure
-//! and on its pool elements (docs/mods.md); the kernel itself is
+//! and on its pool elements (docs/modding/src/how-to/content-mods.md); the kernel itself is
 //! [`TerrainKernel`].
-use super::{
-    BoundingBox, Rotation,
-    jigsaw::Projection,
-    start::{Piece, StructureStart},
-};
 use crate::worldgen::DecodeError;
 use horizon_core::{
     density::{KernelJunction, KernelPiece, StructureBounds, TerrainKernel},
@@ -15,6 +10,14 @@ use horizon_core::{
 };
 use serde_json::Value;
 use std::sync::Arc;
+use {
+    super::{
+        Rotation,
+        jigsaw::Projection,
+        start::{Piece, StructureStart},
+    },
+    horizon_core::bounding_box::BoundingBox,
+};
 
 /// One adaptation: the kernel, and how a piece's box is moved, padded or
 /// cut to a band before the kernel measures from it.
@@ -194,10 +197,8 @@ impl StructureAdaptation {
                 continue;
             }
             let rigid = pool.element.projection() == Projection::Rigid;
-            if rigid {
-                if let Some(b) = adaptation.piece_box(b, pool.rotation) {
-                    push_piece(pieces, adaptation, b, &mut include);
-                }
+            if rigid && let Some(b) = adaptation.piece_box(b, pool.rotation) {
+                push_piece(pieces, adaptation, b, &mut include);
             }
             if (rigid && !self.rigid_junctions) || adaptation.band.is_some() {
                 continue;
@@ -248,7 +249,7 @@ fn push_piece(
 mod tests {
     use super::*;
     use crate::worldgen::structure::{
-        StructureTemplate,
+        LazyTemplate, StructureTemplate,
         jigsaw::{Junction, PoolElement, PoolPiece},
     };
     use serde_json::json;
@@ -303,7 +304,7 @@ mod tests {
 
     fn element(projection: Projection, own: Option<Adaptation>) -> Arc<PoolElement> {
         Arc::new(PoolElement::Single {
-            template: Arc::new(StructureTemplate::empty()),
+            template: LazyTemplate::loaded(Arc::new(StructureTemplate::empty())),
             processors: Default::default(),
             processors_source: serde_json::Value::Null,
             legacy: false,
@@ -330,6 +331,7 @@ mod tests {
             structure: 0,
             name: "test".into(),
             chunk: ChunkPos::new(0, 0),
+            references: 0,
             pieces: vec![
                 piece(&rigid, 0, [5, 64, 5]),
                 piece(&matching, 10, [12, 65, 5]),
@@ -337,6 +339,7 @@ mod tests {
                 piece(&rigid, 60, [62, 64, 5]),
             ],
             bounding_box: BoundingBox::new([0, 64, 0], [69, 73, 9]),
+            has_piece_beardifier: false,
         };
         let kernel = json!({"kernel_size": 24, "kernel_distance": 24, "top": "carve",
             "bottom": "none", "bottom_offset": -1});

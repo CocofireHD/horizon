@@ -193,6 +193,7 @@ impl MenuBlur {
     /// Blur `frame` (the swapchain texture) in place through `target`, its
     /// non-sRGB view, by `radius` pixels (`menuBackgroundBlurriness`).
     #[allow(clippy::too_many_arguments)]
+    #[horizon_mod_api_macros::replaceable]
     pub fn apply(
         &mut self,
         device: &wgpu::Device,
@@ -202,20 +203,44 @@ impl MenuBlur {
         target: &wgpu::TextureView,
         size: [u32; 2],
         radius: f32,
-        mut timing: Option<&mut crate::gfx::pack_timing::PassTiming>,
+        timing: Option<&mut crate::gfx::pack_timing::PassTiming>,
     ) {
-        self.ensure(device, size);
-        let work = self.work_size(size);
-        let copy = if self.half { 2 } else { 0 };
+        let copy = self.source(device, size).0;
         encoder.copy_texture_to_texture(
             frame.as_image_copy(),
-            self.targets[copy].0.as_image_copy(),
+            copy.as_image_copy(),
             wgpu::Extent3d {
                 width: size[0],
                 height: size[1],
                 depth_or_array_layers: 1,
             },
         );
+        self.blur(device, queue, encoder, target, size, radius, timing);
+    }
+    /// The blur's copy of a frame of `size`, for a picture drawn into it rather than copied
+    /// (HDR output's composite, `Hdr::composite`), then `blur`.
+    pub fn source(
+        &mut self,
+        device: &wgpu::Device,
+        size: [u32; 2],
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        self.ensure(device, size);
+        self.targets[if self.half { 2 } else { 0 }].clone()
+    }
+    /// Blur what `source` holds into `target`, as `apply` blurs its copy of the frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blur(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        size: [u32; 2],
+        radius: f32,
+        mut timing: Option<&mut crate::gfx::pack_timing::PassTiming>,
+    ) {
+        self.ensure(device, size);
+        let work = self.work_size(size);
         let radius = if self.half { radius / 2.0 } else { radius };
         if self.half {
             // A radius of 0 samples each half-size pixel's 2x2 block at its shared
@@ -382,7 +407,8 @@ mod tests {
     /// blurs the same.
     #[test]
     fn blurs_the_same_after_its_targets_were_released() {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let _gpu = crate::gfx::test_gpu::lock();
+        let instance = crate::gfx::test_gpu::instance();
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             return;
         };
@@ -403,7 +429,8 @@ mod tests {
     /// frame much as at full size: stripes two pixels wide turn to an even grey.
     #[test]
     fn the_half_size_blur_blurs_like_the_full_size_one() {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let _gpu = crate::gfx::test_gpu::lock();
+        let instance = crate::gfx::test_gpu::instance();
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             return;
         };

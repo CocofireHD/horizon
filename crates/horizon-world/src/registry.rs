@@ -1,29 +1,88 @@
 //! Runtime block-state IDs imported from a version-pinned registry data export.
 //! This supplies identities and default properties, not block behavior.
+mod data;
 mod facts;
+mod intern;
 mod json;
 pub(crate) mod snapshot;
-use crate::{DATA_VERSION, chunk::BlockState, compression::invalid, nbt::Tag};
+use horizon_core::fast_hash::FxHashMap;
 pub use json::BlockStateJsonCodec;
 pub(crate) use json::java_integer;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     hash::{DefaultHasher, Hash, Hasher},
     io,
+    sync::{
+        RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+use {
+    crate::{DATA_VERSION, chunk::BlockState, compression::invalid},
+    horizon_core::nbt::Tag,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockStateId(pub u32);
 
 pub struct BlockRegistry {
-    states: Vec<BlockState>,
-    /// Ids by a hash of their state, checked against `states`: 12 bytes per
-    /// state instead of a second copy of every name and property map (about
-    /// 125 MB for a registry of 190,000 states).
-    ids: HashMap<u64, u32>,
-    /// States whose hash an earlier state already took (none in vanilla).
-    collided: BTreeMap<BlockState, BlockStateId>,
-    defaults: BTreeMap<String, BlockStateId>,
+    /// Game-owned, immutable mod worker metadata for this numeric registry snapshot.
+    /// Filled at resource resolution before any worker can use it; never shared across registries.
+    pub mod_worker_resource: std::sync::OnceLock<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// Game-owned: per block state, the index of the installed code mod whose content it is
+    /// (`u16::MAX`: none). Set once from this registry's own mod list, before its world ticks.
+    pub code_block_owners: std::sync::OnceLock<Box<[u16]>>,
+    /// Optional higher-layer template data transform, frozen before placement workers start.
+    pub structure_block_entity_transform: std::sync::OnceLock<
+        std::sync::Arc<
+            dyn crate::worldgen::structure::block_entity_transform::BlockEntityTransform,
+        >,
+    >,
+    data: std::sync::Arc<data::Data>,
+    /// Saved palette entries by the NBT they came from ([`Self::saved_state_id`]).
+    /// A saved area repeats the same dozen states in every section of every
+    /// column; this outlives one column, unlike the cache it replaces.
+    saved_states: RwLock<FxHashMap<Tag, Option<BlockStateId>>>,
+}
+// Bound retained cache entries across all registries, even registries leaked by
+// asset loading. Slots are not reclaimed when a registry is dropped.
+static SAVED_STATE_SLOTS: AtomicUsize = AtomicUsize::new(0);
+
+fn reserve_saved_state_slot() -> bool {
+    let mut count = SAVED_STATE_SLOTS.load(Ordering::Relaxed);
+    while count < 8192 {
+        match SAVED_STATE_SLOTS.compare_exchange_weak(
+            count,
+            count + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => count = actual,
+        }
+    }
+    false
+}
+
+// Bound both the count and size of cached keys. Unusual or oversized NBT is
+// resolved normally without retaining it for the lifetime of the registry.
+fn cacheable_saved_state(tag: &Tag) -> bool {
+    fn short_string(tag: &Tag) -> bool {
+        matches!(tag, Tag::String(s) if s.0.len() <= 128)
+    }
+    match tag {
+        Tag::String(_) => short_string(tag),
+        Tag::Compound(map) if map.len() <= 2 => map.iter().all(|(key, value)| {
+            if key.0.iter().copied().eq("id".encode_utf16()) {
+                short_string(value)
+            } else if key.0.iter().copied().eq("properties".encode_utf16()) {
+                matches!(value, Tag::Compound(props) if props.len() <= 16 && props.iter().all(|(k, v)| k.0.len() <= 128 && short_string(v)))
+            } else {
+                false
+            }
+        }),
+        _ => false,
+    }
 }
 /// The hash [`BlockRegistry`] indexes states by (fixed keys: the same in
 /// every process).
@@ -105,7 +164,7 @@ impl BlockRegistry {
         if states.is_empty() || states.len() > i32::MAX as usize {
             return Err(invalid("invalid registry size"));
         }
-        let mut result = Self {
+        let mut result = data::Data {
             states: Vec::with_capacity(states.len()),
             ids: HashMap::with_capacity(states.len()),
             collided: BTreeMap::new(),
@@ -150,25 +209,70 @@ impl BlockRegistry {
         {
             return Err(invalid("registry is missing block defaults"));
         }
-        Ok(result)
+        Ok(Self {
+            data: std::sync::Arc::new(result),
+            mod_worker_resource: std::sync::OnceLock::new(),
+            code_block_owners: std::sync::OnceLock::new(),
+            structure_block_entity_transform: std::sync::OnceLock::new(),
+            saved_states: RwLock::new(FxHashMap::default()),
+        })
     }
     pub fn len(&self) -> usize {
-        self.states.len()
+        self.data.states.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.states.is_empty()
+        self.data.states.is_empty()
     }
     pub fn state(&self, id: BlockStateId) -> Option<&BlockState> {
-        self.states.get(id.0 as usize)
+        self.data.states.get(id.0 as usize)
     }
     pub fn id(&self, state: &BlockState) -> Option<BlockStateId> {
-        match self.ids.get(&state_key(state)) {
-            Some(&id) if self.states[id as usize] == *state => Some(BlockStateId(id)),
-            _ => self.collided.get(state).copied(),
+        self.data.id(state)
+    }
+
+    /// The id a saved palette entry resolves to, with `decode_column`'s rules:
+    /// a missing or unknown property takes the block's default, an entry that
+    /// does not parse at all is air (`None`). Memoized by the entry's own NBT,
+    /// so a repeated state costs one hash of its name and properties and one
+    /// comparison, with no `String`, no `Debug` and no UTF-16 decoding.
+    ///
+    /// Equal entries always resolve alike; entries the old parsed-state cache
+    /// would have merged but that differ in NBT (an ignored extra key, or two
+    /// spellings of one string) simply get their own entries with the same id.
+    pub fn saved_state_id(&self, tag: &Tag) -> Option<BlockStateId> {
+        let cacheable = cacheable_saved_state(tag);
+        if cacheable
+            && let Some(&hit) = self
+                .saved_states
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(tag)
+        {
+            return hit;
         }
+        let id = BlockState::from_nbt(tag).ok().and_then(|state| {
+            self.id(&state).or_else(|| {
+                // Missing properties take the block's defaults.
+                let default = self.default_state(&state.name)?;
+                let mut full = self.state(default)?.clone();
+                for (key, value) in &state.properties {
+                    if full.properties.contains_key(key) {
+                        full.properties.insert(key.clone(), value.clone());
+                    }
+                }
+                self.id(&full).or(Some(default))
+            })
+        });
+        if cacheable {
+            let mut cache = self.saved_states.write().unwrap_or_else(|e| e.into_inner());
+            if !cache.contains_key(tag) && reserve_saved_state_slot() {
+                cache.insert(tag.clone(), id);
+            }
+        }
+        id
     }
     pub fn default_state(&self, name: &str) -> Option<BlockStateId> {
-        self.defaults.get(name).copied()
+        self.data.defaults.get(name).copied()
     }
 
     /// The values `property` takes on `block`, in `Property.getPossibleValues`
@@ -178,6 +282,7 @@ impl BlockRegistry {
     pub fn property_values(&self, block: &str, property: &str) -> Vec<&str> {
         let mut values: Vec<&str> = Vec::new();
         for state in self
+            .data
             .states
             .iter()
             .filter(|state| state.name.as_str() == block)
@@ -289,7 +394,7 @@ impl<'r> BlockTableFile<'r> {
     /// Reads `bytes`, checking every `states` list of the root compound and
     /// of the compounds directly under it against `registry`.
     pub fn read(bytes: &[u8], registry: &'r BlockRegistry) -> io::Result<Self> {
-        let mut visit = |states: &mut crate::nbt::ListElements<'_, '_, '_>| {
+        let mut visit = |states: &mut horizon_core::nbt::ListElements<'_, '_, '_>| {
             if states.len() != registry.len() {
                 return Err(states.error("table registry size mismatch"));
             }
@@ -304,9 +409,9 @@ impl<'r> BlockTableFile<'r> {
             }
             Ok(())
         };
-        let (named, _) = crate::nbt::read_named_streaming(
+        let (named, _) = horizon_core::nbt::read_named_streaming(
             bytes,
-            crate::nbt::Limits::tables(),
+            horizon_core::nbt::Limits::tables(),
             "states",
             &mut visit,
         )
@@ -324,5 +429,191 @@ impl<'r> BlockTableFile<'r> {
             read_checked: 2,
         }
         .checked(what)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use horizon_core::nbt::{Compound, JavaString};
+
+    fn state(name: &str, properties: &[(&str, &str)]) -> Tag {
+        let mut map = Compound::new();
+        map.insert(JavaString::from("id"), Tag::String(name.into()));
+        if !properties.is_empty() {
+            let mut props = Compound::new();
+            for (key, value) in properties {
+                props.insert(JavaString::from(*key), Tag::String((*value).into()));
+            }
+            map.insert(JavaString::from("properties"), Tag::Compound(props));
+        }
+        Tag::Compound(map)
+    }
+
+    /// A registry with a defaulted block, a block with one property and one
+    /// with two.
+    fn registry() -> BlockRegistry {
+        let states = [
+            state("minecraft:air", &[]),
+            state("minecraft:stone", &[]),
+            state("test:log", &[("axis", "x")]),
+            state("test:log", &[("axis", "y")]),
+            state("test:log", &[("axis", "z")]),
+            state("test:door", &[("facing", "north"), ("open", "false")]),
+            state("test:door", &[("facing", "east"), ("open", "false")]),
+            state("test:door", &[("facing", "north"), ("open", "true")]),
+        ];
+        let defaults = [
+            ("minecraft:air", 0),
+            ("minecraft:stone", 1),
+            ("test:log", 3),
+            ("test:door", 5),
+        ];
+        BlockRegistry::from_nbt(&Tag::compound([
+            ("DataVersion", Tag::Int(crate::DATA_VERSION)),
+            ("states", Tag::List(states.into())),
+            (
+                "defaults",
+                Tag::compound(defaults.into_iter().map(|(name, id)| (name, Tag::Int(id)))),
+            ),
+        ]))
+        .unwrap()
+    }
+
+    fn materialized(name: &str, properties: &[(&str, Tag)]) -> Tag {
+        let mut map = Compound::new();
+        map.insert(JavaString::from("id"), Tag::String(name.into()));
+        if !properties.is_empty() {
+            let mut props = Compound::new();
+            for (key, value) in properties {
+                props.insert(JavaString::from(*key), value.clone());
+            }
+            map.insert(JavaString::from("properties"), Tag::Compound(props));
+        }
+        Tag::Compound(map)
+    }
+
+    /// `decode_column`'s per-column cache and resolution, unchanged, as the
+    /// reference the new path must agree with.
+    fn old_state_id(
+        registry: &BlockRegistry,
+        tag: &Tag,
+        cache: &mut HashMap<String, u32>,
+        air: u32,
+    ) -> u32 {
+        let state = BlockState::from_nbt(tag).ok();
+        let key = state
+            .as_ref()
+            .map(|s| format!("{}{:?}", s.name, s.properties))
+            .unwrap_or_default();
+        *cache.entry(key).or_insert_with(|| {
+            state
+                .and_then(|s| {
+                    registry.id(&s).or_else(|| {
+                        let default = registry.default_state(&s.name)?;
+                        let mut full = registry.state(default)?.clone();
+                        for (k, v) in &s.properties {
+                            if full.properties.contains_key(k) {
+                                full.properties.insert(k.clone(), v.clone());
+                            }
+                        }
+                        registry.id(&full).or(Some(default))
+                    })
+                })
+                .map_or(air, |id| id.0)
+        })
+    }
+
+    #[test]
+    fn saved_palette_entries_resolve_as_the_per_column_cache_did() {
+        let registry = registry();
+        let air = registry.default_state("minecraft:air").unwrap().0;
+        let tags = [
+            // Known states, with and without the properties they carry.
+            state("minecraft:stone", &[]),
+            Tag::String("minecraft:stone".into()),
+            state("test:log", &[("axis", "z")]),
+            state("test:log", &[]),
+            state("test:door", &[("facing", "north"), ("open", "false")]),
+            state("test:door", &[("open", "true"), ("facing", "north")]),
+            state("test:door", &[("open", "true")]),
+            state("test:door", &[("facing", "east")]),
+            // Missing properties take the defaults, unknown names are ignored,
+            // an unknown value falls back to the default state, and an entry
+            // with an ignored extra key still has its own cache slot.
+            state("test:log", &[("bogus", "x")]),
+            state("test:log", &[("axis", "bogus")]),
+            state("test:log", &[("axis", "")]),
+            state("minecraft:stone", &[("bogus", "x")]),
+            materialized("test:log", &[]),
+            Tag::compound([
+                ("id", Tag::String("minecraft:stone".into())),
+                ("extra", Tag::Int(7)),
+            ]),
+            // Entries `from_nbt` rejects, which resolve to air.
+            Tag::compound([("Name", Tag::String("minecraft:stone".into()))]),
+            Tag::compound([("id", Tag::Int(1))]),
+            Tag::compound([
+                ("id", Tag::String("test:log".into())),
+                ("properties", Tag::String("axis=y".into())),
+            ]),
+            materialized("test:log", &[("axis", Tag::Int(5))]),
+            Tag::String(JavaString(vec![0xd800])),
+            Tag::Compound(Compound::new()),
+            // An unknown block name.
+            state("minecraft:nope", &[]),
+        ];
+        // The old cache was per column; the new one lives in the registry, so
+        // repeat the whole palette (a column's worth of entries) three times.
+        for round in 0..3 {
+            let mut cache = HashMap::new();
+            for (i, tag) in tags.iter().enumerate() {
+                let new = registry.saved_state_id(tag).map_or(air, |id| id.0);
+                let old = old_state_id(&registry, tag, &mut cache, air);
+                assert_eq!(new, old, "round {round} entry {i}: {tag:?}");
+            }
+        }
+        // A few ids stated independently of both implementations.
+        let id = |tag: &Tag| registry.saved_state_id(tag).map_or(air, |id| id.0);
+        assert_eq!(id(&state("minecraft:stone", &[])), 1);
+        assert_eq!(id(&Tag::String("minecraft:stone".into())), 1);
+        assert_eq!(id(&state("test:log", &[("axis", "z")])), 4);
+        assert_eq!(id(&state("test:log", &[])), 3);
+        assert_eq!(id(&state("test:log", &[("axis", "bogus")])), 3);
+        assert_eq!(id(&state("test:door", &[("open", "true")])), 7);
+        assert_eq!(id(&state("test:door", &[("facing", "east")])), 6);
+        assert_eq!(id(&Tag::String(JavaString(vec![0xd800]))), air);
+    }
+    #[test]
+    fn saved_cache_is_bounded_and_registry_local_under_concurrency() {
+        let registry = registry();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for i in 0..8300 {
+                        let name = format!("unknown:{i}");
+                        assert_eq!(registry.saved_state_id(&state(&name, &[])), None);
+                    }
+                    assert_eq!(
+                        registry.saved_state_id(&state("test:log", &[])),
+                        Some(BlockStateId(3))
+                    );
+                });
+            }
+        });
+        assert!(registry.saved_states.read().unwrap().len() <= 8192);
+        assert!(SAVED_STATE_SLOTS.load(Ordering::Relaxed) <= 8192);
+        let oversized = state(&"x".repeat(129), &[]);
+        assert!(!cacheable_saved_state(&oversized));
+        let other = BlockRegistry::from_nbt(&Tag::compound([
+            ("DataVersion", Tag::Int(crate::DATA_VERSION)),
+            ("states", Tag::List(vec![state("test:log", &[])])),
+            ("defaults", Tag::compound([("test:log", Tag::Int(0))])),
+        ]))
+        .unwrap();
+        assert_eq!(
+            other.saved_state_id(&state("test:log", &[])),
+            Some(BlockStateId(0))
+        );
     }
 }

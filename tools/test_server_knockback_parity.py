@@ -16,12 +16,15 @@ players made of vanilla's protocol code, joins them both and runs one script on 
   Alice's motion packets and her sprint flag as the server sets it are compared exactly;
 - a zombie hits Bob, twice: the knockback reaches Bob's client once his server-side copy has
   travelled a tick (the mob's hit, then ServerPlayer's travel, then ServerEntity.sendChanges). It is night, so
-  that no zombie burns (a burning mob is in its hurt cooldown).
+  that no zombie burns (a burning mob is in its hurt cooldown);
+- Bob hits Alice just after her first airborne position. The motion packet must carry the jump's upward
+  velocity, before the server's next travel tick reduces it.
 
 The script waits on the server, not on the wall: `ticks N` is N ticks of its game clock (with a `sync` round trip
 before and after, so each client holds what the server sent), `tickstep` is one `/tick step` that has run, `frozen`
-a frozen game that has stopped, and `hit` a hit that has landed (a frozen server still ticks its players, so a hit
-lands in Alice's next tick). A server that stalls under load gets the same ticks as an idle one.
+a frozen game that has stopped, `hit` a hit that has landed (a frozen server still ticks its players, so a hit
+lands in Alice's next tick), and `blast` a right click whose blast has moved a given entity (test_bed_explosion_parity).
+A server that stalls under load gets the same ticks as an idle one.
 
 Each case is compared on its own. KNOWN lists the cases Horizon still gets wrong and why; one that matches
 again is reported, and should leave the list.
@@ -38,12 +41,12 @@ import time
 try:
     from . import lab, test_rust_parity as base
     from .test_dedicated_server_parity import Server, free_port, game_time, wait_ticks
-    from .test_locator_bar_parity import generate_world, ops_json
+    from .test_locator_bar_parity import ClientOutput, generate_world, ops_json
 except ImportError:
     import lab
     import test_rust_parity as base
     from test_dedicated_server_parity import Server, free_port, game_time, wait_ticks
-    from test_locator_bar_parity import generate_world, ops_json
+    from test_locator_bar_parity import ClientOutput, generate_world, ops_json
 
 NAME = 'server-knockback-parity'
 PLAYERS = ('Alice', 'Bob')
@@ -63,7 +66,6 @@ PROPERTIES = {
 }
 # Cases Horizon still gets wrong, and why.
 KNOWN = {
-    'pvp-mace': "a smash on a player runs none of MaceItem.hurtEnemy (the attacker's fall goes on)",
 }
 
 A = (0.5, -60.0, 0.5)  # Alice, facing east (yaw -90)
@@ -150,6 +152,16 @@ def pvp_case(weapon=SWORD, sprint=False, crit=False, shield=False, armour=False,
     return lines
 
 
+def pvp_takeoff_case():
+    """Use the first joined guest as the victim so her move is handled before Bob's attack."""
+    return ['cmd Alice difficulty peaceful', 'cmd Alice clear @s',
+            'cmd Alice effect give @s minecraft:resistance 1000 4 true',
+            f'cmd Bob item replace entity @s weapon.mainhand with {SWORD}',
+            f'cmd Alice tp Alice {V[0]} {V[1]} {V[2]} 90 0',
+            f'cmd Alice tp Bob {A[0]} {A[1]} {A[2]} -90 0',
+            *stand('Alice', V, 90), *stand('Bob', A, -90), 'ticks 30', 'takeoff-hit']
+
+
 def mob_hits_case(kind):
     """A mob's own attack on Bob, twice: his motion packet. Alice is in creative, so the mob goes for Bob; each mob
     is killed once its hit has come (`await`), and Bob stands back where he was before the next. (A mob with no
@@ -219,10 +231,17 @@ CASES = {
     'zombie-hits-bob': mob_hits_case('zombie'),
     'crystal-creative': blast_case('crystal', 16),
     'tnt-creative': blast_case('tnt', 32),
+    'pvp-takeoff': pvp_takeoff_case(),
 }
 SETUP = ['cmd Alice gamerule spawn_mobs false', 'cmd Alice gamerule spawn_monsters false',
          'cmd Alice kill @e[type=!player]', 'cmd Alice gamerule advance_time false', 'cmd Alice time set midnight',
          f'cmd Alice tp Alice {A[0]} {A[1]} {A[2]} -90 0', f'cmd Alice tp Bob {V[0]} {V[1]} {V[2]} 90 0', 'ticks 40']
+
+
+def age_of(text):
+    """The number in a `/data get ... Age` reply (`60`, `4500s`)."""
+    digits = ''.join(c for c in text.split(':')[-1] if c.isdigit())
+    return int(digits) if digits else 0
 
 
 def server_data(server, selector, path, timeout=120):
@@ -236,6 +255,43 @@ def server_data(server, selector, path, timeout=120):
                 return line.split('data: ', 1)[-1]
         time.sleep(0.02)
     raise AssertionError(f'{server.log_path.name}: no entity data in {timeout} s')
+
+
+TICK_STATUS = re.compile(r'The game is (frozen|running)')
+# Seconds a client may take to acknowledge a `sync`: KnockbackClient gives up on a server reply after 30 s and
+# acknowledges anyway, so a client that is silent for longer has stopped.
+SYNC_TIMEOUT = 60
+
+
+def left(deadline, what):
+    """The seconds left before `deadline`, or the failure `what` once there are none."""
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        raise AssertionError(what)
+    return remaining
+
+
+def frozen(server, timeout=60):
+    """Waits until the server reports ticking frozen (`/tick query`) and its game clock stands still across four
+    ticks' time, and returns that clock. Two equal clock reads alone can fall inside one live tick."""
+    deadline = time.time() + timeout
+    failure = f'{server.log_path.name}: ticking was not reported frozen with a still clock in {timeout} s'
+    while True:
+        start = len(server.lines)
+        server.console('tick query')
+        status = None
+        while status is None:
+            status = next((m.group(1) for line in server.lines[start:] if (m := TICK_STATUS.search(line))), None)
+            if status is None:
+                left(deadline, failure)
+                time.sleep(0.02)
+        if status == 'frozen':
+            clock = game_time(server, left(deadline, failure))
+            time.sleep(0.2)
+            if game_time(server, left(deadline, failure)) == clock:
+                return clock
+        left(deadline, failure)
+        time.sleep(0.05)
 
 
 def server_dir(directory, world):
@@ -265,6 +321,7 @@ def run_side(label, server_command, client_command, build, world):
             client = subprocess.Popen([*map(str, client_command), '127.0.0.1', str(port), str(out)],
                                       cwd=lab.ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=subprocess.STDOUT, text=True)
+            output = ClientOutput(client, log, f'{label} (see {build}/{label}-client.log)')
 
             def sync():
                 """Every script line sent so far has run, and each client holds what its server sent before."""
@@ -272,10 +329,7 @@ def run_side(label, server_command, client_command, build, world):
                     client.stdin.write(f'sync {name}\n')
                 client.stdin.flush()
                 for name in PLAYERS:
-                    while (reply := client.stdout.readline()) != f'synced {name}\n':
-                        if not reply:
-                            raise AssertionError(f'{label}: the client exited (see {build}/{label}-client.log)')
-                        log.write(reply)
+                    output.expect(f'synced {name}', SYNC_TIMEOUT)
 
             def send(line):
                 """A script line for the client, or one of ours: the waits are on the server's game clock, not the
@@ -288,10 +342,8 @@ def run_side(label, server_command, client_command, build, world):
                     wait_ticks(server, int(line.split()[1]))
                     sync()
                 elif word == 'frozen':
-                    # The tick in flight when ticking was frozen has finished: the clock reads the same twice.
                     sync()
-                    while game_time(server) != game_time(server):
-                        pass
+                    frozen(server)
                 elif word == 'hit':
                     # Alice hits the mob. A frozen server still ticks its players, and the hit lands in Alice's
                     # next tick, not when the packet arrives: the mob's motion says when it has.
@@ -303,6 +355,42 @@ def run_side(label, server_command, client_command, build, world):
                     while server_data(server, mob, 'Motion') == before:
                         time.sleep(0.05)
                     sync()
+                elif word == 'blast':
+                    # `blast X Y Z SELECTOR`: Alice right-clicks the block's top, and the wait ends once the blast
+                    # has moved the selected entity. Like a hit, a frozen server may apply the click in Alice's
+                    # next tick, not when the packet arrives.
+                    sync()
+                    x, y, z, selector = line.split()[1:5]
+                    deadline = time.time() + 30
+                    failure = f'{server.log_path.name}: the click on {x} {y} {z} did not move {selector} in 30 s'
+                    try:
+                        before = server_data(server, selector, 'Motion', timeout=left(deadline, failure))
+                        client.stdin.write(f'useblock Alice {x} {y} {z}\n')
+                        client.stdin.flush()
+                        while True:
+                            motion = server_data(server, selector, 'Motion', timeout=left(deadline, failure))
+                            left(deadline, failure)  # a reply after the deadline is no success
+                            if motion != before:
+                                break
+                            time.sleep(0.05)
+                    except AssertionError as error:
+                        raise AssertionError(f'{failure} ({error})') from None
+                    sync()
+                elif word == 'waitage':
+                    # Hold until an entity's `Age` has reached N. A value that
+                    # decays with the entity's own ticks (a blast's push on an
+                    # item) then belongs to a known age on both servers, whose
+                    # game clocks need not advance together between commands.
+                    # The console's own round trip can be two ticks, so the wait
+                    # is `>=` and the age is carried beside the value it pins.
+                    sync()
+                    selector, age = line.split()[1], int(line.split()[2])
+                    deadline = time.time() + 120
+                    while age_of(server_data(server, selector, 'Age')) < age:
+                        if time.time() > deadline:
+                            raise AssertionError(f'{server.log_path.name}: {selector} never reached Age {age}')
+                        time.sleep(0.05)
+                    sync()
                 elif word == 'tickstep':
                     # `/tick step 1` answers at once and the tick runs after: the clock says when it has.
                     sync()
@@ -311,6 +399,21 @@ def run_side(label, server_command, client_command, build, world):
                     client.stdin.flush()
                     while game_time(server) == before:
                         time.sleep(0.05)
+                    sync()
+                elif word == 'takeoff-hit':
+                    sync()
+                    server.console('tick rate 2')
+                    sync()
+                    wait_ticks(server, 1)
+                    game_time(server)
+                    client.stdin.write(f'mark Alice\npos Alice {V[0]} {V[1] + 0.42} {V[2]} 90 0 0\n')
+                    client.stdin.flush()
+                    # Leave the position packet a head start on its own connection, inside the longer tick.
+                    time.sleep(0.035)
+                    client.stdin.write('attack Bob Alice\nawait Alice\n')
+                    client.stdin.flush()
+                    sync()
+                    server.console('tick rate 20')
                     sync()
                 else:
                     client.stdin.write(line + '\n')
@@ -328,7 +431,9 @@ def run_side(label, server_command, client_command, build, world):
                         send(line)
                     send('ticks 10')
                 send('end')
-                log.write(client.communicate(timeout=60)[0])
+                client.stdin.close()
+                output.drain(60)
+                client.wait(timeout=10)
             finally:
                 if client.poll() is None:
                     client.kill()
@@ -376,7 +481,7 @@ def main():
     subprocess.run(['javac', '--release', str(lock['minecraft']['java_major']), '-proc:none', '-nowarn', '-sourcepath',
                     lab.ROOT / 'mods/horizon/src/test/java', '-cp', dependencies, '-d', classes, oracle],
                    cwd=lab.ROOT, check=True, capture_output=True)
-    subprocess.run(['cargo', 'build', '--profile', 'fast', '-p', 'horizon-client', '--bin', 'horizon-client'], cwd=lab.ROOT,
+    subprocess.run(['cargo', 'build', '--profile', 'fast', '-p', 'horizon-game', '--bin', 'horizon-client'], cwd=lab.ROOT,
                    check=True, capture_output=True)
     import json
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'],
@@ -388,6 +493,9 @@ def main():
 
     world = generate_world(vanilla_server, build)
     vanilla = compared(run_side('vanilla', vanilla_server, client, build, world))
+    takeoff = [line for line in vanilla.get('pvp-takeoff', []) if line.startswith('Alice motion self ')]
+    if len(takeoff) != 1 or not 0.4 < float(takeoff[0].split()[4]) < 0.43:
+        raise AssertionError(f'pvp-takeoff: vanilla did not hit after the jump and before travel: {takeoff}')
     horizon = compared(run_side('horizon', horizon_server, client, build, world))
     differ, fixed = [], []
     for case in CASES:

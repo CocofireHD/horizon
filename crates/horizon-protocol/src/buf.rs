@@ -2,20 +2,53 @@
 //! VarLong, ByteBufCodecs) and the `Codec` building blocks packets are
 //! composed from, mirroring `StreamCodec.composite`.
 use crate::{Error, Result};
-use horizon_world::nbt::{self, Tag};
+use horizon_core::{nbt, nbt::Tag};
 use std::marker::PhantomData;
 
 /// Vanilla's default NBT quota for network tags (NbtAccounter.defaultQuota).
-pub const NBT_QUOTA: usize = 2_097_152;
+pub const NBT_QUOTA: usize = nbt::Limits::network().max_bytes;
+/// The most tags one network NBT value can hold within [`NBT_QUOTA`], using
+/// vanilla's minimum eight-byte per-tag heap charge.
+pub const NBT_MAX_TAGS: usize = nbt::Limits::network().max_nodes;
+
+/// Whether a peer can read `tag` as network NBT: written within [`NBT_QUOTA`], then read back by
+/// [`Reader::nbt`] under the receiver's own limits (`NbtAccounter.defaultQuota` and its tag count).
+pub fn check_network_nbt(tag: &Tag) -> Result<()> {
+    let limits = nbt::Limits {
+        max_bytes: NBT_QUOTA,
+        ..nbt::Limits::default()
+    };
+    let bytes = nbt::write_network(tag, limits).map_err(|e| Error::new(format!("NBT: {e}")))?;
+    Reader::new(&bytes).nbt().map(drop)
+}
 
 /// A cursor over a received packet body.
 pub struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
+    payload_codecs: Option<&'a crate::packets::custom_payload::PayloadCodecs>,
 }
 impl<'a> Reader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self {
+            data,
+            pos: 0,
+            payload_codecs: None,
+        }
+    }
+    /// Read using this connection's frozen custom-payload codecs.
+    pub fn with_payload_codecs(
+        data: &'a [u8],
+        codecs: &'a crate::packets::custom_payload::PayloadCodecs,
+    ) -> Self {
+        Self {
+            data,
+            pos: 0,
+            payload_codecs: Some(codecs),
+        }
+    }
+    pub(crate) fn payload_codecs(&self) -> Option<&crate::packets::custom_payload::PayloadCodecs> {
+        self.payload_codecs
     }
     pub fn remaining(&self) -> usize {
         self.data.len() - self.pos
@@ -45,6 +78,23 @@ impl<'a> Reader<'a> {
     }
     fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
         Ok(self.bytes(N)?.try_into().expect("length checked"))
+    }
+    /// Read one byte for the variable-width primitive codecs.
+    ///
+    /// `u8` goes through the fixed-width array path, which is useful for the
+    /// public primitive API but needlessly builds a one-byte slice for every
+    /// group in a VarInt. Keeping this tiny cursor operation separate lets
+    /// the hot codecs do one bounds check and one cursor increment per byte.
+    #[inline]
+    fn next_byte(&mut self) -> Result<u8> {
+        let Some(&byte) = self.data.get(self.pos) else {
+            return Err(Error::new(format!(
+                "needed 1 bytes, {} left",
+                self.remaining()
+            )));
+        };
+        self.pos += 1;
+        Ok(byte)
     }
     pub fn u8(&mut self) -> Result<u8> {
         Ok(self.array::<1>()?[0])
@@ -78,9 +128,16 @@ impl<'a> Reader<'a> {
     }
     /// VarInt.read: at most five 7-bit groups, least significant first.
     pub fn varint(&mut self) -> Result<i32> {
-        let mut value = 0u32;
-        for i in 0..5 {
-            let b = self.u8()?;
+        // Packet ids and counts are overwhelmingly one byte. Handle that
+        // shape directly, then use the same cursor operation for the less
+        // common continuation groups.
+        let first = self.next_byte()?;
+        if first & 0x80 == 0 {
+            return Ok(i32::from(first));
+        }
+        let mut value = u32::from(first & 0x7F);
+        for i in 1..5 {
+            let b = self.next_byte()?;
             value |= u32::from(b & 0x7F) << (7 * i);
             if b & 0x80 == 0 {
                 return Ok(value as i32);
@@ -90,9 +147,13 @@ impl<'a> Reader<'a> {
     }
     /// VarLong.read: at most ten 7-bit groups.
     pub fn varlong(&mut self) -> Result<i64> {
-        let mut value = 0u64;
-        for i in 0..10 {
-            let b = self.u8()?;
+        let first = self.next_byte()?;
+        if first & 0x80 == 0 {
+            return Ok(i64::from(first));
+        }
+        let mut value = u64::from(first & 0x7F);
+        for i in 1..10 {
+            let b = self.next_byte()?;
             value |= u64::from(b & 0x7F) << (7 * i);
             if b & 0x80 == 0 {
                 return Ok(value as i64);
@@ -115,12 +176,11 @@ impl<'a> Reader<'a> {
     /// String (UTF-16 units: a character outside the BMP counts twice).
     pub fn string(&mut self, max: usize) -> Result<String> {
         let len = self.count(max.saturating_mul(3))?;
-        let s = std::str::from_utf8(self.bytes(len)?)
-            .map_err(|e| Error::new(format!("bad UTF-8: {e}")))?;
+        let s = java_utf8(self.bytes(len)?);
         if s.encode_utf16().count() > max {
             return Err(Error::new(format!("string longer than {max} chars")));
         }
-        Ok(s.to_owned())
+        Ok(s)
     }
     pub fn byte_array(&mut self, max: usize) -> Result<Vec<u8>> {
         let len = self.count(max)?;
@@ -131,10 +191,10 @@ impl<'a> Reader<'a> {
     }
     /// A network NBT tag (NbtIo.readAnyTag without a root name); `End` means none.
     pub fn nbt(&mut self) -> Result<Tag> {
-        let limits = nbt::Limits {
-            max_bytes: NBT_QUOTA,
-            ..nbt::Limits::default()
-        };
+        self.nbt_within(nbt::Limits::network())
+    }
+    /// [`Self::nbt`] within `limits`, for a codec whose writer uses the same ones.
+    pub fn nbt_within(&mut self, limits: nbt::Limits) -> Result<Tag> {
         let (tag, used) = nbt::read_network(&self.data[self.pos..], limits)
             .map_err(|e| Error::new(format!("NBT: {e}")))?;
         self.pos += used;
@@ -149,6 +209,42 @@ impl<'a> Reader<'a> {
             return Err(Error::new("fixed long array past the end"));
         }
         (0..n).map(|_| self.i64()).collect()
+    }
+}
+
+/// Java's UTF-8 replacement decoder, as used by Utf8String.read and by a reader
+/// opened on a UTF-8 file (Guava's `Files.newReader`). Most malformed
+/// sequences have Rust's maximal-subpart grouping, but Java consumes an encoded
+/// surrogate (including its truncated two-byte prefix) as one replacement.
+pub fn java_utf8(mut bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len());
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                output.push_str(valid);
+                return output;
+            }
+            Err(error) => {
+                let (valid, rest) = bytes.split_at(error.valid_up_to());
+                output.push_str(std::str::from_utf8(valid).expect("validated UTF-8 prefix"));
+                bytes = rest;
+                let surrogate = bytes[0] == 0xed
+                    && bytes
+                        .get(1)
+                        .is_some_and(|byte| (0xa0..=0xbf).contains(byte));
+                let consumed = if surrogate {
+                    if bytes.get(2).is_some_and(|byte| byte & 0xc0 == 0x80) {
+                        3
+                    } else {
+                        2
+                    }
+                } else {
+                    error.error_len().unwrap_or(bytes.len())
+                };
+                output.push('\u{fffd}');
+                bytes = &bytes[consumed..];
+            }
+        }
     }
 }
 
@@ -253,6 +349,17 @@ pub fn varint_size(v: i32) -> usize {
 pub trait Codec<T> {
     fn read(r: &mut Reader) -> Result<T>;
     fn write(v: &T, w: &mut Writer);
+    /// Validate a value before allocating its encoded body.
+    fn validate(_v: &T) -> Result<()> {
+        Ok(())
+    }
+    /// Validate using this connection's frozen custom-payload codecs.
+    fn validate_with_payload_codecs(
+        v: &T,
+        _codecs: &crate::packets::custom_payload::PayloadCodecs,
+    ) -> Result<()> {
+        Self::validate(v)
+    }
 }
 macro_rules! primitive {
     ($name:ident, $ty:ty, $read:ident, $write:ident) => {
@@ -300,8 +407,37 @@ impl<const N: usize> Codec<String> for StrN<N> {
         w.string(v)
     }
 }
-/// Identifier.STREAM_CODEC: a resource location string.
-pub type Ident = StrN<32767>;
+/// Identifier.STREAM_CODEC: a validated resource location, with the default namespace.
+pub struct Ident;
+impl Codec<String> for Ident {
+    fn read(r: &mut Reader) -> Result<String> {
+        let value = r.string(32767)?;
+        // A namespaced identifier (what vanilla writes) goes back as read.
+        let qualified = value.find(':').is_some_and(|i| i > 0);
+        let (namespace, path) = value.split_once(':').unwrap_or(("", &value));
+        let namespace = if namespace.is_empty() {
+            "minecraft"
+        } else {
+            namespace
+        };
+        if !namespace
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_.-".contains(&c))
+            || !path
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"/_.-".contains(&c))
+        {
+            return Err(Error::new("invalid resource identifier"));
+        }
+        if qualified {
+            return Ok(value);
+        }
+        Ok(format!("{namespace}:{path}"))
+    }
+    fn write(v: &String, w: &mut Writer) {
+        w.string(v)
+    }
+}
 /// VarInt-prefixed bytes.
 pub struct Bytes;
 impl Codec<Vec<u8>> for Bytes {
@@ -326,6 +462,22 @@ impl<const N: usize> Codec<Vec<u8>> for BytesN<N> {
 pub struct Rest;
 impl Codec<Vec<u8>> for Rest {
     fn read(r: &mut Reader) -> Result<Vec<u8>> {
+        Ok(r.rest().to_vec())
+    }
+    fn write(v: &Vec<u8>, w: &mut Writer) {
+        w.bytes(v)
+    }
+}
+/// Everything left in the packet, at most N bytes: vanilla's unknown login query payloads
+/// (`readableBytes()` outside `0..=N` throws "Payload may not be larger than N bytes").
+pub struct RestN<const N: usize>;
+impl<const N: usize> Codec<Vec<u8>> for RestN<N> {
+    fn read(r: &mut Reader) -> Result<Vec<u8>> {
+        if r.remaining() > N {
+            return Err(Error::new(format!(
+                "Payload may not be larger than {N} bytes"
+            )));
+        }
         Ok(r.rest().to_vec())
     }
     fn write(v: &Vec<u8>, w: &mut Writer) {
@@ -366,6 +518,17 @@ impl<T, C: Codec<T>> Codec<Vec<T>> for List<C> {
         }
     }
 }
+/// ByteBufCodecs.list(N): as [`List`], at most N elements.
+pub struct ListN<C, const N: usize>(PhantomData<C>);
+impl<T, C: Codec<T>, const N: usize> Codec<Vec<T>> for ListN<C, N> {
+    fn read(r: &mut Reader) -> Result<Vec<T>> {
+        let n = r.count(N)?;
+        (0..n).map(|_| C::read(r)).collect()
+    }
+    fn write(v: &Vec<T>, w: &mut Writer) {
+        List::<C>::write(v, w)
+    }
+}
 /// ByteBufCodecs.optional(): a boolean presence flag.
 pub struct Opt<C>(PhantomData<C>);
 impl<T, C: Codec<T>> Codec<Option<T>> for Opt<C> {
@@ -388,10 +551,14 @@ pub struct OptVarInt;
 impl Codec<Option<i32>> for OptVarInt {
     fn read(r: &mut Reader) -> Result<Option<i32>> {
         let v = r.varint()?;
-        Ok(if v == 0 { None } else { Some(v - 1) })
+        Ok(if v == 0 {
+            None
+        } else {
+            Some(v.wrapping_sub(1))
+        })
     }
     fn write(v: &Option<i32>, w: &mut Writer) {
-        w.varint(v.map_or(0, |v| v + 1))
+        w.varint(v.map_or(0, |v| v.wrapping_add(1)))
     }
 }
 /// Vec3i.STREAM_CODEC: three var ints.
@@ -573,6 +740,9 @@ macro_rules! packet {
         pub struct $name {
             $(pub $field: $ty),*
         }
+        impl $crate::retained::OwnedHeap for $name {
+            fn owned_heap_bytes(&self) -> usize { 0usize $(.saturating_add($crate::retained::OwnedHeap::owned_heap_bytes(&self.$field)))* }
+        }
         impl $crate::buf::Codec<$name> for $name {
             #[allow(unused_variables)]
             fn read(r: &mut $crate::buf::Reader) -> $crate::Result<$name> {
@@ -589,6 +759,64 @@ macro_rules! packet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_optional_var_int_wraps_as_java_does() {
+        let mut w = Writer::new();
+        w.varint(i32::MIN);
+        assert_eq!(
+            OptVarInt::read(&mut Reader::new(&w.data)).unwrap(),
+            Some(i32::MAX)
+        );
+        let mut w = Writer::new();
+        OptVarInt::write(&Some(i32::MAX), &mut w);
+        assert_eq!(Reader::new(&w.data).varint().unwrap(), i32::MIN);
+    }
+
+    #[test]
+    fn a_capped_list_refuses_one_more() {
+        let mut w = Writer::new();
+        List::<VarInt>::write(&(0..17).collect(), &mut w);
+        assert!(ListN::<VarInt, 16>::read(&mut Reader::new(&w.data)).is_err());
+        let mut w = Writer::new();
+        List::<VarInt>::write(&(0..16).collect(), &mut w);
+        assert_eq!(
+            ListN::<VarInt, 16>::read(&mut Reader::new(&w.data))
+                .unwrap()
+                .len(),
+            16
+        );
+    }
+
+    /// A network NBT list of `n` byte tags: one root list plus `n` elements.
+    fn byte_list(n: usize) -> Vec<u8> {
+        let mut data = vec![9, 1];
+        data.extend_from_slice(&(n as i32).to_be_bytes());
+        data.resize(data.len() + n, 7);
+        data
+    }
+
+    #[test]
+    fn network_nbt_holds_no_more_tags_than_vanillas_quota_admits() {
+        // Vanilla charges each tag at least 8 bytes of its 2 MiB quota (EndTag's size; a byte in a
+        // list costs it 13), so it refuses any value with more than 262,144 tags: refused here too,
+        // whatever few bytes they take.
+        assert_eq!(NBT_MAX_TAGS, 262_144);
+        let fits = byte_list(NBT_MAX_TAGS - 1);
+        let mut r = Reader::new(&fits);
+        match r.nbt().unwrap() {
+            Tag::List(values) => assert_eq!(values.len(), NBT_MAX_TAGS - 1),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(r.remaining(), 0);
+        let over = byte_list(NBT_MAX_TAGS);
+        assert!(
+            over.len() < NBT_QUOTA / 4,
+            "a few hundred KB, far under the byte quota"
+        );
+        let refused = Reader::new(&over).nbt().unwrap_err().to_string();
+        assert!(refused.contains("node limit"), "{refused}");
+    }
 
     fn round<T: PartialEq + std::fmt::Debug, C: Codec<T>>(v: T) -> Vec<u8> {
         let mut w = Writer::new();
@@ -674,6 +902,47 @@ mod tests {
         round::<Option<i32>, OptVarInt>(Some(0));
         round::<Vec<i32>, List<VarInt>>(vec![1, 300, -1]);
         round::<u128, Uuid>(0x0123_4567_89ab_cdef_0011_2233_4455_6677);
+    }
+
+    #[test]
+    fn packet_strings_replace_malformed_utf8_like_java() {
+        // Captured from the pinned Utf8String.read, including Java's grouping
+        // of encoded surrogates (different from String::from_utf8_lossy).
+        for (bytes, expected) in [
+            (&b"\xff"[..], "\u{fffd}"),
+            (&b"\xed\xa0\x80"[..], "\u{fffd}"),
+            (&b"\xed\xa0"[..], "\u{fffd}"),
+            (&b"\xe0\x80\x80"[..], "\u{fffd}\u{fffd}\u{fffd}"),
+            (&b"\xe2\x82A"[..], "\u{fffd}A"),
+            (&b"\xf0\x9f\x98"[..], "\u{fffd}"),
+        ] {
+            let mut packet = Writer::new();
+            packet.byte_array(bytes);
+            packet.u8(42);
+            let mut reader = Reader::new(&packet.data);
+            assert_eq!(reader.string(16).unwrap(), expected, "{bytes:x?}");
+            assert_eq!(reader.u8().unwrap(), 42);
+        }
+    }
+
+    #[test]
+    fn replacement_strings_keep_the_length_limits_and_cursor() {
+        // Three bytes decode to one replacement, so they fit a one-unit limit.
+        let mut reader = Reader::new(b"\x03\xed\xa0\x80");
+        assert_eq!(reader.string(1).unwrap(), "\u{fffd}");
+        assert_eq!(reader.position(), 4);
+        // Two invalid bytes produce two replacements: the decoded limit fails
+        // after consuming the string, as Utf8String.read does.
+        let mut reader = Reader::new(b"\x02\xff\xff*");
+        assert!(reader.string(1).is_err());
+        assert_eq!(reader.position(), 3);
+        assert_eq!(reader.u8().unwrap(), 42);
+        // Encoded length and truncation failures leave the body unread.
+        for bytes in [&b"\x04\xff\xff\xff\xff"[..], &b"\x02\xff"[..]] {
+            let mut reader = Reader::new(bytes);
+            assert!(reader.string(1).is_err());
+            assert_eq!(reader.position(), 1);
+        }
     }
 
     #[test]

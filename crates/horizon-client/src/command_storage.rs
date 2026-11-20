@@ -1,7 +1,7 @@
 //! `CommandStorage`: named compounds for `/data ... storage <id>`, kept per
 //! namespace in `data/<namespace>/command_storage.dat`.
 use crate::save;
-use horizon_world::nbt::{Compound, Tag};
+use horizon_core::nbt::{Compound, Tag};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -90,6 +90,17 @@ impl CommandStorage {
         }
         self.dirty = true;
     }
+    /// What an in-place edit of `get`'s compound leaves behind when no
+    /// `set` follows: a command that changed the stored compound and then
+    /// failed (`DataCommands.manipulateData` throws before `setData`). Only
+    /// an id that is stored has a compound to edit; the storage is not
+    /// marked for saving.
+    pub fn set_unsaved(&mut self, id: &str, contents: Tag) {
+        let (ns, path) = split_id(id);
+        if let Some(stored) = self.namespaces.get_mut(ns).and_then(|m| m.get_mut(path)) {
+            *stored = contents;
+        }
+    }
     /// Every stored id (`keys`).
     pub fn keys(&self) -> Vec<String> {
         self.namespaces
@@ -102,7 +113,7 @@ impl CommandStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use horizon_world::nbt::parse_snbt;
+    use horizon_core::nbt::parse_snbt;
 
     #[test]
     fn stores_per_namespace_and_persists() {

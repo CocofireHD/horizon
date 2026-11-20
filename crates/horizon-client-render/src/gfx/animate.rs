@@ -64,7 +64,7 @@ enum Writer {
     },
 }
 
-pub(super) struct SpriteAnimator {
+pub(crate) struct SpriteAnimator {
     sprites: Vec<Sprite>,
     groups: Vec<Group>,
     writer: Writer,
@@ -74,9 +74,85 @@ pub(super) struct SpriteAnimator {
     changed: Vec<u32>,
     /// Whether each sprite layer has an animation.
     is_animated: Vec<bool>,
+    /// What the sprites' Polytone animation `mode`s read.
+    modes: AnimationModes,
+}
+
+/// The sprites' Polytone animation `mode` expressions, compiled, and what the modes read this
+/// frame (the time of day, the weather, each expression's value).
+#[derive(Default)]
+struct AnimationModes {
+    programs: Vec<(String, horizon_polytone::expr::Program)>,
+    day_time: i64,
+    weather: f32,
+    values: std::collections::HashMap<String, f64>,
+    /// The open screen (an identity the game picks) and the ticks it has been open.
+    screen: Option<u64>,
+    screen_time: i64,
+}
+
+impl AnimationModes {
+    fn new(animations: &[SpriteAnimation]) -> Self {
+        let mut programs: Vec<(String, horizon_polytone::expr::Program)> = Vec::new();
+        for animation in animations {
+            if let Some(horizon_assets::animation::ClipMode::Expression(source)) = animation.mode()
+                && !programs.iter().any(|(s, _)| s == source)
+            {
+                match horizon_polytone::expr::Program::compile(source) {
+                    Ok(program) => programs.push((source.clone(), program)),
+                    Err(e) => log::warn!("animation mode {source:?}: {e}"),
+                }
+            }
+        }
+        Self {
+            programs,
+            ..Default::default()
+        }
+    }
+}
+
+impl super::Renderer {
+    /// What the packs' Polytone animation modes read this frame: the time of day, the weather and,
+    /// for expressions, the packs' frame (none without a Polytone pack: those animations wait).
+    pub fn set_animation_inputs(
+        &mut self,
+        day_time: i64,
+        [rain, thunder]: [f32; 2],
+        frame: Option<&crate::environment::Frame>,
+        screen: Option<u64>,
+    ) {
+        let modes = &mut self.animations.modes;
+        // `screen_time`: a tick more while the same screen stays open, from 0 on a new one.
+        modes.screen_time = match (screen, modes.screen) {
+            (Some(open), Some(was)) if open == was => modes.screen_time + 1,
+            _ => 0,
+        };
+        modes.screen = screen;
+        modes.day_time = day_time;
+        modes.weather = rain + thunder;
+        modes.values.clear();
+        if let Some(frame) = frame {
+            for (source, program) in &modes.programs {
+                let configs = Default::default();
+                if let Some(value) = crate::environment::eval_frame(program, frame, &configs) {
+                    modes.values.insert(source.clone(), value.num());
+                }
+            }
+        }
+    }
 }
 
 impl SpriteAnimator {
+    /// What the modes read this frame, for the GUI atlas's sprites (their expressions aren't
+    /// compiled: those run on ticks).
+    pub(crate) fn mode_inputs(&self) -> horizon_assets::animation::ModeInputs<'static> {
+        horizon_assets::animation::ModeInputs {
+            day_time: self.modes.day_time,
+            screen_time: self.modes.screen_time,
+            weather: self.modes.weather,
+            expression: &|_| None,
+        }
+    }
     /// `textures` are the sprite arrays, `split` layers each, `size` pixels
     /// wide; `animations` hold their frames at that size. `compute`: whether
     /// the device says it runs compute shaders writing storage textures.
@@ -105,9 +181,18 @@ impl SpriteAnimator {
         let mut counts: Vec<usize> = Vec::new();
         let mut sprites = Vec::with_capacity(animations.len());
         for animation in animations {
-            let pixels: Vec<_> = (0..animation.frame_count())
-                .map(|frame| animation.pixels(frame))
-                .collect();
+            // Charged before anything is built: the frames at the chains' edge, and their mips.
+            let edge = chain_edge(settings, animation.layer, size);
+            let count = animation.frame_count();
+            if chain_budget(edge, count, limit).is_none() {
+                log::warn!(
+                    "Horizon: layer {}'s animation ({count} frames at {edge} px) does not fit in a storage buffer or the sprite budget; it stays still",
+                    animation.layer
+                );
+                continue;
+            }
+            let at_edge: Vec<Vec<u8>> = (0..count).map(|f| animation.frame_at(f, edge)).collect();
+            let pixels: Vec<&[u8]> = at_edge.iter().map(Vec::as_slice).collect();
             let (chains, edge) = source_chains(&pixels, size, settings, animation.layer);
             let bytes: u64 = chains.iter().map(|chain| chain.len() as u64).sum();
             if bytes > limit {
@@ -176,6 +261,7 @@ impl SpriteAnimator {
                 size,
                 changed: Vec::new(),
                 is_animated,
+                modes: AnimationModes::new(animations),
             };
         };
         let frames: Vec<_> = frames
@@ -256,6 +342,7 @@ impl SpriteAnimator {
             size,
             changed: Vec::new(),
             is_animated,
+            modes: AnimationModes::new(animations),
         }
     }
 
@@ -290,10 +377,17 @@ impl SpriteAnimator {
         &self.changed
     }
 
-    /// Show every sprite's frame at `tick`, rewriting only the sprites whose
-    /// frame or mix changed (`SpriteContents.AnimationState.tick`), skipping
-    /// sprites not present in `active` when provided.
-    pub fn animate(
+    /// The frame selected for this layer, including animation modes.
+    pub(super) fn current_frame(&self, layer: u32) -> Option<usize> {
+        self.sprites
+            .iter()
+            .find(|s| s.animation.layer == layer)?
+            .shown
+            .map(|b| b.frame)
+    }
+
+    /// [`Self::animate_with`] with the Polytone animation modes' inputs the renderer was last given.
+    pub fn animate_modes(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         uploads: &mut Uploads,
@@ -301,7 +395,32 @@ impl SpriteAnimator {
         active: Option<&[u64]>,
         timing: Option<&mut super::pack_timing::PassTiming>,
     ) {
-        if self.collect(tick, active) == 0 {
+        let values = std::mem::take(&mut self.modes.values);
+        let expression = |source: &str| values.get(source).copied();
+        let inputs = horizon_assets::animation::ModeInputs {
+            day_time: self.modes.day_time,
+            screen_time: self.modes.screen_time,
+            weather: self.modes.weather,
+            expression: &expression,
+        };
+        self.animate_with(encoder, uploads, tick, Some(&inputs), active, timing);
+        self.modes.values = values;
+    }
+
+    /// Show every sprite's frame at `tick` (or what a Polytone `mode` picks from `inputs`),
+    /// rewriting only the sprites whose frame or mix changed
+    /// (`SpriteContents.AnimationState.tick`), skipping sprites not present in `active` when
+    /// provided.
+    pub fn animate_with(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        uploads: &mut Uploads,
+        tick: u64,
+        inputs: Option<&horizon_assets::animation::ModeInputs>,
+        active: Option<&[u64]>,
+        timing: Option<&mut super::pack_timing::PassTiming>,
+    ) {
+        if self.collect(tick, inputs, active) == 0 {
             return;
         }
         let (jobs, pipeline) = match &self.writer {
@@ -361,7 +480,12 @@ impl SpriteAnimator {
 
     /// Queue a job for every sprite whose blend at `tick` differs from what
     /// its layer shows; the number of jobs.
-    fn collect(&mut self, tick: u64, active: Option<&[u64]>) -> usize {
+    fn collect(
+        &mut self,
+        tick: u64,
+        inputs: Option<&horizon_assets::animation::ModeInputs>,
+        active: Option<&[u64]>,
+    ) -> usize {
         let mut count = 0;
         self.changed.clear();
         for sprite in &mut self.sprites {
@@ -373,7 +497,7 @@ impl SpriteAnimator {
                     continue;
                 }
             }
-            let blend = sprite.animation.blend(tick);
+            let blend = sprite.animation.blend_with(tick, inputs);
             if sprite.shown == Some(blend) {
                 continue;
             }
@@ -457,6 +581,28 @@ fn mix_level(frames: &[u8], [_, current, next, millis, edge]: [u32; 5], width: u
     out
 }
 
+/// The first level's edge of a layer's chains: its native side when that is a power of two
+/// below the layers' `size` (the array's upper levels repeat it), else `size`.
+fn chain_edge(settings: &[Settings], layer: u32, size: u32) -> u32 {
+    let s = settings.get(layer as usize).copied().unwrap_or_default();
+    if s.native_size.is_power_of_two() && s.native_size < size {
+        s.native_size
+    } else {
+        size
+    }
+}
+
+/// The bytes `count` frames' chains take at `edge` (every level down to 1x1), or `None` when
+/// they pass `limit`, or the frames at `edge` pass a full atlas (`sprites::check_frames`).
+fn chain_budget(edge: u32, count: usize, limit: u64) -> Option<u64> {
+    crate::sprites::check_frames(edge, u32::try_from(count).ok()?).ok()?;
+    let frame: u64 = (0..=edge.trailing_zeros())
+        .map(|level| u64::from(edge >> level).pow(2) * 4)
+        .sum();
+    let bytes = frame.checked_mul(count as u64)?;
+    (bytes <= limit).then_some(bytes)
+}
+
 /// The mip chain a frame's layer is made of, and its first level's edge.
 /// `mipmap::generate` makes a sprite scaled up by whole pixels to the
 /// array's size from its own size's chain, its first level repeated into the
@@ -481,19 +627,22 @@ fn source_chains(
     layer: u32,
 ) -> (Vec<Vec<u8>>, u32) {
     let s = settings.get(layer as usize).copied().unwrap_or_default();
-    let edge = if s.native_size.is_power_of_two() && s.native_size < size {
-        s.native_size
-    } else {
-        size
-    };
+    let edge = chain_edge(settings, layer, size);
     let mut sheet = crate::mipmap::Image {
         width: edge,
         height: edge * frames.len() as u32,
         pixels: Vec::with_capacity((edge * edge) as usize * frames.len()),
     };
     for frame in frames {
-        let frame = crate::sprites::resample(frame, size, edge);
-        sheet.pixels.extend_from_slice(frame.as_chunks::<4>().0);
+        // Square frames of any side: at the layers' size, or already at `edge`.
+        let from = (frame.len() / 4).isqrt() as u32;
+        match from == edge {
+            true => sheet.pixels.extend_from_slice(frame.as_chunks::<4>().0),
+            false => {
+                let frame = crate::sprites::resample(frame, from, edge);
+                sheet.pixels.extend_from_slice(frame.as_chunks::<4>().0);
+            }
+        }
     }
     let has_transparent = s.has_transparent || sheet.pixels.iter().any(|p| p[3] == 0);
     let levels = crate::mipmap::generate(
@@ -615,6 +764,17 @@ mod tests {
         }
     }
 
+    /// A 1024x4112 sheet of 16x16 frames (16448) beside 128 px layers is charged at its 16 px
+    /// edge: about 21.4 MiB of chains, where squared at 128 its frames were 1,028 MiB.
+    #[test]
+    fn animations_are_charged_at_their_edge() {
+        assert_eq!(chain_budget(16, 16_448, 128 << 20), Some(16_448 * 1364));
+        assert_eq!(chain_budget(16, 16_448, 16 << 20), None);
+        // 65 frames at a 2048 px edge pass a full atlas.
+        assert_eq!(chain_budget(2048, 65, u64::MAX), None);
+        assert!(chain_budget(2048, 64, u64::MAX).is_some());
+    }
+
     #[test]
     fn real_animation_chains_repeat_into_the_array_chain() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -626,7 +786,9 @@ mod tests {
         {
             return;
         }
-        let mut sprites = crate::sprites::Sprites::default();
+        let mut sprites = crate::sprites::Sprites::new(
+            crate::resource_source::ResourceSource::directory(root.clone()),
+        );
         for name in [
             "water_still",
             "water_flow",
@@ -639,16 +801,14 @@ mod tests {
             "kelp",
             "straw_bed",
         ] {
-            sprites
-                .insert(&root, &format!("minecraft:block/{name}"))
-                .unwrap();
+            sprites.insert(&format!("minecraft:block/{name}")).unwrap();
         }
         sprites.finish();
         assert_eq!(sprites.size, 64);
         assert_eq!(sprites.animations.len(), 9);
         for animation in &sprites.animations {
             for frame in 0..animation.frame_count() {
-                let pixels = animation.pixels(frame);
+                let pixels = &animation.frame_at(frame, 64);
                 let (expected, _) =
                     super::super::mip_chain(pixels, 64, &sprites.mips, animation.layer, 1);
                 let (chain, edge) = source_chain(pixels, 64, &sprites.mips, animation.layer);
@@ -669,11 +829,11 @@ mod tests {
         {
             return;
         }
-        let mut sprites = crate::sprites::Sprites::default();
+        let mut sprites = crate::sprites::Sprites::new(
+            crate::resource_source::ResourceSource::directory(root.clone()),
+        );
         for name in ["kelp", "kelp_plant", "seagrass", "tall_seagrass_top"] {
-            sprites
-                .insert(&root, &format!("minecraft:block/{name}"))
-                .unwrap();
+            sprites.insert(&format!("minecraft:block/{name}")).unwrap();
         }
         sprites.finish();
         // A level drawn nowhere: no texel passes the cutout's alpha test.
@@ -719,12 +879,18 @@ mod tests {
     fn rounding_matches_f32_mix_but_for_exact_halves() {
         // The CPU blend this replaced: f32 mix, then rounded. They differ
         // only where the exact mix is a half, which f32 rounded either way.
+        let normalized: [f32; 256] = std::array::from_fn(|channel| channel as f32 / 255.0);
         for millis in 1..1000u32 {
             let t = millis as f32 / 1000.0;
+            let inverse_t = 1.0 - t;
+            let remaining = 1000 - millis;
             for a in 0..=255u32 {
+                // Preserve the original f32 operations and their order, just reuse the a term.
+                let from_a = normalized[a as usize] * inverse_t;
+                let exact_a = a * remaining;
                 for b in (0..=255u32).step_by(3) {
-                    let f = ((a as f32 / 255.0) * (1.0 - t) + (b as f32 / 255.0) * t) * 255.0;
-                    let exact = a * (1000 - millis) + b * millis;
+                    let f = (from_a + normalized[b as usize] * t) * 255.0;
+                    let exact = exact_a + b * millis;
                     let ours = (exact + 500) / 1000;
                     if exact % 1000 != 500 {
                         assert_eq!(ours, f.round() as u32, "{a} {b} {millis}");
@@ -796,12 +962,14 @@ mod tests {
 
     #[test]
     fn gpu_layers_match_the_cpu_chains_every_tick() {
+        let _gpu = crate::gfx::test_gpu::lock();
         layers_match_the_cpu_chains_every_tick(true);
     }
 
     /// Without compute shaders (OpenGL before 4.3): the same layers.
     #[test]
     fn copied_layers_match_the_cpu_chains_every_tick() {
+        let _gpu = crate::gfx::test_gpu::lock();
         layers_match_the_cpu_chains_every_tick(false);
     }
 
@@ -860,7 +1028,7 @@ mod tests {
         for tick in [0, 0, 1, 2, 3, 4, 7, 7, 12, 30] {
             let mut encoder = device.create_command_encoder(&Default::default());
             let shown: Vec<_> = animator.sprites.iter().map(|s| s.shown).collect();
-            animator.animate(&mut encoder, &mut uploads, tick, None, None);
+            animator.animate_with(&mut encoder, &mut uploads, tick, None, None, None);
             writes.push(
                 animator
                     .sprites
@@ -900,6 +1068,7 @@ mod tests {
 
     #[test]
     fn inactive_sprites_are_skipped_by_collect() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, _)) = device() else {
             return;
         };
@@ -929,23 +1098,23 @@ mod tests {
 
         // When active layer is [1], only sprite 1 is collected
         let active = [1_u64 << 1];
-        let count = animator.collect(1, Some(&active));
+        let count = animator.collect(1, None, Some(&active));
         assert_eq!(count, 1);
         assert_eq!(animator.changed, vec![1]);
 
         // When active is empty, 0 are collected
-        let count = animator.collect(2, Some(&[0]));
+        let count = animator.collect(2, None, Some(&[0]));
         assert_eq!(count, 0);
         assert!(animator.changed.is_empty());
 
         // When active is [3, 5], both 3 and 5 are collected
         let active = [1_u64 << 3 | 1_u64 << 5];
-        let count = animator.collect(3, Some(&active));
+        let count = animator.collect(3, None, Some(&active));
         assert_eq!(count, 2);
         assert_eq!(animator.changed, vec![3, 5]);
 
         // When active is None, all out-of-date sprites update
-        let count = animator.collect(5, None);
+        let count = animator.collect(5, None, None);
         assert_eq!(count, 3);
         assert_eq!(animator.changed, vec![1, 3, 5]);
     }

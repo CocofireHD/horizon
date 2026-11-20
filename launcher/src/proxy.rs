@@ -5,7 +5,8 @@
 //!
 //! What goes through it: Horizon's releases and the launcher's own update, Minecraft's files and
 //! Java from Mojang, Modrinth, CurseForge, Horizon's mod registry, pictures, Microsoft sign-in,
-//! Tailscale's API, and the jars a modpack import downloads. A local address never does, and the
+//! Tailscale's API, the jars a modpack import downloads, and the crates and horizon-mixins a
+//! native build's Cargo downloads ([`for_programs`]). A local address never does, and the
 //! Servers page's calls to a game server's API (`servers.rs`) build their agent without it: they
 //! are on loopback and asked every second.
 //!
@@ -45,18 +46,18 @@ pub fn agent(builder: ureq::AgentBuilder, url: &str) -> ureq::AgentBuilder {
     }
 }
 
+/// The launcher's setting for the programs it starts that download by themselves, in curl's
+/// spelling, which they read: a native build's Cargo (`CARGO_HTTP_PROXY`), fetching crates and
+/// horizon-mixins. None without one: they read the environment's then, as the launcher does.
+pub fn for_programs() -> Option<String> {
+    setting().map(crate::downloads::proxy_address)
+}
+
 /// Why `spec` can't be used as a proxy, or None when it can (empty means none).
 pub fn refuse(spec: &str) -> Option<String> {
     let spec = spec.trim();
     if spec.is_empty() {
         return None;
-    }
-    if horizon_port_pack::net::socks(spec) {
-        return Some(format!(
-            "{} is a SOCKS proxy; Horizon downloads through an HTTP proxy, such as the \
-             http:// address your proxy app also listens on.",
-            horizon_port_pack::net::redacted(spec)
-        ));
     }
     // `ureq` takes `http://` without a host, which would leave a download failing with nothing
     // said about the proxy.
@@ -64,7 +65,7 @@ pub fn refuse(spec: &str) -> Option<String> {
         || horizon_port_pack::net::host_of(spec).is_none_or(str::is_empty)
     {
         return Some(format!(
-            "{} isn't a proxy address. Write it as http://host:port.",
+            "{} isn't a proxy address. Write it as http://host:port or socks5://host:port.",
             horizon_port_pack::net::redacted(spec)
         ));
     }
@@ -137,14 +138,16 @@ mod tests {
         assert_eq!(refuse("127.0.0.1:7890"), None);
         assert_eq!(refuse("http://user:pass@proxy.local:3128"), None);
         assert!(refuse("http://").is_some());
-        assert!(refuse("socks5://127.0.0.1:7891").is_some());
+        assert_eq!(refuse("socks5://127.0.0.1:7891"), None);
+        assert_eq!(refuse("socks5h://user:pass@127.0.0.1:7891"), None);
+        assert!(refuse("socks5://").is_some());
     }
 
     /// The reason is shown under the field and printed by `horizon-launcher settings set`.
     #[test]
     fn a_refused_address_keeps_its_credentials_to_itself() {
-        let why = refuse("socks5://user:secret@127.0.0.1:7891").unwrap();
-        assert!(why.starts_with("socks5://***@127.0.0.1:7891 "), "{why}");
+        let why = refuse("socks3://user:secret@127.0.0.1:7891").unwrap();
+        assert!(why.starts_with("socks3://***@127.0.0.1:7891 "), "{why}");
         let why = refuse("http://user:secret@").unwrap();
         assert!(!why.contains("secret"), "{why}");
     }

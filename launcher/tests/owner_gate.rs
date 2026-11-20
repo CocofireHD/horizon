@@ -6,8 +6,8 @@ use std::process::{Command, Output, Stdio};
 
 const REFUSED: &str = "Sign in with a Microsoft account that owns Minecraft: Java Edition to play.";
 
-/// Fresh homes with one installed (not prepared) version and an offline name, as a player who
-/// played offline before the gate has.
+/// Fresh homes with one installed (not prepared) version and an offline name from an older
+/// launcher, as a player who played offline before the gate has.
 fn home(name: &str) -> PathBuf {
     let root =
         std::env::temp_dir().join(format!("horizon-owner-gate-{name}-{}", std::process::id()));
@@ -51,10 +51,39 @@ fn the_cli_refuses_to_play_without_an_owner() {
     assert!(!out.status.success(), "{said}");
     assert!(said.contains(REFUSED), "{said}");
     assert!(said.contains("horizon-launcher account sign-in"), "{said}");
-    // Nothing of the game ran, and the offline name is still there.
+    // Nothing of the game ran, and a refusal doesn't rewrite the accounts.
     assert!(!root.join("game/sessions").exists());
     let accounts = std::fs::read_to_string(root.join("launcher/accounts.json")).unwrap();
     assert!(accounts.contains("Builder_1"), "{accounts}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn prepare_download_explains_the_sign_in_requirement() {
+    let root = home("prepare-download");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../research-lock.json"),
+        root.join("launcher/versions/v2026.10.27.01/research-lock.json"),
+    )
+    .unwrap();
+    let out = launcher(
+        &root,
+        &["prepare", "--download", "--version", "v2026.10.27.01"],
+    )
+    .current_dir(&root)
+    .env("HOME", &root)
+    .env("HORIZON_LAUNCHER_TRASH", root.join("trash"))
+    .env("HORIZON_LAUNCHER_CLIPBOARD", root.join("clipboard"))
+    .env("HORIZON_LAUNCHER_DESKTOP", root.join("desktop"))
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(out.stdout.is_empty(), "{}", text(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "error: Sign in with a Microsoft account that owns Minecraft: Java Edition to download 26.3 from Mojang."
+    );
+    assert!(!root.join("launcher/minecraft").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
 

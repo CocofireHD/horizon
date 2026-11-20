@@ -3,19 +3,21 @@
 //! columns (`BlendingData.calculateData`) and the biomes they keep.
 use crate::{biome::Biomes, chunk::Chunk, save::SaveDir};
 use horizon_core::position::ChunkPos;
-use horizon_world::{
-    nbt::Tag,
-    registry::BlockStateId,
-    worldgen::{
-        biome::BiomeId,
-        biome_chunk::BiomeChunk,
-        blending::{BlendingData, Direction8, OldChunk, OldWorld, Sides},
-        generator::GeneratorData,
-    },
-};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
+};
+use {
+    horizon_core::nbt::Tag,
+    horizon_world::{
+        registry::BlockStateId,
+        worldgen::{
+            biome::BiomeId,
+            biome_chunk::BiomeChunk,
+            blending::{BlendingData, Direction8, OldChunk, OldWorld, Sides},
+            generator::GeneratorData,
+        },
+    },
 };
 
 /// A level's saved chunks that an older version generated.
@@ -83,6 +85,16 @@ impl SavedOldWorld {
     fn client_to_generator_biome(&self, id: u16) -> BiomeId {
         let name = &self.biomes.get(id).name;
         self.data.biome_id(name).unwrap_or(BiomeId(0))
+    }
+    /// The data `blending` already calculated for an old chunk, from the cache
+    /// alone: it never calculates (the save writes what the generation made).
+    pub fn calculated(&self, x: i32, z: i32) -> Option<Arc<BlendingData>> {
+        self.blending
+            .lock()
+            .unwrap()
+            .get(&(x, z))
+            .cloned()
+            .flatten()
     }
     /// The packed `blending_data` of a saved chunk.
     fn packed(&self, x: i32, z: i32) -> Option<BlendingData> {

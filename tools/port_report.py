@@ -18,6 +18,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 try:
     from . import class_index, vanilla_map
@@ -42,8 +43,6 @@ GENERATORS = [
      lambda d: bool(d["commands"]["added"] or d["commands"]["removed"])),
     ("crates/horizon-command/src/vanilla_order.rs", "python3 tools/generate_command_order.py",
      lambda d: bool(d["commands"]["added"] or d["commands"]["removed"])),
-    ("crates/horizon-world/src/datafix/block_state_data.txt", "python3 tools/gen_block_state_data.py",
-     lambda d: "net/minecraft/util/datafix/fixes/BlockStateData" in d["classes"]["changed"]),
 ]
 # Registries whose new entries are new things to port.
 CONTENT = ["minecraft:block", "minecraft:item", "minecraft:entity_type", "minecraft:block_entity_type",
@@ -54,7 +53,9 @@ def version_sites(facts, root=ROOT):
     """file:line of every place the code states these version facts (not tests)."""
     pattern = ["-e", str(facts["protocol_version"]), "-e", str(facts["world_version"])]
     found = []
-    for command in (["git", "grep", "-n", "-w"] + pattern, ["git", "grep", "-n", "-F", f'"{facts["id"]}"']):
+    for command in (["git", "grep", "-n", "-w"] + pattern,
+                    ["git", "grep", "-n", "-F", f'"{facts["id"]}"'],
+                    ["git", "grep", "-n", "-F", f"'{facts['id']}'"]):
         result = subprocess.run(command + ["--", "crates/*.rs", "launcher/*.rs", "tools/*.py"],
                                 cwd=root, capture_output=True, text=True)
         found += [line.split(":", 2)[0] + ":" + line.split(":", 2)[1] for line in result.stdout.splitlines()]
@@ -147,17 +148,30 @@ def blocking_items(diff, mapping, pinned_facts, root, regen=None):
         items.append(item(1, "report-format", f"blocks.json format: {', '.join(diff['blocks']['format'])}",
                           files=files_containing("blocks.json", root),
                           details={"fields": diff["blocks"]["format"]}))
-    if regen is None:
-        for output, command, stale in GENERATORS:
-            if stale(diff):
-                items.append(item(1, "regenerate", f"Regenerate {output}", files=[output], command=command))
-    else:
+    # Block state IDs are the chunk palette and the network protocol: a shift is a blocking change
+    # even when no block was added, removed or given a different property.
+    if diff["blocks"].get("state_ids_shifted"):
+        first = diff["blocks"].get("first_shifted")
+        items.append(item(1, "block-ids",
+                          f"Block state IDs: {diff['blocks']['state_ids_shifted']} blocks shifted"
+                          + (f" (first: {first})" if first else ""),
+                          files=files_containing("blocks.json", root),
+                          details={"shifted": diff["blocks"]["state_ids_shifted"], "first": first,
+                                   "state_count": diff["blocks"].get("state_count")}))
+    covered = set()
+    if regen is not None:
         for name, entry in regen["generators"].items():
             if entry["status"] == "failed":
                 errors = entry.get("compile_errors", [])
                 what = "its vanilla exporter no longer compiles" if errors else "failed"
                 items.append(item(1, "regen-failed", f"Generator {name}: {what} on {regen['new']}",
                                   files=entry["outputs"], error=entry["error"], compile_errors=errors))
+                covered.update(entry.get("outputs", []))
+            elif entry["status"] in ("regenerated", "unchanged"):
+                covered.update(entry.get("outputs", []))
+    for output, command, stale in GENERATORS:
+        if output not in covered and stale(diff):
+            items.append(item(1, "regenerate", f"Regenerate {output}", files=[output], command=command))
     return items
 
 
@@ -281,7 +295,9 @@ def build(diff, mapping, old, new, pinned_facts, results=None, root=ROOT, regen=
         entry["id"] = number
     clean = [kind for kind in ("packets", "commands") if not diff[kind]]
     clean += [kind for kind in ("blocks", "items") if not (diff[kind]["added"] or diff[kind]["removed"]
-                                                            or diff[kind]["changed"])]
+                                                            or diff[kind]["changed"]
+                                                            or diff[kind].get("state_ids_shifted")
+                                                            or diff[kind].get("format"))]
     classes = diff["classes"]
     return {
         "old": old, "new": new,
@@ -290,8 +306,10 @@ def build(diff, mapping, old, new, pinned_facts, results=None, root=ROOT, regen=
             "classes": {"added": len(classes["added"]), "removed": len(classes["removed"]),
                         "moved": len(classes["moved"]), "changed": len(classes["changed"]),
                         "horizon": len(classes["horizon"])},
-            "generators": ({name: e["status"] for name, e in regen["generators"].items()} if regen
-                           else {i["files"][0]: "stale" for i in items if i["kind"] == "regenerate"}),
+            "generators": {
+                **({name: e["status"] for name, e in regen["generators"].items()} if regen else {}),
+                **{i["files"][0]: "stale" for i in items if i["kind"] == "regenerate"},
+            },
         },
         "harnesses": harnesses["summary"] if harnesses else None,
         "regen": {"candidate": regen["candidate"], "commit": regen["commit"],
@@ -319,9 +337,11 @@ def markdown(report, limit=12):
         lines.append(f"- unchanged: {', '.join(report['clean'])}")
     if report.get("regen"):
         generators = summary["generators"]
+        statuses = ("regenerated", "unchanged", "failed")
+        if any(v == "stale" for v in generators.values()):
+            statuses += ("stale",)
         lines.append(f"- generators in `{report['regen']['candidate']}` at {report['regen']['commit'][:10]}: "
-                     + ", ".join(f"{s} {sum(1 for v in generators.values() if v == s)}"
-                                 for s in ("regenerated", "unchanged", "failed")))
+                     + ", ".join(f"{s} {sum(1 for v in generators.values() if v == s)}" for s in statuses))
         for path, (added, removed) in report["regen"]["stat"].items():
             lines.append(f"  - regenerated `{path}` (+{added} -{removed})")
     if report.get("harnesses"):
@@ -376,3 +396,9 @@ def markdown(report, limit=12):
                                               for p, n in list(entry["packages"].items())[:limit]))
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+if __name__ == "__main__":
+    # A module, not a command: say how it is used instead of doing nothing at all.
+    print(__doc__, file=sys.stderr)
+    raise SystemExit(2)

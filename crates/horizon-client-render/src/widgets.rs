@@ -13,7 +13,13 @@ pub enum Cursor {
     #[default]
     Arrow,
     PointingHand,
+    /// `CursorTypes.IBEAM`: over a text field that takes input.
+    Ibeam,
     NotAllowed,
+    /// `CursorTypes.RESIZE_NS`: a scroller held vertically (`MerchantScreen`).
+    ResizeNs,
+    /// `CursorTypes.RESIZE_EW`: a slider held horizontally.
+    ResizeEw,
 }
 
 thread_local! {
@@ -32,6 +38,31 @@ pub fn widget_cursor(hovered: bool, active: bool) {
     if hovered {
         request_cursor(if active {
             Cursor::PointingHand
+        } else {
+            Cursor::NotAllowed
+        });
+    }
+}
+/// `AbstractSliderButton.handleCursor`: a dragged slider resizes, a hovered
+/// one points, and an inactive one is not allowed.
+pub fn slider_cursor(hovered: bool, active: bool, dragging: bool) {
+    if hovered {
+        request_cursor(if !active {
+            Cursor::NotAllowed
+        } else if dragging {
+            Cursor::ResizeEw
+        } else {
+            Cursor::PointingHand
+        });
+    }
+}
+
+/// `EditBox.handleCursor`: a hovered text field shows the I-beam, or the
+/// forbidden sign when it takes no input.
+pub fn text_cursor(hovered: bool, editable: bool) {
+    if hovered {
+        request_cursor(if editable {
+            Cursor::Ibeam
         } else {
             Cursor::NotAllowed
         });
@@ -105,6 +136,11 @@ thread_local! {
     static ACTION_SCREENS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     /// The lists drawn with a scrollbar since `end_frame`, and the last frame's.
     static SCROLL_AREAS: RefCell<(Vec<ScrollArea>, Vec<ScrollArea>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    /// The steps screens declared since `end_frame` ([`focus_link`]), and the last frame's.
+    static FOCUS_LINKS: RefCell<(Vec<FocusLink>, Vec<FocusLink>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    /// The targets whose value left and right step ([`steps_value`]) since `end_frame`, and the
+    /// last frame's.
+    static STEPPERS: RefCell<(Vec<[f32; 4]>, Vec<[f32; 4]>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
 /// Splitscreen: one player's buttons and focus targets, kept aside while another player's game
@@ -117,6 +153,8 @@ pub struct Saved(
     bool,
     (u64, u64),
     (Vec<ScrollArea>, Vec<ScrollArea>),
+    (Vec<FocusLink>, Vec<FocusLink>),
+    (Vec<[f32; 4]>, Vec<[f32; 4]>),
 );
 
 /// This thread's buttons and targets, leaving none.
@@ -128,6 +166,8 @@ pub fn take() -> Saved {
         ACTION_GLYPHS.take(),
         ACTION_SCREENS.take(),
         SCROLL_AREAS.take(),
+        FOCUS_LINKS.take(),
+        STEPPERS.take(),
     )
 }
 
@@ -136,6 +176,8 @@ pub fn put(saved: Saved) {
     WIDGETS.set(saved.0);
     TARGETS.set(saved.1);
     SCROLL_AREAS.set(saved.5);
+    FOCUS_LINKS.set(saved.6);
+    STEPPERS.set(saved.7);
     ACTIONS.set(saved.2);
     ACTION_GLYPHS.set(saved.3);
     ACTION_SCREENS.set(saved.4);
@@ -201,9 +243,14 @@ pub fn set_action_glyphs(on: bool) {
     ACTION_GLYPHS.set(on);
 }
 
-/// How much of a declared button's left the glyph takes from its label.
+/// How much of a declared button's left the glyph takes from its label: a face button's, the only
+/// kind declared buttons show, and no family's is wider than its art.
 pub fn action_glyph_room() -> f32 {
-    if ACTION_GLYPHS.get() { 14.0 } else { 0.0 }
+    if ACTION_GLYPHS.get() {
+        crate::pad_glyph::FACE_WIDTH + 3.0
+    } else {
+        0.0
+    }
 }
 
 /// An interactive rectangle (GUI pixels) a controller can focus and click.
@@ -244,6 +291,43 @@ pub fn clip_targets(mark: usize, y0: f32, y1: f32) {
     });
 }
 
+/// How many labelled widgets and targets the frame has so far, for [`clip_frame`].
+pub fn frame_mark() -> (usize, usize) {
+    let labelled = WIDGETS.with_borrow(|(current, _, _)| current.len());
+    (labelled, targets_mark())
+}
+
+/// Drop the labelled widgets and targets since `mark` whose middle isn't in `y0..y1` (GUI pixels):
+/// what a scrolling body clipped away, where a press wouldn't land.
+pub fn clip_frame((labelled, targets): (usize, usize), y0: f32, y1: f32) {
+    let shown = |y: f32, h: f32| (y0..y1).contains(&(y + h / 2.0));
+    WIDGETS.with_borrow_mut(|(current, _, _)| {
+        let mut at = 0;
+        current.retain(|w| {
+            at += 1;
+            at <= labelled || shown(w.y, w.h)
+        });
+    });
+    TARGETS.with_borrow_mut(|(current, _, _)| {
+        let mut at = 0;
+        current.retain(|t| {
+            at += 1;
+            at <= targets || shown(t.rect[1], t.rect[3])
+        });
+    });
+}
+
+/// A prompt comes up over what the frame drew so far: what it covers can't be reached, by the
+/// pointer or a controller, so its widgets, targets, declared buttons and lists go.
+pub fn cover_frame() {
+    WIDGETS.with_borrow_mut(|(current, _, _)| current.clear());
+    TARGETS.with_borrow_mut(|(current, _, _)| current.clear());
+    ACTIONS.with_borrow_mut(|(current, _)| current.clear());
+    SCROLL_AREAS.with_borrow_mut(|(current, _)| current.clear());
+    FOCUS_LINKS.with_borrow_mut(|(current, _)| current.clear());
+    STEPPERS.with_borrow_mut(|(current, _)| current.clear());
+}
+
 /// This frame drew a list with something to scroll, in `rect`, scrolled `amount`
 /// of `max`: a focus step goes through its hidden rows before it leaves
 /// (`gamepad::list_step`).
@@ -273,6 +357,50 @@ pub fn over_scroll_area(at: (f32, f32)) -> (f32, f32) {
             _ => at,
         }
     })
+}
+
+/// A step the arrows and the D-pad take that the rectangles don't show: `down` (else up) from
+/// a focus whose middle is in `from`, to the target at `to`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FocusLink {
+    pub from: [f32; 4],
+    pub down: bool,
+    pub to: [f32; 4],
+}
+
+/// Down (or up) from what is in `from` goes to `to`: a screen whose layout puts the next control
+/// off to one side, where vanilla's step would pass it by (the settings shell's search field over
+/// its list, on a screen with no page list).
+pub fn focus_link(from: [f32; 4], down: bool, to: [f32; 4]) {
+    FOCUS_LINKS.with_borrow_mut(|(current, _)| current.push(FocusLink { from, down, to }));
+}
+
+/// Where the last drawn frame said a step `down` (else up) from `focus` goes, if it said.
+pub fn linked_step(focus: [f32; 4], down: bool) -> Option<[f32; 4]> {
+    let [x, y, w, h] = focus;
+    let middle = (x + w / 2.0, y + h / 2.0);
+    FOCUS_LINKS.with_borrow(|(_, last)| {
+        last.iter()
+            .find(|l| {
+                let [lx, ly, lw, lh] = l.from;
+                l.down == down
+                    && (lx..lx + lw).contains(&middle.0)
+                    && (ly..ly + lh).contains(&middle.1)
+            })
+            .map(|l| l.to)
+    })
+}
+
+/// Left and right on the target at `rect` step its value, back and on, rather than move the focus
+/// (the settings shell's choices, whose `<` `>` say so): Right as a press, Left as a Shift press.
+pub fn steps_value(rect: [f32; 4]) {
+    STEPPERS.with_borrow_mut(|(current, _)| current.push(rect));
+}
+
+/// Whether the last drawn frame said left and right step the value of the target at `focus`.
+pub fn last_steps_value(focus: [f32; 4]) -> bool {
+    let same = |rect: &[f32; 4]| rect.iter().zip(focus).all(|(a, b)| (a - b).abs() < 0.5);
+    STEPPERS.with_borrow(|(_, last)| last.iter().any(same))
 }
 
 /// The focus targets of the last drawn frame.
@@ -316,6 +444,28 @@ mod cursor_tests {
     use super::*;
 
     #[test]
+    fn a_hovered_text_field_asks_for_the_i_beam() {
+        let _ = take_cursor();
+        text_cursor(false, true);
+        assert_eq!(take_cursor(), Cursor::Arrow);
+        text_cursor(true, true);
+        assert_eq!(take_cursor(), Cursor::Ibeam);
+        text_cursor(true, false);
+        assert_eq!(take_cursor(), Cursor::NotAllowed);
+    }
+    #[test]
+    fn a_dragged_slider_asks_for_the_horizontal_resize_cursor() {
+        let _ = take_cursor();
+        slider_cursor(false, true, true);
+        assert_eq!(take_cursor(), Cursor::Arrow);
+        slider_cursor(true, true, true);
+        assert_eq!(take_cursor(), Cursor::ResizeEw);
+        slider_cursor(true, true, false);
+        assert_eq!(take_cursor(), Cursor::PointingHand);
+        slider_cursor(true, false, true);
+        assert_eq!(take_cursor(), Cursor::NotAllowed);
+    }
+    #[test]
     fn hovered_widgets_ask_for_the_hand_or_not_allowed() {
         let _ = take_cursor();
         widget_cursor(false, true);
@@ -350,6 +500,12 @@ pub fn end_frame(frames: u64) {
             });
             ACTION_SCREENS.set((ACTION_SCREENS.get().0, ACTION_SCREENS.get().0));
             SCROLL_AREAS.with_borrow_mut(|(current, last)| {
+                *last = std::mem::take(current);
+            });
+            FOCUS_LINKS.with_borrow_mut(|(current, last)| {
+                *last = std::mem::take(current);
+            });
+            STEPPERS.with_borrow_mut(|(current, last)| {
                 *last = std::mem::take(current);
             });
             NARRATION.with_borrow_mut(|(current, last)| {
@@ -1348,5 +1504,43 @@ mod tests {
             2,
             "the clipped row is gone, earlier ones stay"
         );
+    }
+
+    #[test]
+    fn a_scrolled_body_loses_what_it_clips_and_nothing_before_it() {
+        let _ = take();
+        target([0.0, 0.0, 5.0, 5.0]);
+        record("warning", [0.0, 0.0, 5.0, 5.0], true);
+        let mark = frame_mark();
+        record("shown", [0.0, 10.0, 5.0, 10.0], true);
+        target([0.0, 10.0, 5.0, 10.0]);
+        // Half in view is still pressed at its middle, which a mouse could reach.
+        record("half", [0.0, 25.0, 5.0, 10.0], true);
+        target([0.0, 25.0, 5.0, 10.0]);
+        record("gone", [0.0, 40.0, 5.0, 10.0], true);
+        target([0.0, 40.0, 5.0, 10.0]);
+        clip_frame(mark, 8.0, 32.0);
+        end_frame(101);
+        let names: Vec<String> = last_labelled().into_iter().map(|w| w.label).collect();
+        assert_eq!(names, ["warning", "shown", "half"]);
+        assert_eq!(last_targets().len(), 3);
+    }
+
+    #[test]
+    fn a_prompt_covers_what_was_drawn_before_it() {
+        let _ = take();
+        record("under", [0.0, 0.0, 5.0, 5.0], true);
+        target([0.0, 10.0, 5.0, 5.0]);
+        declare_action(Action::Done, [0.0, 0.0, 5.0, 5.0], true);
+        scroll_area([0.0, 0.0, 5.0, 5.0], 0.0, 5.0);
+        cover_frame();
+        record("over", [0.0, 20.0, 5.0, 5.0], true);
+        set_action_screen(7);
+        end_frame(102);
+        let names: Vec<String> = last_labelled().into_iter().map(|w| w.label).collect();
+        assert_eq!(names, ["over"]);
+        assert!(last_targets().is_empty());
+        assert!(last_actions(7).is_empty());
+        assert!(last_scroll_areas().is_empty());
     }
 }

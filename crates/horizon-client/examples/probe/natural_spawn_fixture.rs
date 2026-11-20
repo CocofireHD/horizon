@@ -30,7 +30,7 @@ use horizon_client::{
     mobs::{
         MobTypes, Species,
         data::MobData,
-        spawn_rules::{Dimension, SpawnLevel},
+        spawn_rules::SpawnLevel,
         spawn_selection::{
             self, Category, Counted, Event, GenEvent, Heightmap, NaturalLevel, SpawnCost,
             SpawnPlayer, SpawnRequest, SpawnState, Spawned, StructureAt, StructureSpawns,
@@ -49,13 +49,11 @@ use horizon_client::{
     vault::{Vault, VaultEvent, VaultLevel, VaultPlayer, VaultState},
 };
 use horizon_core::{
+    LevelKey,
     geometry::Aabb,
     random::{LegacyRandom, RandomSource},
 };
-use horizon_world::{
-    block_collision::BlockCollisionRegistry, chunk::BlockState, loot::PackOverlay, nbt::Tag,
-    registry::BlockStateId,
-};
+use horizon_world::dimension_type::DimensionFacts;
 use serde_json::Value;
 use std::{
     cell::{Cell, RefCell},
@@ -63,6 +61,13 @@ use std::{
     fmt::Write as _,
     fs,
     path::Path,
+};
+use {
+    horizon_core::nbt::Tag,
+    horizon_world::{
+        block_collision::BlockCollisionRegistry, chunk::BlockState, loot::PackOverlay,
+        registry::BlockStateId,
+    },
 };
 
 #[derive(Clone, Copy)]
@@ -98,6 +103,7 @@ struct Shared<'a> {
     entity_types: &'a HashSet<String>,
 }
 struct World<'a> {
+    border: horizon_core::geometry::border::BorderGeometry,
     s: &'a Shared<'a>,
     blocks: Vec<(Bx, BlockStateId)>,
     lights: Vec<(Bx, i32, i32)>,
@@ -110,7 +116,7 @@ struct World<'a> {
     sea: i32,
     seed: i64,
     peaceful: bool,
-    dimension: Dimension,
+    dimension: &'static DimensionFacts,
     dimension_id: String,
     slime: f32,
     starts: Vec<Start>,
@@ -158,6 +164,10 @@ impl World<'_> {
     }
 }
 impl SpawnLevel for World<'_> {
+    fn within_world_border(&self, x: i32, z: i32) -> bool {
+        self.border
+            .is_within_bounds(f64::from(x), f64::from(z), 0.0)
+    }
     fn state(&self, x: i32, y: i32, z: i32) -> BlockStateId {
         if let Some((_, s)) = self
             .placed
@@ -214,7 +224,7 @@ impl SpawnLevel for World<'_> {
     fn peaceful(&self) -> bool {
         self.peaceful
     }
-    fn dimension(&self) -> Dimension {
+    fn dimension_type(&self) -> &DimensionFacts {
         self.dimension
     }
     fn surface_slime_chance(&self, _: i32, _: i32, _: i32) -> f32 {
@@ -232,28 +242,24 @@ impl SpawnLevel for World<'_> {
 }
 impl NaturalLevel for World<'_> {
     fn min_y(&self) -> i32 {
-        if self.dimension == Dimension::Overworld {
+        if self.dimension.id == "minecraft:overworld" {
             -64
         } else {
             0
         }
     }
     fn max_y(&self) -> i32 {
-        if self.dimension == Dimension::Overworld {
+        if self.dimension.id == "minecraft:overworld" {
             319
         } else {
             255
         }
     }
     fn ambient_light(&self) -> f32 {
-        match self.dimension {
-            Dimension::Overworld => 0.0,
-            Dimension::Nether => 0.1,
-            Dimension::End => 0.25,
-        }
+        self.dimension.ambient_light
     }
     fn has_ceiling(&self) -> bool {
-        self.dimension == Dimension::Nether
+        self.dimension.id == "minecraft:the_nether"
     }
     fn mob_type(&self, entity: &str) -> Option<(Species, f32, f32, Category)> {
         let t = self.s.types.types.get(entity)?;
@@ -316,6 +322,8 @@ impl NaturalLevel for World<'_> {
     }
     fn can_spawn_in_chunk(&self, cx: i32, cz: i32) -> bool {
         !self.unloaded.contains(&(cx, cz))
+            && self.within_world_border(cx << 4, cz << 4)
+            && self.within_world_border((cx << 4).wrapping_add(15), (cz << 4).wrapping_add(15))
     }
     fn no_collision(&self, bounds: Aabb) -> bool {
         let lookup = |x: i32, y: i32, z: i32| self.state(x, y, z);
@@ -349,7 +357,10 @@ impl NaturalLevel for World<'_> {
             .map_or(self.min_y(), |y| y + 1)
     }
     fn pathfindable_land(&self, x: i32, y: i32, z: i32) -> bool {
-        self.s.data.state(self.state(x, y, z)).flags & horizon_client::mobs::data::LAND != 0
+        self.s.data.pathfindable(
+            self.state(x, y, z),
+            horizon_client::mobs::data::PathComputationType::Land,
+        )
     }
 }
 
@@ -522,17 +533,23 @@ pub fn main() -> horizon_client::Result<()> {
     let assets = Assets::load(root)?;
     let registry = assets.registry;
     let facts = BlockFacts::load(root, registry)?;
-    let data = MobData::load(root, &facts);
-    let items = Items::tags_only(root, &PackOverlay::NONE)?;
+    let data = MobData::load(
+        &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+        &facts,
+    );
+    let defaults = horizon_world::item_defaults::read(root)?;
+    let items = Items::tags_only(root, &PackOverlay::NONE, &defaults)?;
     // Trial spawner rewards: the loot tables and the configs.
     let loot = if input.contains("mode=trial") || input.contains("mode=vault") {
         horizon_client::mobs::trial_spawner::load_registry(root);
-        horizon_client::structure_blocks::loot_data(root, &PackOverlay::NONE)
+        horizon_client::structure_blocks::loot_data(root, &PackOverlay::NONE, &defaults)
     } else {
         None
     };
     let types = MobTypes::load(root)?;
-    let biomes = Biomes::load(root)?;
+    let biomes = Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(
+        root.to_path_buf(),
+    ))?;
     let structures = StructureSpawns::load(root);
     let collision = collisions::load(root, registry)?;
     let entity_types: HashSet<String> = fs::read(root.join("entity-types.json"))
@@ -664,11 +681,8 @@ pub fn main() -> horizon_client::Result<()> {
             })
             .collect::<Vec<_>>();
         let dimension_id = get("dim", "minecraft:overworld");
-        let dimension = match dimension_id.as_str() {
-            "minecraft:the_nether" => Dimension::Nether,
-            "minecraft:the_end" => Dimension::End,
-            _ => Dimension::Overworld,
-        };
+        let dimension =
+            DimensionFacts::of_builtin_level(LevelKey::builtin_or_overworld(&dimension_id));
         let respawn = {
             let r = get("respawn", "0,-1000,0/minecraft:overworld");
             let (p, d) = r.split_once('/').ok_or("bad respawn")?;
@@ -709,6 +723,11 @@ pub fn main() -> horizon_client::Result<()> {
             ));
         }
         let world = World {
+            border: horizon_core::geometry::border::BorderGeometry::new(
+                [get("borderx", "0").parse()?, get("borderz", "0").parse()?],
+                get("bordersize", "59999968").parse()?,
+                29_999_984,
+            )?,
             s: &shared,
             blocks,
             lights,
@@ -766,12 +785,13 @@ pub fn main() -> horizon_client::Result<()> {
         };
         let mut random = LegacyRandom::new(get("seed", "0").parse()?);
         let mut log: Vec<String> = Vec::new();
-        let mut spawn = |l: &World, r: &SpawnRequest| -> Option<Spawned> {
+        let mut spawn = |l: &World, r: &SpawnRequest, _: &mut LegacyRandom| -> Option<Spawned> {
             let bounds = neutral_box(l, r);
             l.entities.borrow_mut().push((r.entity.to_owned(), bounds));
             Some(Spawned {
                 bounds,
                 school: true,
+                cluster_size: None,
             })
         };
         let mode = get("mode", "chunk");
@@ -796,7 +816,7 @@ pub fn main() -> horizon_client::Result<()> {
                 chunk,
                 &mut gen_random,
                 &mut rules,
-                &mut |l, r, _| spawn(l, r).is_some(),
+                &mut |l, r, rng| spawn(l, r, rng).is_some(),
                 &mut |e| match e {
                     GenEvent::Column(x, z) => log.push(format!("col {x} {z}")),
                     GenEvent::Spawn(t, p, yaw) => spawns.push(format!(
@@ -861,7 +881,7 @@ pub fn main() -> horizon_client::Result<()> {
                         bits(p[0]),
                         bits(p[1]),
                         bits(p[2]),
-                        yaw_text(&t, yaw)
+                        yaw_text(t, yaw)
                     ),
                 })
             };
@@ -885,15 +905,17 @@ pub fn main() -> horizon_client::Result<()> {
                 let categories = state
                     .filtered_categories(get("enemies", "1") == "1", get("persistent", "1") == "1");
                 trace(Event::Categories(categories.clone()));
-                spawn_selection::spawn_for_chunk(
-                    &world,
-                    &mut random,
-                    &mut state,
-                    &categories,
-                    chunk,
-                    &mut spawn,
-                    &mut trace,
-                );
+                if mode != "tick_chunk" || world.can_spawn_in_chunk(chunk.0, chunk.1) {
+                    spawn_selection::spawn_for_chunk(
+                        &world,
+                        &mut random,
+                        &mut state,
+                        &categories,
+                        chunk,
+                        &mut spawn,
+                        &mut trace,
+                    );
+                }
             }
             log.push(format!("next {}", random.next_int_bound(1000).unwrap_or(0)));
         }
@@ -917,39 +939,40 @@ fn spawner_case(
         .collect();
     let pos = [v[0], v[1], v[2]];
     let text = horizon_client::skins::base64_decode(&get("snbt", "")).ok_or("bad snbt")?;
-    let tag = horizon_world::nbt::parse_snbt(&String::from_utf8(text)?)?.0;
+    let tag = horizon_core::nbt::parse_snbt(&String::from_utf8(text)?)?.0;
     let mut spawner = Spawner::load(&tag);
     let ticks: i32 = get("ticks", "1").parse()?;
     for tick in 0..ticks {
         let mut events = Vec::new();
         let mut spawned = std::collections::VecDeque::new();
-        let mut spawn = |l: &World, r: &SpawnerSpawn| -> Option<SpawnerAdded> {
-            let t = l.s.types.types.get(r.id)?;
-            let [x, y, z] = r.position;
-            let bounds = spawn_box(x, y, z, t.width as f32, t.height as f32);
-            l.entities.borrow_mut().push((r.id.to_owned(), bounds));
-            spawned.push_back(format!(
-                "{tick} spawn {} {} {} {} {}",
-                r.id,
-                bits(x),
-                bits(y),
-                bits(z),
-                // Shulker.finalizeSpawn faces it south.
-                yaw_text(
+        let mut spawn =
+            |l: &World, _: &mut LegacyRandom, r: &SpawnerSpawn| -> Option<SpawnerAdded> {
+                let t = l.s.types.types.get(r.id)?;
+                let [x, y, z] = r.position;
+                let bounds = spawn_box(x, y, z, t.width as f32, t.height as f32);
+                l.entities.borrow_mut().push((r.id.to_owned(), bounds));
+                spawned.push_back(format!(
+                    "{tick} spawn {} {} {} {} {}",
                     r.id,
-                    if r.finalize && r.id == "minecraft:shulker" {
-                        0.0
-                    } else {
-                        r.yaw
-                    }
-                )
-            ));
-            Some(SpawnerAdded {
-                id: spawned.len() as u32,
-                bounds,
-                mob: true,
-            })
-        };
+                    bits(x),
+                    bits(y),
+                    bits(z),
+                    // Shulker.finalizeSpawn faces it south.
+                    yaw_text(
+                        r.id,
+                        if r.finalize && r.id == "minecraft:shulker" {
+                            0.0
+                        } else {
+                            r.yaw
+                        }
+                    )
+                ));
+                Some(SpawnerAdded {
+                    id: spawned.len() as u32,
+                    bounds,
+                    mob: true,
+                })
+            };
         spawner.server_tick(world, random, pos, &mut spawn, &mut events);
         for e in events {
             match e {
@@ -1017,7 +1040,7 @@ fn trial_case(
         .borrow_mut()
         .push((pos, registry.resolve(&block_state(state, ominous))?));
     let text = horizon_client::skins::base64_decode(&get("snbt", "")).ok_or("bad snbt")?;
-    let tag = horizon_world::nbt::parse_snbt(&String::from_utf8(text)?)?.0;
+    let tag = horizon_core::nbt::parse_snbt(&String::from_utf8(text)?)?.0;
     let mut spawner = TrialSpawner::load(&tag);
     let ticks: i64 = get("ticks", "1").parse()?;
     let t0: i64 = get("t0", "0").parse()?;
@@ -1030,10 +1053,10 @@ fn trial_case(
         let mut events = Vec::new();
         let mut spawned = std::collections::VecDeque::new();
         let mut items = Vec::new();
-        let mut spawn = |l: &World, r: &SpawnerSpawn| {
+        let mut spawn = |l: &World, _: &mut LegacyRandom, r: &SpawnerSpawn| {
             let t = l.s.types.types.get(r.id)?;
             // Slime.readAdditionalSaveData: size Size + 1, clamped to 1..=127.
-            let size = match r.entity.get(&horizon_world::nbt::JavaString::from("Size")) {
+            let size = match r.entity.get(&horizon_core::nbt::JavaString::from("Size")) {
                 Some(Tag::Byte(v)) => i32::from(*v),
                 Some(Tag::Short(v)) => i32::from(*v),
                 Some(Tag::Int(v)) => *v,
@@ -1053,10 +1076,7 @@ fn trial_case(
             l.trial_count.set(l.trial_count.get() + 1);
             // Zombie.readAdditionalSaveData: IsBaby halves the box
             // (getAgeScale); finalizeSpawn's fixed random never makes one.
-            let baby = match r
-                .entity
-                .get(&horizon_world::nbt::JavaString::from("IsBaby"))
-            {
+            let baby = match r.entity.get(&horizon_core::nbt::JavaString::from("IsBaby")) {
                 Some(Tag::Byte(v)) => *v != 0,
                 Some(Tag::Int(v)) => *v != 0,
                 _ => false,
@@ -1294,7 +1314,7 @@ fn vault_case(
     let mut state = VaultState::from_name(&get("state", "inactive")).ok_or("bad state")?;
     let ominous = get("ominous", "0") == "1";
     let text = horizon_client::skins::base64_decode(&get("snbt", "")).ok_or("bad snbt")?;
-    let tag = horizon_world::nbt::parse_snbt(&String::from_utf8(text)?)?.0;
+    let tag = horizon_core::nbt::parse_snbt(&String::from_utf8(text)?)?.0;
     let mut vault = Vault::load(&tag);
     let schedule = |key: &str| -> Vec<Vec<String>> {
         get(key, "")

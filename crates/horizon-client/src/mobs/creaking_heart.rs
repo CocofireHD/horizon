@@ -9,7 +9,7 @@ use super::{Mob, MobEvent, MobType, MobWorld, creaking};
 use crate::{collisions::SceneCollisions, containers::CreakingHeart};
 use horizon_core::{
     geometry::{Aabb, Vec3},
-    random::{LegacyRandom, RandomSource},
+    random::{LevelRandom, RandomSource},
 };
 use horizon_world::registry::BlockStateId;
 use std::sync::Arc;
@@ -46,6 +46,9 @@ pub enum HeartEvent {
     },
     /// `updateNeighbourForOutputSignal`: comparators read the new signal.
     OutputChanged([i32; 3]),
+    /// `Level.gameEvent(event, pos, Context.of(state))` from the heart's own
+    /// block state (a resin clump's `BLOCK_PLACE`).
+    BlockGameEvent(&'static str, [i32; 3], BlockStateId),
     /// A mob's own sounds and effects (the spawned creaking's voice, a
     /// creaking falling apart).
     Mob(MobEvent),
@@ -108,7 +111,8 @@ impl Blocks<'_, '_> {
 /// `EnvironmentAttributes.CREAKING_ACTIVE`: the overworld's night, from
 /// 12600 to 23400.
 pub fn creaking_active(w: &MobWorld) -> bool {
-    !w.nether && !w.end && (12600..23401).contains(&w.day_time.rem_euclid(24000))
+    w.dimension_type.has_timeline("minecraft:day")
+        && (12600..23401).contains(&w.day_time.rem_euclid(24000))
 }
 /// `CreakingHeartBlock.hasRequiredLogs`: pale oak logs on both ends of the
 /// heart's axis, along the same axis.
@@ -203,7 +207,7 @@ fn emit_particles(
     pos: [i32; 3],
     count: i32,
     towards: bool,
-    lr: &mut LegacyRandom,
+    lr: &mut LevelRandom,
     host: &impl HeartHost,
     out: &mut Vec<HeartEvent>,
 ) {
@@ -238,7 +242,7 @@ fn emit_particles(
     }
 }
 /// `Util.shuffledCopy(Direction.values(), random)`.
-fn shuffled_directions(lr: &mut LegacyRandom) -> [usize; 6] {
+fn shuffled_directions(lr: &mut impl RandomSource) -> [usize; 6] {
     let mut order = [0, 1, 2, 3, 4, 5];
     for i in (2..=6).rev() {
         let j = lr.next_int_bound(i as i32).unwrap_or(0) as usize;
@@ -258,7 +262,7 @@ fn offset(p: [i32; 3], d: usize) -> [i32; 3] {
 fn spread_resin(
     b: &mut Blocks,
     pos: [i32; 3],
-    lr: &mut LegacyRandom,
+    lr: &mut LevelRandom,
     out: &mut Vec<HeartEvent>,
 ) -> Option<[i32; 3]> {
     let mut visited: Vec<[i32; 3]> = Vec::new();
@@ -316,7 +320,7 @@ pub fn creaking_hurt(
     heart: &mut CreakingHeart,
     pos: [i32; 3],
     w: &MobWorld,
-    lr: &mut LegacyRandom,
+    lr: &mut LevelRandom,
     host: &mut impl HeartHost,
     out: &mut Vec<HeartEvent>,
 ) {
@@ -337,6 +341,11 @@ pub fn creaking_hurt(
         for _ in 0..clumps {
             if let Some(at) = spread_resin(&mut b, pos, lr, out) {
                 out.push(HeartEvent::Sound("block.resin.place", centre(at), 1.0, 1.0));
+                out.push(HeartEvent::BlockGameEvent(
+                    "minecraft:block_place",
+                    at,
+                    state,
+                ));
             }
         }
     }
@@ -372,7 +381,7 @@ fn can_spawn_on(b: &Blocks, pos: [i32; 3], state: BlockStateId, above: BlockStat
 fn spawn_protector(
     pos: [i32; 3],
     w: &MobWorld,
-    lr: &mut LegacyRandom,
+    lr: &mut LevelRandom,
     host: &mut impl HeartHost,
     out: &mut Vec<HeartEvent>,
 ) -> Option<u32> {
@@ -443,6 +452,20 @@ fn spawn_protector(
         if !creaking::is_active(&m) {
             m.voice("entity.creaking.ambient", &mut events);
         }
+        // spawnProtector: ENTITY_PLACE at the creaking and entity event 60
+        // (the poof cloud), then setTransient.
+        let spawned_at = [m.position.x, m.position.y, m.position.z];
+        events.push(MobEvent::GameEvent {
+            event: "minecraft:entity_place",
+            at: spawned_at,
+            source: id,
+            state: BlockStateId(0),
+        });
+        events.push(MobEvent::EntityEvent {
+            mob: id,
+            event: 60,
+            at: spawned_at,
+        });
         creaking::set_transient(&mut m, pos);
         // spawnProtector's caller: the creaking's spawn sound.
         m.voice("entity.creaking.spawn", &mut events);
@@ -460,7 +483,7 @@ fn spawn_protector(
 }
 /// `Mob.finalizeSpawn`: the follow range's random spawn bonus and the
 /// handedness, from the level random.
-pub fn finalize_spawn(m: &mut Mob, lr: &mut LegacyRandom) {
+pub fn finalize_spawn(m: &mut Mob, lr: &mut LevelRandom) {
     let bonus = lr.triangle(0.0, 0.114_850_000_000_000_01);
     // ADD_MULTIPLIED_BASE on the base value.
     m.attrs.follow_range += m.kind.follow_range * bonus;
@@ -503,10 +526,24 @@ pub fn server_tick(
     heart: &mut CreakingHeart,
     pos: [i32; 3],
     w: &MobWorld,
-    lr: &mut LegacyRandom,
+    lr: &mut LevelRandom,
     host: &mut impl HeartHost,
     out: &mut Vec<HeartEvent>,
 ) {
+    if server_tick_start(heart, pos, lr, host, out) {
+        server_tick_update(heart, pos, w, lr, host, out);
+    }
+}
+
+/// [`server_tick`] up to its update, which reads no mob world: whether the
+/// update follows (as [`tick_updates`] said before it).
+pub fn server_tick_start(
+    heart: &mut CreakingHeart,
+    pos: [i32; 3],
+    lr: &mut LevelRandom,
+    host: &mut impl HeartHost,
+    out: &mut Vec<HeartEvent>,
+) -> bool {
     heart.ticks_existed += 1;
     let signal = output_signal(heart, pos, host);
     if heart.output_signal != signal {
@@ -549,9 +586,19 @@ pub fn server_tick(
     }
     let ticker = heart.ticker;
     heart.ticker -= 1;
-    if ticker >= 0 {
-        return;
-    }
+    ticker < 0
+}
+
+/// The rest of [`server_tick`], once [`server_tick_start`] says so:
+/// `updateCreakingState` and the protector checks.
+pub fn server_tick_update(
+    heart: &mut CreakingHeart,
+    pos: [i32; 3],
+    w: &MobWorld,
+    lr: &mut LevelRandom,
+    host: &mut impl HeartHost,
+    out: &mut Vec<HeartEvent>,
+) {
     heart.ticker = lr.next_int_bound(5).unwrap_or(0) + 20;
     let mut b = Blocks {
         w,
@@ -582,7 +629,7 @@ pub fn server_tick(
         if awake && host.spawning_monsters() {
             // getNearestPlayer(pos, 32, false): no spectators.
             let (x, y, z) = (f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
-            let near = w.player.as_ref().is_some_and(|p| {
+            let near = w.selected_player().is_some_and(|p| {
                 !p.spectator
                     && (p.position.x - x).powi(2)
                         + (p.position.y - y).powi(2)
@@ -599,7 +646,7 @@ pub fn server_tick(
         // playerIsStuckInYou reads the creaking's NEAREST_PLAYERS.
         let stuck = host.mob_mut(id).is_some_and(|m| {
             let listed = super::monster_brain::nearest_players(m).contains(&super::Who::Player);
-            let eye = w.player.as_ref().filter(|_| listed).map(|p| p.eye);
+            let eye = w.selected_player().filter(|_| listed).map(|p| p.eye);
             creaking::player_is_stuck(m, eye)
         });
         if !active && !persistent || distance_to_creaking(heart, pos, host) > TOO_FAR || stuck {

@@ -8,12 +8,12 @@
 use std::path::{Path, PathBuf};
 
 /// `Limits::downlevel_defaults().max_inter_stage_shader_variables`, the least a GPU offers.
-const LIMIT: u32 = 15;
+pub(in crate::gfx) const LIMIT: u32 = 15;
 
 /// One entry point's variables: the user-defined `@location`s and the built-ins wgpu counts.
 #[derive(Debug, PartialEq, Eq)]
-struct Interface {
-    entry: String,
+pub(in crate::gfx) struct Interface {
+    pub(in crate::gfx) entry: String,
     /// Vertex outputs or fragment inputs, user-defined.
     user: u32,
     /// The fragment stage's `front_facing`, `sample_index`, `sample_mask` and `primitive_index`
@@ -22,7 +22,7 @@ struct Interface {
 }
 
 impl Interface {
-    fn total(&self) -> u32 {
+    pub(in crate::gfx) fn total(&self) -> u32 {
         self.user + self.built_ins
     }
 }
@@ -49,7 +49,7 @@ fn is_location(binding: &naga::Binding) -> bool {
 }
 
 /// The stage interface of every vertex and fragment entry point of `source`.
-fn interfaces(source: &str) -> Vec<Interface> {
+pub(in crate::gfx) fn interfaces(source: &str) -> Vec<Interface> {
     let module = naga::front::wgsl::parse_str(source).unwrap();
     let mut out = Vec::new();
     for entry in &module.entry_points {
@@ -61,6 +61,14 @@ fn interfaces(source: &str) -> Vec<Interface> {
                     .iter()
                     .flat_map(|r| bindings(&module, &r.binding, r.ty))
                     .collect();
+                (outputs.iter().filter(|b| is_location(b)).count(), 0)
+            }
+            naga::ShaderStage::Mesh => {
+                let outputs = entry
+                    .mesh_info
+                    .as_ref()
+                    .map(|info| bindings(&module, &None, info.vertex_output_type))
+                    .unwrap_or_default();
                 (outputs.iter().filter(|b| is_location(b)).count(), 0)
             }
             naga::ShaderStage::Fragment => {
@@ -98,8 +106,29 @@ fn interfaces(source: &str) -> Vec<Interface> {
 
 /// The shaders as the renderer assembles them, by the `.wgsl` files each is made of.
 fn composed() -> Vec<(&'static str, Vec<&'static str>, String)> {
-    let entity = crate::overlay::wgsl_constants() + include_str!("../entity.wgsl");
+    let entity = super::entity_shader();
     vec![
+        (
+            "HDR",
+            vec!["hdr.wgsl", "hdr_light.wgsl"],
+            super::hdr::shader(),
+        ),
+        (
+            "HDR emission thresholds",
+            vec!["hdr_stats.wgsl"],
+            super::hdr_stats::shader(),
+        ),
+        ("terrain", vec!["terrain.wgsl"], super::terrain_shader()),
+        (
+            "stars",
+            vec!["stars.wgsl"],
+            super::wgsl_prefix::HDR_LIGHT.to_owned() + include_str!("stars.wgsl"),
+        ),
+        (
+            "custom sky",
+            vec!["custom_sky.wgsl"],
+            super::wgsl_prefix::HDR_LIGHT.to_owned() + include_str!("custom_sky.wgsl"),
+        ),
         ("entity", vec!["entity.wgsl"], entity.clone()),
         (
             "GPU culling occlusion test",
@@ -110,6 +139,11 @@ fn composed() -> Vec<(&'static str, Vec<&'static str>, String)> {
             "static entity",
             vec!["entity.wgsl", "static_entity.wgsl"],
             entity.clone() + include_str!("../static_entity.wgsl"),
+        ),
+        (
+            "prepared model",
+            vec!["entity.wgsl", "prepared_model.wgsl"],
+            entity.clone() + include_str!("../prepared_model.wgsl"),
         ),
         (
             "improved transparency clouds",
@@ -124,19 +158,41 @@ fn composed() -> Vec<(&'static str, Vec<&'static str>, String)> {
         (
             "improved transparency world",
             vec!["terrain.wgsl", "oit.wgsl", "oit_world.wgsl"],
-            include_str!("../terrain.wgsl").to_owned()
+            super::terrain_shader()
                 + include_str!("../oit.wgsl")
                 + include_str!("../oit_world.wgsl"),
         ),
         (
             "visibility buffer",
             vec!["terrain.wgsl", "visbuffer.wgsl"],
-            include_str!("../terrain.wgsl").to_owned() + include_str!("../visbuffer.wgsl"),
+            super::terrain_shader() + include_str!("../visbuffer.wgsl"),
+        ),
+        // Ray tracing's unpacking of sections into its store (gfx/rt/scene.rs's `Unpacker`).
+        (
+            "ray tracing unpack",
+            vec!["terrain.wgsl", "rt_unpack.wgsl"],
+            super::rt::scene::unpack_shader(),
+        ),
+        (
+            "terrain mesh shader",
+            vec!["terrain.wgsl", "terrain_mesh.wgsl"],
+            super::surface_setup::mesh_shader::shader(),
+        ),
+        (
+            "world primitives",
+            vec!["world_primitives.wgsl"],
+            super::world_primitives::shader(),
+        ),
+        // A native pack's entity stage (gfx/native_entity.rs), around vanilla's own.
+        (
+            "native pack entities",
+            vec!["entity.wgsl", "static_entity.wgsl"],
+            super::native_entity::tests::shader(super::native_entity::tests::VANILLA),
         ),
         (
             "improved transparency world border",
             vec!["border.wgsl", "oit.wgsl", "oit_border.wgsl"],
-            include_str!("../border.wgsl").to_owned()
+            super::border_shader()
                 + include_str!("../oit.wgsl")
                 + include_str!("../oit_border.wgsl"),
         ),
@@ -186,6 +242,7 @@ fn audited() -> Vec<(String, Vec<Interface>)> {
 }
 
 #[test]
+#[ignore = "daily"]
 fn no_pipeline_exceeds_the_weakest_gpus_inter_stage_limit() {
     let mut over = Vec::new();
     for (shader, entries) in audited() {

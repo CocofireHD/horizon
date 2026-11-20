@@ -9,7 +9,7 @@
 use horizon_core::{geometry::Vec3, random::RandomSource};
 
 use super::{
-    DamageKind, Mob, MobWorld, Species, Who,
+    Mob, MobWorld, Species, Who,
     goals::{
         Cx, Float, FollowParent, Goal, HurtByTarget, LookAtPlayer, MOVE, MeleeAttack,
         NearestTarget, Panic, RandomLookAround, Stroll, goal_clone,
@@ -88,20 +88,12 @@ impl Goal for PolarBearPanic {
         self.0.stop(m, cx)
     }
 }
-/// `DamageTypeTags.PANIC_ENVIRONMENTAL_CAUSES` (fire, lava, cactus), or
+/// `DamageTypeTags.PANIC_ENVIRONMENTAL_CAUSES` (`armadillo::environmental`), or
 /// burning.
 fn environmental_panic(m: &Mob) -> bool {
     m.fire_ticks > 0 && !m.kind.flags.fire_immune
         || m.last_damage.is_some_and(|(d, t)| {
-            matches!(
-                d.kind,
-                DamageKind::OnFire
-                    | DamageKind::InFire
-                    | DamageKind::Lava
-                    | DamageKind::Cactus
-                    | DamageKind::LightningBolt
-                    | DamageKind::HotFloor
-            ) && i64::from(m.age) - t <= 40
+            super::armadillo::environmental(d.kind) && i64::from(m.age) - t <= 40
         })
 }
 
@@ -128,7 +120,7 @@ pub fn check_and_perform_attack(
     t: &TargetInfo,
     cx: &mut Cx,
 ) {
-    if *until_attack <= 0 && m.within_melee_range(t) && m.sees(cx.w, who) {
+    if *until_attack <= 0 && m.within_melee_range(cx.w, t) && m.sees(cx.w, who) {
         *until_attack = cooldown;
         super::ai::do_hurt_target(m, who, cx);
         set_standing(m, false);
@@ -190,12 +182,15 @@ pub fn ai_step(m: &mut Mob, w: &MobWorld) {
     } else if m.extra.anger > 0 {
         m.extra.anger -= 1;
         if m.extra.anger == 0 {
-            stop_being_angry(m);
+            stop_being_angry_with_world(m, Some(w));
         }
     }
     // A player in creative or spectator mode is forgiven at once.
-    if m.extra.flag2 && w.player.as_ref().is_some_and(|p| p.creative || p.spectator) {
-        stop_being_angry(m);
+    if m.extra.flag2
+        && w.selected_player()
+            .is_some_and(|p| p.creative || p.spectator)
+    {
+        stop_being_angry_with_world(m, Some(w));
     }
 }
 /// `NeutralMob.playerDied`: a bear angry at the player (its target, kept in
@@ -207,9 +202,18 @@ pub fn forgive_dead_player(m: &mut Mob) {
 }
 /// `NeutralMob.stopBeingAngry`.
 fn stop_being_angry(m: &mut Mob) {
+    stop_being_angry_with_world(m, None);
+}
+
+fn stop_being_angry_with_world(m: &mut Mob, world: Option<&MobWorld>) {
     m.ai.last_hurt_by = None;
-    m.ai.target = None;
-    m.extra.anger = 0;
+    m.ai.last_hurt_by_ref = None;
+    if let Some(world) = world {
+        m.set_ai_target(world, None);
+    } else {
+        m.ai.target = None;
+    }
+    super::neutral_anger::stop(m);
     m.extra.flag2 = false;
 }
 
@@ -274,5 +278,29 @@ mod tests {
         assert_eq!(m.dims().1, h0, "the flag alone does not grow the box");
         client_tick(&mut m);
         assert_eq!(m.dims().1, f64::from(base_h * (1.0 + 1.0 / STAND_TICKS)));
+    }
+}
+
+#[cfg(test)]
+mod freeze_panic_tests {
+    use super::*;
+
+    /// `#panic_environmental_causes` holds freeze and sulfur_cube_hot too.
+    #[test]
+    fn freezing_and_a_hot_sulfur_cube_are_environmental() {
+        let kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
+        for cause in [
+            super::super::DamageKind::Freeze,
+            super::super::DamageKind::SulfurCubeHot,
+        ] {
+            let mut m = Mob::new(
+                1,
+                std::sync::Arc::new(kind.clone()),
+                horizon_core::geometry::Vec3::ZERO,
+                0.0,
+            );
+            m.last_damage = Some((super::super::Damage::of(cause), i64::from(m.age)));
+            assert!(environmental_panic(&m), "{cause:?}");
+        }
     }
 }

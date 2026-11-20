@@ -224,7 +224,9 @@ impl Goal for DefendTrader {
         let Some(t) = cx.w.target_info(by) else {
             return false;
         };
-        if !t.alive || t.is_player && t.creative {
+        if !t.alive
+            || t.is_player && (t.creative || cx.w.player.as_ref().is_some_and(|p| p.spectator))
+        {
             return false;
         }
         let follow = m.attrs.follow_range;
@@ -238,7 +240,7 @@ impl Goal for DefendTrader {
         target_continue(&mut self.st, false, m, cx)
     }
     fn start(&mut self, m: &mut Mob, cx: &mut Cx) {
-        m.ai.target = self.attacker;
+        m.set_ai_target(cx.w, self.attacker);
         if let Some(super::leash::Holder::Mob(id)) = m.extra.leash
             && let Some(owner) = cx.w.seen(id)
             && let Some((_, stamp)) = owner.hurt_by
@@ -246,8 +248,8 @@ impl Goal for DefendTrader {
             self.timestamp = stamp;
         }
     }
-    fn stop(&mut self, m: &mut Mob, _: &mut Cx) {
-        m.ai.target = None;
+    fn stop(&mut self, m: &mut Mob, cx: &mut Cx) {
+        m.set_ai_target(cx.w, None);
     }
 }
 /// `TraderLlama.maybeDespawn`: counts down its own delay, or follows the
@@ -269,5 +271,64 @@ pub fn trader_llama_tick(m: &mut Mob, w: &MobWorld) {
     if m.extra.ints[0] <= 0 {
         super::leash::remove(m);
         m.removed = true;
+    }
+}
+
+#[cfg(test)]
+mod defend_trader_tests {
+    use super::*;
+    use crate::mobs::world::{test_player, with_test_world};
+    use crate::mobs::{Mob, Species, sensor_scan_tests::kind};
+    use horizon_core::geometry::Vec3;
+    use std::sync::Arc;
+
+    /// `TraderLlamaDefendWanderingTraderGoal` runs the trader's attacker
+    /// through `TargetingConditions.DEFAULT`, which never accepts a
+    /// spectator.
+    #[test]
+    #[ignore = "daily"]
+    fn a_trader_llama_does_not_defend_the_trader_from_a_spectator() {
+        let mut outcomes = Vec::new();
+        if !with_test_world(&[], |w, _| {
+            for spectator in [false, true] {
+                let mut world = w.clone();
+                let mut p = test_player(Vec3::new(3.5, 64.0, 0.5));
+                p.spectator = spectator;
+                world.player = Some(p);
+                let mut owner_kind = (*kind()).clone();
+                owner_kind.species = Species::WanderingTrader;
+                let mut owner = Mob::new(2, Arc::new(owner_kind), Vec3::new(1.5, 64.0, 0.5), 0.0);
+                owner.ai.last_hurt_by = Some(Who::Player);
+                owner.ai.last_hurt_by_time = 5;
+                let seen = [owner.seen(None, &crate::items::Items::empty())];
+                let world = crate::mobs::MobWorld {
+                    others: &seen,
+                    ..world
+                };
+                let mut llama_kind = (*kind()).clone();
+                llama_kind.species = Species::TraderLlama;
+                let mut llama = Mob::new(1, Arc::new(llama_kind), Vec3::new(0.5, 64.0, 0.5), 0.0);
+                llama.extra.leash = Some(super::super::leash::Holder::Mob(2));
+                llama.ai.goals.add(1, DefendTrader::default());
+                let mut lr = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut lr.level(),
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut llama.ai.goals);
+                goals.tick(&mut llama, &mut cx);
+                outcomes.push(goals.is_running("DefendTrader"));
+                llama.ai.goals = goals;
+            }
+        }) {
+            return;
+        }
+        assert_eq!(
+            outcomes,
+            vec![true, false],
+            "a survival player is defended against; a spectator is not"
+        );
     }
 }

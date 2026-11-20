@@ -1,10 +1,14 @@
 //! Pieces of vanilla's `Brain` that species implemented as brains share:
-//! memories that expire, behaviour durations, walk targets and
-//! `MoveToTargetSink`.
-use super::{Mob, MobWorld, Who, goals::Cx};
+//! memories that expire, behaviour durations, walk targets,
+//! `MoveToTargetSink`, and the melee cooldown of the behaviour Horizon runs as a
+//! goal (`melee_attack`).
+use super::{
+    Mob, MobWorld, Who,
+    goals::{Cx, MeleeAttack},
+};
 use horizon_core::{
     geometry::Vec3,
-    random::{LegacyRandom, RandomSource},
+    random::{LevelRandom, RandomSource},
 };
 
 /// A memory with an expiry (`Brain.setMemoryWithExpiry`): present for the
@@ -48,7 +52,7 @@ impl Timed {
     }
     /// `Behavior.tryStart`'s duration draw from the level random, in Java's
     /// int arithmetic (made even when it cannot vary).
-    pub fn begin(&mut self, lr: &mut LegacyRandom, now: i64) {
+    pub fn begin(&mut self, lr: &mut LevelRandom, now: i64) {
         self.running = true;
         let bound = self.max.wrapping_add(1).wrapping_sub(self.min);
         let d = self.min.wrapping_add(lr.next_int_bound(bound).unwrap_or(0));
@@ -70,7 +74,7 @@ pub fn living_near(m: &Mob, w: &MobWorld) -> Vec<Who> {
             found.push((Who::Mob(o.id), m.distance_sqr(o.position)));
         }
     }
-    if let Some(p) = &w.player
+    if let Some(p) = w.selected_player()
         && p.alive
         && p.bounds.intersects(area)
     {
@@ -78,6 +82,20 @@ pub fn living_near(m: &Mob, w: &MobWorld) -> Vec<Who> {
     }
     found.sort_by(|a, b| a.1.total_cmp(&b.1));
     found.into_iter().map(|(w, _)| w).collect()
+}
+/// The brain's `MeleeAttack.create(cooldown)` for a mob whose cooldown never
+/// varies, as the goal that stands in for that behaviour has to run it:
+/// `MeleeAttack` arms `ATTACK_COOLING_DOWN` with the cooldown and
+/// `MemorySlot.tick` erases it a tick after it reaches zero, so vanilla's hits
+/// come `cooldown + 1` ticks apart. A goal (`MeleeAttackGoal`) counts its own
+/// cooldown down before it tests it, so it has to wait `cooldown + 1`.
+pub fn melee_attack(cooldown: i32) -> MeleeAttack {
+    MeleeAttack::new(1.0, true).interval(cooldown + 1)
+}
+/// `MeleeAttack.create(adult)` and `create(baby)` (`Hoglin`, `Zoglin`):
+/// [`melee_attack`] for a mob whose cooldown depends on its age.
+pub fn melee_attack_by_age(adult: i32, baby: i32) -> MeleeAttack {
+    MeleeAttack::new(1.0, true).intervals(adult + 1, baby + 1)
 }
 /// A random duration in `min..=max` (`Behavior`'s end time).
 pub fn duration(m: &mut Mob, min: i32, max: i32) -> i32 {
@@ -171,6 +189,82 @@ impl Sink {
         }
     }
 }
+use horizon_core::nbt::{Compound, Tag};
+
+/// `finalizeSpawn`'s memories (`m.extra.memories`) as `Brain.Packed` writes
+/// them: a `Unit` empty compound, a boolean, an integer, or a global position
+/// for `home`, with the remaining TTL when it is finite.
+pub fn put_brain(map: &mut Compound, m: &Mob, dimension: &str) {
+    if m.extra.memories.is_empty() {
+        return;
+    }
+    let mut memories = match map.get(&"Brain".into()).and_then(|b| b.get("memories")) {
+        Some(Tag::Compound(c)) => c.clone(),
+        _ => Compound::new(),
+    };
+    for &(name, value, ttl) in &m.extra.memories {
+        let value = match name {
+            "hunted_recently" => Tag::Byte(value as i8),
+            // `Unit` memories save an empty compound.
+            "is_pregnant" => Tag::Compound(Compound::new()),
+            "home" => match m.extra.home {
+                Some(p) => Tag::compound([
+                    ("dimension", Tag::String(dimension.into())),
+                    ("pos", Tag::IntArray(p.to_vec())),
+                ]),
+                None => continue,
+            },
+            _ => Tag::Int(value as i32),
+        };
+        let mut memory = vec![("value", value)];
+        if ttl != i64::MAX {
+            memory.push(("ttl", Tag::Long(ttl)));
+        }
+        memories.insert(
+            format!("minecraft:{name}").as_str().into(),
+            Tag::compound(memory),
+        );
+    }
+    map.insert(
+        "Brain".into(),
+        Tag::compound([("memories", Tag::Compound(memories))]),
+    );
+}
+
+/// `Frog`'s brain memory `IS_PREGNANT`, which `Brain.Packed` writes beside the
+/// other memories and `mob_from_nbt` reads back into the frog's memories. The
+/// memory is a `Unit`: its value is an empty compound, with no TTL.
+pub fn write_frog(m: &Mob, map: &mut Compound) {
+    let brain = map
+        .entry("Brain".into())
+        .or_insert_with(|| Tag::Compound(Compound::new()));
+    if !matches!(brain, Tag::Compound(_)) {
+        *brain = Tag::Compound(Compound::new());
+    }
+    let Tag::Compound(brain) = brain else { return };
+    let memories = brain
+        .entry("memories".into())
+        .or_insert_with(|| Tag::Compound(Compound::new()));
+    if !matches!(memories, Tag::Compound(_)) {
+        *memories = Tag::Compound(Compound::new());
+    }
+    let Tag::Compound(memories) = memories else {
+        return;
+    };
+    if super::frog::is_pregnant(m) {
+        memories.insert(
+            "minecraft:is_pregnant".into(),
+            Tag::compound([("value", Tag::Compound(Compound::new()))]),
+        );
+    } else {
+        memories.remove(&"minecraft:is_pregnant".into());
+    }
+}
+
+#[cfg(test)]
+#[path = "melee_cooldown_tests.rs"]
+mod melee_cooldown_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

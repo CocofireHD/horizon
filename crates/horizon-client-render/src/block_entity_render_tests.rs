@@ -340,6 +340,7 @@ fn batched_callbacks_preserve_entity_ranges_and_allow_immediate_culling() {
     let anim = |_: [i32; 3]| BlockAnim::default();
     let scene = Scene {
         camera: DVec3::new(3.25, 64.5, -4.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -358,6 +359,7 @@ fn batched_callbacks_preserve_entity_ranges_and_allow_immediate_culling() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     // Reverse local-position order to check that cache indexing does not
@@ -429,6 +431,7 @@ fn static_cache_qualifies_local_positions_by_section_and_drops_old_entries() {
     let anim = |_: [i32; 3]| BlockAnim::default();
     let mut scene = Scene {
         camera: DVec3::new(2.25, 64.5, -3.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -447,6 +450,7 @@ fn static_cache_qualifies_local_positions_by_section_and_drops_old_entries() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let options = CacheOptions {
@@ -484,6 +488,7 @@ fn gpu_static_cache_uses_section_local_chests_and_keeps_visibility_separate() {
     };
     let mut scene = Scene {
         camera: DVec3::new(99.25, 70.5, -31.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -502,6 +507,7 @@ fn gpu_static_cache_uses_section_local_chests_and_keeps_visibility_separate() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let blocks = [([100, 70, -32], 0)];
@@ -671,6 +677,7 @@ fn sign_text_cache_can_be_disabled_and_reenabled_without_changing_output() {
     };
     let scene = Scene {
         camera: DVec3::new(2.25, 64.5, -3.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &|_| BlockAnim::default(),
         texts: None,
@@ -689,6 +696,7 @@ fn sign_text_cache_can_be_disabled_and_reenabled_without_changing_output() {
         skull: &|_| None,
         glyph: &glyph,
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let blocks = [([0, 64, 0], 0)];
@@ -725,6 +733,7 @@ fn shulker_cache_tracks_settled_poses_and_does_not_freeze_opening_animation() {
     };
     let scene = Scene {
         camera: DVec3::new(2.0, 64.0, -3.0),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -743,6 +752,7 @@ fn shulker_cache_tracks_settled_poses_and_does_not_freeze_opening_animation() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let blocks = [([0, 64, 0], 0)];
@@ -827,6 +837,7 @@ fn shulker_cache_covers_all_colors_and_facing_directions() {
     let anim = |_: [i32; 3]| BlockAnim::default();
     let scene = Scene {
         camera: DVec3::new(2.25, 64.5, -3.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -845,6 +856,7 @@ fn shulker_cache_covers_all_colors_and_facing_directions() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let options = CacheOptions {
@@ -882,6 +894,7 @@ fn cached_bells_keep_shaking_until_the_animation_ends() {
     };
     let scene = Scene {
         camera: DVec3::new(2.0, 64.0, -3.0),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -900,6 +913,7 @@ fn cached_bells_keep_shaking_until_the_animation_ends() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let blocks = [([0, 64, 0], 0)];
@@ -944,6 +958,7 @@ fn cached_closed_chests_match_the_direct_model_and_rebuild_when_opening() {
     let anim = |_: [i32; 3]| BlockAnim::default();
     let mut scene = Scene {
         camera: DVec3::new(2.25, 64.5, -3.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -962,6 +977,7 @@ fn cached_closed_chests_match_the_direct_model_and_rebuild_when_opening() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let blocks = [([0, 64, 0], 0)];
@@ -993,7 +1009,9 @@ fn cached_closed_chests_match_the_direct_model_and_rebuild_when_opening() {
     scene.nether = true;
     let nether_closed = render_cached(&scene);
     assert_same_vertices(&nether_closed, &render_direct(&renderer, &scene, &blocks));
-    assert_vertices_differ(&closed_again, &nether_closed);
+    // The nether is the entity shader's flag now (`entity_light`'s `l1` and
+    // `globals.time.y`), not a baked colour, so the cached geometry serves both.
+    assert_same_vertices(&closed_again, &nether_closed);
 }
 
 #[test]
@@ -1040,6 +1058,7 @@ fn closed_chest_cache_covers_all_materials_and_atlas_reloads() {
     let anim = |_: [i32; 3]| BlockAnim::default();
     let mut scene = Scene {
         camera: DVec3::new(2.25, 64.5, -3.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -1058,6 +1077,7 @@ fn closed_chest_cache_covers_all_materials_and_atlas_reloads() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let pos = [0, 64, 0];
@@ -1129,6 +1149,7 @@ fn double_chest_cache_bypasses_both_halves_while_either_lid_is_open() {
     let anim = |_: [i32; 3]| BlockAnim::default();
     let scene = Scene {
         camera: DVec3::new(2.25, 64.5, -3.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -1147,6 +1168,7 @@ fn double_chest_cache_bypasses_both_halves_while_either_lid_is_open() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let pair = [([0, 64, 0], 0), ([1, 64, 0], 1)];
@@ -1205,6 +1227,7 @@ fn decorated_pot_cache_tracks_sherds_and_bypasses_wobble_animation() {
     let anim = |_: [i32; 3]| animation.borrow().clone();
     let scene = Scene {
         camera: DVec3::new(2.25, 64.5, -3.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -1223,6 +1246,7 @@ fn decorated_pot_cache_tracks_sherds_and_bypasses_wobble_animation() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let blocks = [([0, 64, 0], 0)];
@@ -1284,6 +1308,7 @@ fn banner_cache_keeps_the_pole_static_while_the_flag_and_patterns_update() {
     let banner_patterns = |_: [i32; 3]| patterns.borrow().clone();
     let mut scene = Scene {
         camera: DVec3::new(2.25, 64.5, -3.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -1302,6 +1327,7 @@ fn banner_cache_keeps_the_pole_static_while_the_flag_and_patterns_update() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let blocks = [([0, 64, 0], 0)];
@@ -1351,6 +1377,7 @@ fn cached_wall_banner_poles_use_the_wall_model() {
     let anim = |_: [i32; 3]| BlockAnim::default();
     let scene = Scene {
         camera: DVec3::new(2.25, 64.5, -3.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -1369,6 +1396,7 @@ fn cached_wall_banner_poles_use_the_wall_model() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let pos = [0, 64, 0];
@@ -1399,6 +1427,7 @@ fn copper_statue_cache_rebuilds_when_its_pose_state_changes() {
     let anim = |_: [i32; 3]| BlockAnim::default();
     let scene = Scene {
         camera: DVec3::new(2.25, 64.5, -3.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -1417,6 +1446,7 @@ fn copper_statue_cache_rebuilds_when_its_pose_state_changes() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let options = CacheOptions {
@@ -1505,6 +1535,7 @@ fn copper_statue_cache_covers_weathering_waxing_and_all_poses() {
     let anim = |_: [i32; 3]| BlockAnim::default();
     let scene = Scene {
         camera: DVec3::new(2.25, 64.5, -3.75),
+        spyglass_outline: false,
         orientation: Quat::IDENTITY,
         anim: &anim,
         texts: None,
@@ -1523,6 +1554,7 @@ fn copper_statue_cache_covers_weathering_waxing_and_all_poses() {
         skull: &|_| None,
         glyph: &|_| Glyph::default(),
         glyphs: 0,
+        font: None,
         dynamic_visible: None,
     };
     let options = CacheOptions {
@@ -1550,4 +1582,87 @@ fn copper_statue_cache_covers_weathering_waxing_and_all_poses() {
             assert_eq!(renderer.static_geometry.lock().unwrap().len, 1);
         }
     }
+}
+
+/// `AbstractSignRenderer.isOutlineVisible`: a first-person camera looking
+/// through a spyglass outlines glowing sign text at any distance, while
+/// otherwise only text within 16 blocks of the sign is.
+#[test]
+fn a_scoping_first_person_camera_outlines_glowing_sign_text_from_afar() {
+    let renderer = BlockEntityRenderer {
+        kinds: vec![Kind::Sign {
+            hanging: false,
+            wall: false,
+            angle: 180.0,
+        }],
+        ..Default::default()
+    };
+    let world = World::new(BlockStateId(0), 1);
+    let sprites = HashMap::new();
+    let glyph = |c: char| Glyph {
+        rect: (c != ' ').then_some(Rect {
+            u0: 0.0,
+            v0: 0.0,
+            u1: 0.0625,
+            v1: 0.0625,
+            w: 8,
+            h: 8,
+        }),
+        right: 8.0,
+        bottom: 8.0,
+        advance: 6.0,
+        ..Glyph::default()
+    };
+    let glowing = SignData {
+        front: SignText {
+            lines: ["glow".into(), String::new(), String::new(), String::new()],
+            color: 3,
+            glowing: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let sign = |_: [i32; 3]| Some(&glowing);
+    let pos = [0, 70, 0];
+    let mut scene = Scene {
+        camera: DVec3::new(0.5, 70.5, 20.5),
+        spyglass_outline: false,
+        orientation: Quat::IDENTITY,
+        anim: &|_| BlockAnim::default(),
+        texts: None,
+        partial: 0.0,
+        game_time: 0,
+        max_y: 320,
+        world: &world,
+        sprites: &sprites,
+        emissive: &Default::default(),
+        translucent_sprites: &HashSet::new(),
+        atlas_revision: 1,
+        nether: false,
+        lid: &|_| 0.0,
+        sign: &sign,
+        banner: &|_| Vec::new(),
+        skull: &|_| None,
+        glyph: &glyph,
+        glyphs: 0,
+        font: None,
+        dynamic_visible: None,
+    };
+    let text = |scene: &Scene| {
+        let mut out = Vec::new();
+        renderer.render(scene, [(pos, 0u32)].iter(), &mut out);
+        out.len()
+    };
+    let plain = text(&scene);
+    assert!(plain > 0, "the glowing text drew");
+    scene.spyglass_outline = true;
+    let scoping = text(&scene);
+    assert!(
+        scoping > plain,
+        "the outline adds quads: {scoping} vs {plain}"
+    );
+    // The same text as if the camera stood right at the sign.
+    scene.spyglass_outline = false;
+    scene.camera = DVec3::new(0.5, 70.5, 0.5);
+    assert_eq!(text(&scene), scoping);
 }

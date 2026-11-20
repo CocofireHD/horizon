@@ -4,26 +4,51 @@
 use super::{
     Mob, MobEvent, MobWorld, Seen, Species, Who,
     anim::{Poses, State},
-    brain::{Ttl, living_near},
+    brain::{Ttl, living_near, melee_attack, melee_attack_by_age},
     goals::{
-        Cx, Float, Goal, HurtByTarget, LOOK, LookAtPlayer, MOVE, MeleeAttack, NearestTarget, Prey,
+        Cx, Float, Goal, HurtByTarget, LOOK, LookAtPlayer, MOVE, NearestTarget, Prey,
         RandomLookAround, Stroll, TARGET, TargetState, goal_clone, target_continue,
     },
 };
 use horizon_core::geometry::{Vec3, trig::Mth};
-use horizon_core::random::{LegacyRandom, RandomSource};
+use horizon_core::random::{LegacyRandom, LevelRandom, RandomSource};
 use std::f32::consts::PI;
 
 /// `PiglinAi.ADMIRE_DURATION`.
 pub const ADMIRE: i32 = 119;
 /// `PiglinAi.eat`: the `ATE_RECENTLY` memory lasts 200 ticks (kept in
-/// `extra.ints[0]` of a piglin).
+/// `extra.piglin.ate_recently`).
 pub const ATE_RECENTLY: i32 = 200;
 /// `AbstractPiglin.CONVERSION_TIME` (and the hoglin's).
 const CONVERSION: i32 = 300;
 /// `PiglinAi.CELEBRATION_TIME`: how long the `CELEBRATE_LOCATION` and
 /// `DANCING` memories last.
 const CELEBRATION: i32 = 300;
+
+/// `ZombifiedPiglin.populateDefaultEquipmentSlots`: a golden sword, or one
+/// time in 20 a golden spear, off `random` (`Pig.thunderHit` passes the pig's
+/// own, `this.getRandom()`).
+pub fn default_equipment(random: &mut impl RandomSource) -> &'static str {
+    if random.next_int_bound(20).unwrap_or(1) == 0 {
+        "minecraft:golden_spear"
+    } else {
+        "minecraft:golden_sword"
+    }
+}
+
+/// `PiglinAi.BARTERING_ITEM`: vanilla's barter currency, compared by item.
+pub const BARTERING_ITEM: &str = "minecraft:gold_ingot";
+
+/// `Piglin.holdInOffHand`: equip the stack being admired, components and
+/// all, dropped when the piglin is killed; anything but the barter item keeps
+/// the piglin from despawning.
+pub fn hold_in_offhand(m: &mut Mob, stack: crate::items::ItemStack) {
+    if &*stack.item != BARTERING_ITEM {
+        m.persistent = true;
+    }
+    super::finalize::set_item_stack(m, super::finalize::OFFHAND, stack);
+    super::finalize::set_drop_chance(m, super::finalize::OFFHAND, 2.0);
+}
 
 /// `Activity`: what a piglin's or hoglin's brain is busy with. `Admire`,
 /// `Celebrate` and `Ride` are a piglin's only; the others are both.
@@ -63,6 +88,8 @@ pub struct Memories {
     /// authoritative actor identity and clears stale raw data instead of inventing one.
     /// Its remaining TTL is the existing `Extra::anger` counter.
     pub guarded_angry_at: Option<Option<[i32; 4]>>,
+    /// `Piglin.setCannotHunt`: the piglin will not start hunting hoglins.
+    pub cannot_hunt: bool,
     /// `AVOID_TARGET`.
     pub avoid: Option<AvoidTarget>,
     /// `RIDE_TARGET`.
@@ -109,6 +136,11 @@ pub struct Memories {
     pub walk_off: i32,
     /// `ADMIRING_DISABLED`: the ticks left.
     pub admire_disabled: i32,
+    /// `ATE_RECENTLY`: the ticks left.
+    pub ate_recently: i32,
+    /// A hit stopped the admiring (`wasHurtBy`): the `FinishAdmiring` it raised
+    /// doesn't barter.
+    pub hit_stop: bool,
 }
 /// Existing guarded-block anger, with the causal player's authoritative UUID.
 /// This adds identity only; targeting and countdown keep their existing policy.
@@ -116,6 +148,25 @@ pub fn set_guarded_anger_target(m: &mut Mob, player: Option<[i32; 4]>) {
     m.extra.anger = 600;
     m.ai.target = Some(Who::Player);
     m.extra.piglin.guarded_angry_at = Some(player);
+}
+
+/// `AbstractPiglin.canHunt`: false when the saved `CannotHunt` flag is set.
+pub fn can_hunt(m: &Mob) -> bool {
+    !m.extra.piglin.cannot_hunt
+}
+/// `PiglinAi.isIdle`: whether the active activity is `Activity::Idle`.
+pub fn is_idle(m: &Mob) -> bool {
+    activity(m) == Activity::Idle
+}
+
+/// `PiglinAi.eat`: sets `ATE_RECENTLY` memory for 200 ticks.
+pub fn eat(m: &mut Mob) {
+    m.extra.piglin.ate_recently = ATE_RECENTLY;
+}
+
+/// `PiglinAi.hasEatenRecently`: checks if `ATE_RECENTLY` memory is present.
+pub fn has_eaten_recently(m: &Mob) -> bool {
+    m.extra.piglin.ate_recently > 0
 }
 
 impl Memories {
@@ -152,9 +203,15 @@ fn visible(m: &mut Mob, w: &MobWorld, who: Who) -> bool {
     let range = m.attrs.follow_range;
     match who {
         Who::Player => {
-            let Some(p) = &w.player else { return false };
-            let r = (range * p.visibility_percent(Some(m.kind.id.as_str()), w.items)).max(2.0);
-            p.alive && !p.spectator && m.distance_sqr(p.position) <= r * r && m.sees(w, who)
+            let Some(p) = w.selected_player() else {
+                return false;
+            };
+            if !p.alive || p.spectator {
+                return false;
+            }
+            let r =
+                (range * w.player_visibility(p, m.id, p.visibility_percent(m.species()))).max(2.0);
+            m.distance_sqr(p.position) <= r * r && m.sees(w, who)
         }
         Who::Mob(id) => {
             let Some(s) = w.seen(id) else { return false };
@@ -218,8 +275,7 @@ fn piglin_sense(m: &mut Mob, w: &MobWorld) {
         match who {
             Who::Player => {
                 if !loved
-                    && w.player
-                        .as_ref()
+                    && w.selected_player()
                         .is_some_and(|p| !p.spectator && holds_loved(w, p))
                     && visible(m, w, who)
                 {
@@ -278,7 +334,8 @@ pub fn activity(m: &Mob) -> Activity {
     // `ADMIRING_ITEM`: a gold item in the off hand being admired (a charging
     // crossbow counts `using_item` up too), or one `StartAdmiringItemIfSeen`
     // saw lying around.
-    if piglin && ((m.extra.off_hand.is_some() && m.extra.using_item > 0) || b.seen_admire > 0) {
+    if piglin && ((m.extra.off_hand_id().is_some() && m.extra.using_item > 0) || b.seen_admire > 0)
+    {
         Activity::Admire
     } else if m.ai.target.is_some() {
         Activity::Fight
@@ -389,7 +446,7 @@ fn is_baby_riding_baby(m: &Mob, w: &MobWorld) -> bool {
 /// `Hoglin.isConverting` and `AbstractPiglin.isConverting`: in a dimension
 /// that is not piglin safe, a mob that is not immune and has AI.
 fn converting(m: &Mob, w: &MobWorld) -> bool {
-    !w.nether && !m.extra.flag2 && !m.no_ai
+    w.dimension_type.piglins_zombify && !m.extra.flag2 && !m.no_ai
 }
 /// `Hoglin.getAmbientSound`: the sound of the activity it is in
 /// (`HoglinAi.getSoundForCurrentActivity`).
@@ -448,7 +505,7 @@ fn play_brute_sound(m: &mut Mob, events: &mut Vec<MobEvent>) {
 }
 /// `PiglinBruteAi.maybePlayActivitySound`: the level random is drawn on every
 /// tick, fighting or not; a hit only growls in a fight.
-fn maybe_play_brute_sound(m: &mut Mob, lr: &mut LegacyRandom, events: &mut Vec<MobEvent>) {
+fn maybe_play_brute_sound(m: &mut Mob, lr: &mut LevelRandom, events: &mut Vec<MobEvent>) {
     if lr.next_float() < 0.0125 {
         play_brute_sound(m, events);
     }
@@ -465,7 +522,7 @@ fn remember_avoid(m: &mut Mob, who: Who, at: Vec3, ticks: i32) {
 }
 /// `TimeUtil.rangeOfSeconds(5, 7)` of `PiglinAi.AVOID_ZOMBIFIED_DURATION` and
 /// `BABY_AVOID_NEMESIS_DURATION`, sampled from the level random.
-fn avoid_duration(lr: &mut LegacyRandom) -> i32 {
+fn avoid_duration(lr: &mut LevelRandom) -> i32 {
     lr.next_int_between_inclusive(100, 140).unwrap_or(100)
 }
 /// `PiglinAi.isNearZombified`: the nearest visible zombified piglin or zoglin
@@ -484,18 +541,18 @@ fn copy_to_avoid(m: &mut Mob, cx: &mut Cx) {
         && let Some(who) = m.extra.piglin.nemesis
         && let Some(p) = cx.w.target_info(who)
     {
-        let ticks = avoid_duration(cx.lr);
+        let ticks = avoid_duration(cx.level.random());
         remember_avoid(m, who, p.position, ticks);
     }
     if let Some((who, at)) = near_zombified(m, cx.w) {
-        let ticks = avoid_duration(cx.lr);
+        let ticks = avoid_duration(cx.level.random());
         remember_avoid(m, who, at, ticks);
     }
 }
 /// `SetEntityLookTargetSometimes.Ticker.tickDownAndCheck`: with nothing left
 /// to wait for, draw the next wait from `interval` and say no; otherwise
 /// count down and say yes when it reaches nothing.
-fn tick_down_and_check(wait: &mut i32, lr: &mut LegacyRandom, interval: (i32, i32)) -> bool {
+fn tick_down_and_check(wait: &mut i32, lr: &mut LevelRandom, interval: (i32, i32)) -> bool {
     if *wait == 0 {
         *wait = lr
             .next_int_between_inclusive(interval.0, interval.1)
@@ -519,10 +576,14 @@ fn baby_sometimes_ride_baby_hoglin(m: &mut Mob, cx: &mut Cx) {
     if b.ride.is_some() || !m.is_baby() {
         return;
     }
-    if !tick_down_and_check(&mut m.extra.piglin.ride_wait, cx.lr, (200, 800)) {
+    if !tick_down_and_check(&mut m.extra.piglin.ride_wait, cx.level.random(), (200, 800)) {
         return;
     }
-    let ticks = cx.lr.next_int_between_inclusive(200, 600).unwrap_or(200);
+    let ticks = cx
+        .level
+        .random()
+        .next_int_between_inclusive(200, 600)
+        .unwrap_or(200);
     let mut ttl = Ttl::default();
     ttl.set(ticks);
     m.extra.piglin.ride = Some(RideTarget {
@@ -664,18 +725,20 @@ fn wants_to_stop_fleeing(m: &Mob, w: &MobWorld) -> bool {
 }
 /// `PiglinAi.RETREAT_DURATION` and `HoglinAi.RETREAT_DURATION`:
 /// `TimeUtil.rangeOfSeconds(5, 20)`, sampled from the level random.
-fn retreat_duration(lr: &mut LegacyRandom) -> i32 {
+fn retreat_duration(lr: &mut LevelRandom) -> i32 {
     lr.next_int_between_inclusive(100, 400).unwrap_or(100)
 }
 /// `PiglinAi.TIME_BETWEEN_HUNTS` (30 to 120 seconds) sampled from the level
 /// random.
-fn hunt_wait(lr: &mut LegacyRandom) -> i32 {
+fn hunt_wait(lr: &mut LevelRandom) -> i32 {
     lr.next_int_between_inclusive(600, 2400).unwrap_or(600)
 }
 /// `HoglinAi.setAvoidTarget`: forget the attack target and the walk, and
 /// avoid `who`, standing at `at`, for a while.
-pub fn set_avoid_target(m: &mut Mob, lr: &mut LegacyRandom, who: Who, at: Vec3) {
-    m.ai.target = None;
+pub fn set_avoid_target(m: &mut Mob, w: &MobWorld, lr: &mut LevelRandom, who: Who, at: Vec3) {
+    if let super::TargetChange::Set(target) = w.change_target(m, true, None) {
+        m.ai.target = target;
+    }
     m.nav_stop();
     let ticks = retreat_duration(lr);
     remember_avoid(m, who, at, ticks);
@@ -683,16 +746,22 @@ pub fn set_avoid_target(m: &mut Mob, lr: &mut LegacyRandom, who: Who, at: Vec3) 
 /// `PiglinAi.setAvoidTargetAndDontHuntForAWhile`: forget the anger, the
 /// attack target and the walk, avoid `who` for a while and start the
 /// `HUNTED_RECENTLY` wait (`dontKillAnyMoreHoglinsForAWhile`).
-pub fn set_avoid_target_and_dont_hunt(m: &mut Mob, lr: &mut LegacyRandom, who: Who, at: Vec3) {
+pub fn set_avoid_target_and_dont_hunt(
+    m: &mut Mob,
+    w: &MobWorld,
+    lr: &mut LevelRandom,
+    who: Who,
+    at: Vec3,
+) {
     m.extra.anger = 0;
-    set_avoid_target(m, lr, who, at);
+    set_avoid_target(m, w, lr, who, at);
     m.extra.ints[0] = hunt_wait(lr);
 }
 /// `HoglinAi.retreatFromNearestTarget` and `PiglinAi.retreatFromNearestTarget`:
 /// retreat from the nearest of the new target, the avoid target and the
 /// attack target (`BehaviorUtils.getNearestTarget`: the first one only when
 /// it is strictly closer).
-pub fn retreat_from_nearest(m: &mut Mob, w: &MobWorld, lr: &mut LegacyRandom, who: Who, at: Vec3) {
+pub fn retreat_from_nearest(m: &mut Mob, w: &MobWorld, lr: &mut LevelRandom, who: Who, at: Vec3) {
     let mut nearest = (who, at);
     let avoid = m.extra.piglin.avoid.map(|a| (a.who, a.at));
     let attack =
@@ -704,9 +773,9 @@ pub fn retreat_from_nearest(m: &mut Mob, w: &MobWorld, lr: &mut LegacyRandom, wh
         }
     }
     if m.species() == Species::Hoglin {
-        set_avoid_target(m, lr, nearest.0, nearest.1);
+        set_avoid_target(m, w, lr, nearest.0, nearest.1);
     } else {
-        set_avoid_target_and_dont_hunt(m, lr, nearest.0, nearest.1);
+        set_avoid_target_and_dont_hunt(m, w, lr, nearest.0, nearest.1);
     }
 }
 /// `HoglinAi.broadcastRetreat` and `PiglinAi.broadcastRetreat`: every adult
@@ -777,8 +846,15 @@ fn hoglin_retaliates(m: &mut Mob, w: &MobWorld, by: Who, at: Vec3) -> bool {
 /// `HoglinAi.wasHurtBy`, which `Hoglin.hurtServer` calls: a hit ends the
 /// pacified state; a baby retreats from the attacker, an adult retaliates
 /// when `maybeRetaliate` allows. The hurt-by goal does the retaliating, so a
-/// hit that does not get it is used up.
-fn hoglin_hurt(m: &mut Mob, w: &MobWorld, lr: &mut LegacyRandom, by: Who) {
+/// hit that does not get it is used up. A retaliation is broadcast to the
+/// visible adult hoglins (`broadcastAttackTarget`, `NEAREST_VISIBLE_ADULT_HOGLINS`).
+fn hoglin_hurt(
+    m: &mut Mob,
+    w: &MobWorld,
+    lr: &mut LevelRandom,
+    events: &mut Vec<MobEvent>,
+    by: Who,
+) {
     m.extra.ints[0] = 0;
     let Some(at) = w.target_info(by).map(|t| t.position) else {
         return;
@@ -788,18 +864,49 @@ fn hoglin_hurt(m: &mut Mob, w: &MobWorld, lr: &mut LegacyRandom, by: Who) {
         m.ai.last_hurt_by = None;
     } else if !hoglin_retaliates(m, w, by, at) {
         m.ai.last_hurt_by = None;
+    } else {
+        for &mob in &m.extra.piglin.adults {
+            events.push(MobEvent::HoglinAttackTarget {
+                mob,
+                target: by,
+                player: None,
+            });
+        }
     }
 }
-/// `PiglinAi.stopHoldingOffHandItem` without bartering (`wasHurtBy`): a gold
-/// ingot is not bartered and is gone; anything else ends its admiring next
-/// tick, as if the time ran out, and the game side puts it away.
-pub fn stop_admiring(m: &mut Mob) {
-    if m.extra.off_hand.as_deref() == Some("minecraft:gold_ingot") {
-        m.extra.off_hand = None;
-        m.extra.using_item = 0;
-    } else {
-        m.extra.using_item = i32::from(m.extra.off_hand.is_some() && m.extra.using_item > 0);
+/// `HoglinAi.setAttackTargetIfCloserThanCurrent` for a hoglin that received a
+/// broadcast: nothing while pacified; otherwise `BehaviorUtils.getNearestTarget`,
+/// the new target unless the current one is strictly nearer
+/// (`getTargetNearestMe`). `position` gives the current (true) or incoming (false) target's place; a
+/// current target it cannot place counts as absent. Player positions must resolve the corresponding concrete identity. Returns a proposal for the event dispatcher to approve before
+/// committing the target, without changing the receiving mob.
+pub fn receive_attack_target(
+    m: &Mob,
+    target: Who,
+    position: impl Fn(Who, bool) -> Option<Vec3>,
+) -> Option<Who> {
+    if m.extra.ints[0] > 0 {
+        return None;
     }
+    let Some(current) = m.ai.target else {
+        return Some(target);
+    };
+    let Some(now) = position(current, true) else {
+        return Some(target);
+    };
+    let new = position(target, false)?;
+    (m.distance_sqr(now) >= m.distance_sqr(new)).then_some(target)
+}
+/// `PiglinAi.wasHurtBy`'s `stopHoldingOffHandItem` without bartering: the
+/// admiring ends, and the game, handling the `FinishAdmiring` raised here,
+/// takes the off-hand item (currency is lost, anything else put away).
+pub fn stop_admiring(m: &mut Mob) {
+    if m.extra.off_hand_id().is_none() {
+        return;
+    }
+    m.extra.using_item = 0;
+    m.extra.piglin.hit_stop = true;
+    m.outbox.push(MobEvent::FinishAdmiring { mob: m.id });
 }
 /// Whether two entities are of one type: both the player, or both mobs of
 /// one species.
@@ -856,7 +963,7 @@ fn piglin_retaliates(m: &mut Mob, w: &MobWorld, by: Who, at: Vec3) -> bool {
 fn piglin_hurt(
     m: &mut Mob,
     w: &MobWorld,
-    lr: &mut LegacyRandom,
+    lr: &mut LevelRandom,
     events: &mut Vec<MobEvent>,
     by: Who,
 ) {
@@ -897,7 +1004,7 @@ fn piglin_hurt(
         }
         m.ai.last_hurt_by = None;
     } else if species == Some(Species::Hoglin) && hoglins_outnumber_piglins(m) {
-        set_avoid_target_and_dont_hunt(m, lr, by, at);
+        set_avoid_target_and_dont_hunt(m, w, lr, by, at);
         broadcast_retreat(m, w, by, at, events);
         m.ai.last_hurt_by = None;
     } else if piglin_retaliates(m, w, by, at) {
@@ -911,7 +1018,7 @@ fn piglin_hurt(
 /// What a piglin or hoglin handles before its goals run: the retreats other
 /// mobs broadcast to it, the hit `wasHurtBy` reacts to and, for a piglin,
 /// its celebration.
-pub fn before_goals(m: &mut Mob, w: &MobWorld, lr: &mut LegacyRandom, events: &mut Vec<MobEvent>) {
+pub fn before_goals(m: &mut Mob, w: &MobWorld, lr: &mut LevelRandom, events: &mut Vec<MobEvent>) {
     for (from, at) in std::mem::take(&mut m.extra.piglin.retreats) {
         retreat_from_nearest(m, w, lr, from, at);
     }
@@ -920,7 +1027,7 @@ pub fn before_goals(m: &mut Mob, w: &MobWorld, lr: &mut LegacyRandom, events: &m
     {
         m.extra.piglin.hurt_seen = m.ai.last_hurt_by_time;
         if m.species() == Species::Hoglin {
-            hoglin_hurt(m, w, lr, by);
+            hoglin_hurt(m, w, lr, events, by);
         } else {
             piglin_hurt(m, w, lr, events, by);
         }
@@ -1091,6 +1198,46 @@ impl<G: Goal + Clone + 'static> Goal for NotRetreating<G> {
     }
 }
 
+/// A goal of the fight activity: `HoglinAi.updateActivity` runs after the
+/// brain, so a hoglin given a target fights from the next tick on (here
+/// `brain_step` runs after the goals). The goal may start a tick early, as
+/// the goal selector picks new goals every other tick only and the brain
+/// every tick, but it acts only once the activity is fight.
+#[derive(Clone, Debug)]
+struct InFight<G>(G);
+impl<G: Goal + Clone + 'static> Goal for InFight<G> {
+    goal_clone!();
+    fn flags(&self) -> u8 {
+        self.0.flags()
+    }
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+    fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
+        self.0.can_use(m, cx)
+    }
+    fn can_continue(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
+        self.0.can_continue(m, cx)
+    }
+    fn interruptable(&self) -> bool {
+        self.0.interruptable()
+    }
+    fn every_tick(&self) -> bool {
+        self.0.every_tick()
+    }
+    fn start(&mut self, m: &mut Mob, cx: &mut Cx) {
+        self.0.start(m, cx)
+    }
+    fn stop(&mut self, m: &mut Mob, cx: &mut Cx) {
+        self.0.stop(m, cx)
+    }
+    fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
+        if m.extra.piglin.activity == Activity::Fight {
+            self.0.tick(m, cx)
+        }
+    }
+}
+
 /// A goal of the idle and avoid activities' movement: the ride activity has
 /// none of it (`PiglinAi.initRideHoglinActivity`), so it waits while the
 /// brain is in the ride activity.
@@ -1133,7 +1280,7 @@ fn hostile_to_player(m: &Mob, w: &MobWorld) -> bool {
         return false;
     }
     match m.species() {
-        Species::Piglin => m.extra.anger > 0 || w.player.as_ref().is_some_and(|p| !p.gold_armor),
+        Species::Piglin => m.extra.anger > 0 || w.selected_player().is_some_and(|p| !p.gold_armor),
         _ => true,
     }
 }
@@ -1145,7 +1292,7 @@ fn hostile_to_player(m: &Mob, w: &MobWorld) -> bool {
 struct BackUpIfTooClose;
 impl BackUpIfTooClose {
     fn too_close(m: &mut Mob, cx: &mut Cx) -> Option<[f64; 3]> {
-        if m.extra.main_hand.as_deref() != Some("minecraft:crossbow") || !m.ai.nav.is_done() {
+        if m.extra.main_hand_id() != Some("minecraft:crossbow") || !m.ai.nav.is_done() {
             return None;
         }
         let who = m.ai.target?;
@@ -1194,12 +1341,10 @@ pub fn register_piglin(m: &mut Mob) {
     // held item itself (it only starts while a crossbow is in the main hand).
     g.add(3, super::illager::crossbow_goal(1.0, 8.0));
     g.add(3, BackUpIfTooClose);
-    // `PiglinAi.initFightActivity`: the spear behaviours come before the melee one.
+    // `PiglinAi.initFightActivity`: the spear behaviours come before the melee
+    // one, which is `create(20)`.
     g.add(3, super::spear_use::PiglinSpear::new());
-    g.add(
-        3,
-        super::spear_use::NoMeleeWithSpear(MeleeAttack::new(1.0, true)),
-    );
+    g.add(3, super::spear_use::NoMeleeWithSpear(melee_attack(20)));
     g.add(4, NotRiding(PiglinAvoidRepellent));
     g.add(4, GoToWantedItem);
     g.add(4, Celebrate);
@@ -1249,6 +1394,7 @@ impl Goal for HuntHoglin {
             || m.extra.anger > 0
             || m.ai.target.is_some()
             || m.extra.piglin.activity == Activity::Avoid
+            || m.extra.piglin.cannot_hunt
         {
             return false;
         }
@@ -1283,8 +1429,14 @@ impl Goal for HuntHoglin {
     }
     fn start(&mut self, m: &mut Mob, cx: &mut Cx) {
         let Some(hoglin) = self.found else { return };
-        m.ai.target = Some(Who::Mob(hoglin));
+        let super::TargetChange::Set(Some(target)) =
+            cx.w.change_target(m, true, Some(Who::Mob(hoglin)))
+        else {
+            return;
+        };
+        m.ai.target = Some(target);
         m.extra.ints[0] = time_between_hunts(m);
+        let Who::Mob(hoglin) = target else { return };
         let range = m.attrs.follow_range;
         let pos = Vec3::new(m.position.x, m.eye_y(), m.position.z);
         let id = m.id;
@@ -1303,14 +1455,17 @@ impl Goal for HuntHoglin {
             });
         }
     }
-    fn stop(&mut self, m: &mut Mob, _: &mut Cx) {
-        m.ai.target = None;
+    fn stop(&mut self, m: &mut Mob, cx: &mut Cx) {
+        if let super::TargetChange::Set(target) = cx.w.change_target(m, true, None) {
+            m.ai.target = target;
+        }
     }
 }
 pub fn register_brute(m: &mut Mob) {
     let g = &mut m.ai.goals;
     g.add(0, Float);
-    g.add(2, MeleeAttack::new(1.0, true));
+    // `PiglinBruteAi.initFightActivity`: `MeleeAttack.create(20)`.
+    g.add(2, melee_attack(20));
     // `PiglinBruteAi.createIdleMovementBehaviors`: `StrollToPoi(HOME, 0.6, 2,
     // 100)` ahead of the plain stroll, so a brute that drifts off walks back to
     // the spot `PiglinBruteAi.initMemories` remembered for it.
@@ -1389,8 +1544,10 @@ pub fn register_hoglin(m: &mut Mob) {
     g.add(0, Float);
     // `HoglinAi.initRetreatActivity`: `SetWalkTargetAwayFrom.entity(AVOID_TARGET, 1.3, 15, false)`.
     g.add(1, WalkAway::retreat(1.3, 15.0, false));
-    // HoglinAi: MeleeAttack.create(40) for adults, 15 for babies.
-    g.add(2, MeleeAttack::new(1.0, true).intervals(40, 15));
+    // HoglinAi: MeleeAttack.create(40) for adults, 15 for babies, in the
+    // fight activity. Its `ATTACK_COOLING_DOWN` lives 40 brain ticks and
+    // `MemorySlot.tick` erases it on the 41st, so hits come 41 (16) apart.
+    g.add(2, InFight(melee_attack_by_age(40, 15)));
     g.add(3, NotRetreating(super::goals::Breed::new(1.0)));
     g.add(3, HoglinAvoidRepellent);
     // `HoglinAi.initIdleActivity`: an adult keeps away from the nearest adult
@@ -1399,21 +1556,22 @@ pub fn register_hoglin(m: &mut Mob) {
     g.add(4, NotRetreating(super::goals::FollowParent::new(1.1)));
     g.add(5, Stroll::avoiding_water(0.4));
     g.add(6, LookAtPlayer::new(8.0));
-    m.ai.targets.add(1, HurtByTarget::new().alert());
+    // The retaliation's broadcast is `hoglin_hurt`'s (`HoglinAi.broadcastAttackTarget`), not an alert.
+    m.ai.targets.add(1, HurtByTarget::new());
     // `HoglinAi.findNearestValidAttackTarget`: nothing while pacified, and
     // `StartAttacking` is not in the retreat activity.
     m.ai.targets.add(
         2,
         NearestTarget::player(true).when(|m, _| {
-            !m.is_baby() && m.extra.ints[0] <= 0 && m.extra.piglin.activity != Activity::Avoid
+            !m.is_baby() && !is_pacified(m) && m.extra.piglin.activity != Activity::Avoid
         }),
     );
 }
 pub fn register_zoglin(m: &mut Mob) {
     let g = &mut m.ai.goals;
     g.add(0, Float);
-    // Zoglin.initMemories: MeleeAttack.create(40) for adults, 15 for babies.
-    g.add(2, MeleeAttack::new(1.0, true).intervals(40, 15));
+    // `Zoglin.initFightActivity`: `create(40)` for adults, 15 for babies.
+    g.add(2, melee_attack_by_age(40, 15));
     g.add(5, Stroll::avoiding_water(0.4));
     g.add(6, LookAtPlayer::new(8.0));
     m.ai.targets.add(1, HurtByTarget::new());
@@ -1541,7 +1699,7 @@ impl LookAtLoved {
             Activity::Ride => 64.0,
             _ => return None,
         };
-        let p = cx.w.player.as_ref()?;
+        let p = cx.w.selected_player()?;
         if !holds_loved(cx.w, p) || m.distance_sqr(p.position) > range_sqr {
             return None;
         }
@@ -1580,7 +1738,7 @@ impl Goal for AdmireSeen {
         MOVE | LOOK
     }
     fn can_use(&mut self, m: &mut Mob, _: &mut Cx) -> bool {
-        m.extra.piglin.seen_admire > 0 && m.extra.off_hand.is_none()
+        m.extra.piglin.seen_admire > 0 && m.extra.off_hand_id().is_none()
     }
     fn every_tick(&self) -> bool {
         true
@@ -1599,7 +1757,7 @@ impl Goal for Admire {
         MOVE | LOOK
     }
     fn can_use(&mut self, m: &mut Mob, _: &mut Cx) -> bool {
-        m.extra.using_item > 0 && m.extra.off_hand.is_some()
+        m.extra.using_item > 0 && m.extra.off_hand_id().is_some()
     }
     fn start(&mut self, m: &mut Mob, _: &mut Cx) {
         m.nav_stop();
@@ -1676,6 +1834,19 @@ fn find_hoglin_repellent(m: &Mob, w: &MobWorld) -> Option<[i32; 3]> {
     ];
     w.nearest_block(at, 8, 4, |_, name| tag.contains(name))
 }
+/// `HoglinAi.isPacified`: the `PACIFIED` memory (`ints[0]`) is present.
+/// `BecomePassiveIfMemoryPresent` sets it for 200 ticks while a
+/// `#hoglin_repellents` block is in `NEAREST_REPELLENT`.
+pub fn is_pacified(m: &Mob) -> bool {
+    m.extra.ints[0] > 0
+}
+/// `Hoglin.canFallInLove` is `!HoglinAi.isPacified(this) && super.canFallInLove()`:
+/// a warped fungus nearby pacifies the adult, and it refuses the fungus in the
+/// player's hand. `ai::takes_food`'s baby branch asks `canAgeUp`, not
+/// `canFallInLove`, so a pacified baby still grows.
+pub fn refuses_love(m: &Mob) -> bool {
+    m.species() == Species::Hoglin && is_pacified(m)
+}
 /// The hoglin's repellent memories: the sensors (every 20 ticks), the end of
 /// `PACIFIED` (`ints[0]`) and `BecomePassiveIfMemoryPresent(NEAREST_REPELLENT, 200)`.
 fn hoglin_repellent(m: &mut Mob, w: &MobWorld) {
@@ -1687,12 +1858,12 @@ fn hoglin_repellent(m: &mut Mob, w: &MobWorld) {
         hoglin_sense(m, w);
     }
     // `BecomePassiveIfMemoryPresent` is in the idle and fight activities.
-    if m.extra.ints[0] <= 0
-        && m.extra.repellent.is_some()
-        && m.extra.piglin.activity != Activity::Avoid
+    if !is_pacified(m) && m.extra.repellent.is_some() && m.extra.piglin.activity != Activity::Avoid
     {
         m.extra.ints[0] = 200;
-        m.ai.target = None;
+        if let super::TargetChange::Set(target) = w.change_target(m, true, None) {
+            m.ai.target = target;
+        }
     }
 }
 /// `StartCelebratingIfTargetDead` for a piglin (`scratch[0]` dancing,
@@ -1742,7 +1913,7 @@ pub fn client_converting(m: &mut Mob, nether: bool) {
 pub fn ai_step(
     m: &mut Mob,
     w: &MobWorld,
-    level_random: &mut LegacyRandom,
+    level_random: &mut LevelRandom,
     events: &mut Vec<MobEvent>,
 ) {
     if m.extra.anim_ticks > 0 {
@@ -1760,8 +1931,9 @@ pub fn ai_step(
         if let Some(who @ Who::Mob(_)) = m.ai.target
             && w.target_info(who)
                 .is_none_or(|t| !t.alive || !t.can_be_seen_as_enemy)
+            && let super::TargetChange::Set(target) = w.change_target(m, true, None)
         {
-            m.ai.target = None;
+            m.ai.target = target;
         }
     }
     // `PiglinBrute.customServerAiStep`: `updateActivity`, then
@@ -1772,8 +1944,12 @@ pub fn ai_step(
     }
     if m.extra.anger > 0 {
         m.extra.anger -= 1;
-        if m.extra.anger == 0 && m.ai.target == Some(Who::Player) && !hostile_to_player(m, w) {
-            m.ai.target = None;
+        if m.extra.anger == 0
+            && m.ai.target == Some(Who::Player)
+            && !hostile_to_player(m, w)
+            && let super::TargetChange::Set(target) = w.change_target(m, true, None)
+        {
+            m.ai.target = target;
         }
     }
     // `Brain.forgetOutdatedMemories`: `ADMIRING_DISABLED`, `DISABLE_WALK_TO_ADMIRE_ITEM`
@@ -1782,24 +1958,27 @@ pub fn ai_step(
     b.admire_disabled = (b.admire_disabled - 1).max(0);
     b.walk_off = (b.walk_off - 1).max(0);
     b.seen_admire = (b.seen_admire - 1).max(0);
+    b.ate_recently = (b.ate_recently - 1).max(0);
     // The admired item is in the off hand; a spear in use counts up instead.
-    if m.extra.using_item > 0 && m.extra.off_hand.is_some() {
+    if m.extra.using_item > 0 && m.extra.off_hand_id().is_some() {
         m.extra.using_item -= 1;
         if m.extra.using_item == 0 {
             events.push(MobEvent::FinishAdmiring { mob: m.id });
         }
     }
     // Zombification outside the Nether (piglins without immunity, hoglins).
-    if !w.nether && !m.extra.flag2 && m.alive() {
+    if w.dimension_type.piglins_zombify && !m.extra.flag2 && m.alive() {
         m.extra.counter2 += 1;
         if m.extra.counter2 > CONVERSION {
             // `Piglin.finishConversion` runs `PiglinAi.cancelAdmiring` first:
             // the item the piglin is admiring leaves the off hand and lands
             // where it stands, so the zombified piglin never carries it.
             if m.species() == Species::Piglin {
-                let admiring = (m.extra.off_hand.is_some() && m.extra.using_item > 0)
+                let admiring = (m.extra.off_hand_id().is_some() && m.extra.using_item > 0)
                     || m.extra.piglin.seen_admire > 0;
-                if admiring && let Some(item) = m.extra.off_hand.take() {
+                if admiring
+                    && let Some(item) = m.extra.take_slot_id(horizon_items::equipment::OFFHAND)
+                {
                     events.push(MobEvent::DropItem {
                         mob: m.id,
                         item,
@@ -1833,10 +2012,24 @@ pub fn ai_step(
                 ),
             };
             events.push(MobEvent::Sound(sound, m.center(), 1.0, 1.0));
+            // Conversion also drops the piglin's internal inventory.
+            if m.species() == Species::Piglin {
+                for stack in m.extra.inventory.drain(..).filter(|stack| stack.count > 0) {
+                    events.push(MobEvent::DropStack {
+                        mob: m.id,
+                        stack,
+                        at: [m.position.x, m.position.y, m.position.z],
+                    });
+                }
+            }
+            // `Hoglin.finishConversion` is `ConversionParams.single(this, true,
+            // false)`, `AbstractPiglin.finishConversion` `(this, true, true)`;
+            // both leave the new mob nauseous.
             events.push(MobEvent::Convert {
                 from: Box::new(m.clone()),
                 kind,
                 params,
+                after: super::conversion::After::Nausea,
             });
             m.removed = true;
         }
@@ -1889,9 +2082,14 @@ fn throw_target(m: &mut Mob, who: Who, cx: &mut Cx) {
     let scale = power * f64::from(m.random.next_float() * 0.5 + 0.2);
     let push = away.normalize().scale(scale).rotate_y(angle);
     let up = power * f64::from(m.random.next_float()) * 0.5;
-    cx.events.push(MobEvent::Push {
+    let event = MobEvent::Push {
         target: who,
         velocity: [push.x, up, push.z],
+    };
+    cx.events.push(if who == Who::Player {
+        cx.w.route_player_event(event)
+    } else {
+        event
     });
 }
 /// `HoglinAi.onHitTarget`: an adult that hits a piglin while piglins
@@ -1906,7 +2104,7 @@ fn on_hit_target(m: &mut Mob, who: Who, cx: &mut Cx) {
         return;
     };
     if species_of(cx.w, who) == Some(Species::Piglin) && piglins_outnumber_hoglins(m) {
-        set_avoid_target(m, cx.lr, who, at);
+        set_avoid_target(m, cx.w, cx.level.random(), who, at);
         broadcast_retreat(m, cx.w, who, at, cx.events);
     }
 }
@@ -1930,7 +2128,9 @@ pub fn hoglin_hurt_target(m: &mut Mob, who: Who, cx: &mut Cx) {
     };
     let from = [m.position.x, m.position.y, m.position.z];
     match who {
-        Who::Player => cx.events.push(MobEvent::AttackPlayer(amount, from)),
+        Who::Player => cx
+            .events
+            .push(cx.w.route_player_event(MobEvent::AttackPlayer(amount, from))),
         Who::Mob(id) => cx.events.push(MobEvent::AttackMob {
             target: id,
             amount,
@@ -1964,11 +2164,10 @@ pub fn piglin_anim(m: &Mob, s: &State, p: &mut Poses) {
     // too), which charges while a spear is in use (an admired item is not).
     let spear = m
         .extra
-        .main_hand
-        .as_deref()
+        .main_hand_id()
         .and_then(crate::spear::Kinetic::of)
         .map(|kinetic| {
-            let using = m.extra.using_item > 0 && m.extra.off_hand.is_none();
+            let using = m.extra.using_item > 0 && m.extra.off_hand_id().is_none();
             (
                 kinetic,
                 if using {
@@ -1981,25 +2180,25 @@ pub fn piglin_anim(m: &Mob, s: &State, p: &mut Poses) {
     // Piglin.getArmPose: dancing comes first.
     let pose = if m.extra.scratch[0] > 0 {
         PiglinPose::Dancing
-    } else if m.extra.using_item > 0 && m.extra.off_hand.is_some() {
+    } else if m.extra.using_item > 0 && m.extra.off_hand_id().is_some() {
         PiglinPose::AdmiringItem
     } else if m.extra.flag {
         PiglinPose::CrossbowCharge
-    } else if m.extra.main_hand.as_deref() == Some("minecraft:crossbow") && m.ai.aggressive {
+    } else if m.extra.main_hand_id() == Some("minecraft:crossbow") && m.ai.aggressive {
         PiglinPose::CrossbowHold
-    } else if m.ai.aggressive && m.extra.main_hand.is_some() && spear.is_none() {
+    } else if m.ai.aggressive && m.extra.main_hand_id().is_some() && spear.is_none() {
         PiglinPose::MeleeWeapon
     } else {
         PiglinPose::Default
     };
-    piglin_pose_holding(
+    piglin_pose_humanoid(
         p,
         s,
         pose,
         (25.0, m.extra.using_item as f32),
-        m.main_arm_left(),
-        m.extra.passenger,
+        (m.main_arm_left(), m.extra.passenger),
         spear,
+        Some(m),
     );
 }
 /// `PiglinArmPose`.
@@ -2036,6 +2235,26 @@ pub fn piglin_pose_holding(
     passenger: bool,
     spear: Option<(crate::spear::Kinetic, f32)>,
 ) {
+    piglin_pose_humanoid(
+        p,
+        s,
+        pose,
+        (max_charge, ticks),
+        (left, passenger),
+        spear,
+        None,
+    );
+}
+
+fn piglin_pose_humanoid(
+    p: &mut Poses,
+    s: &State,
+    pose: PiglinPose,
+    (max_charge, ticks): (f32, f32),
+    (left, passenger): (bool, bool),
+    spear: Option<(crate::spear::Kinetic, f32)>,
+    selected: Option<&Mob>,
+) {
     use super::anim::{ArmPose, Hum, crossbow_charge, crossbow_hold, humanoid};
     let mut h = Hum::new(ArmPose::Empty, ArmPose::Empty);
     if let Some((kinetic, ticks_using)) = spear {
@@ -2047,6 +2266,14 @@ pub fn piglin_pose_holding(
         }
         h.spear[side] = Some(kinetic);
         h.spear_ticks[side] = ticks_using;
+    }
+    if let Some(m) = selected {
+        let [main, off] = super::anim::humanoid_arm_poses(m, m.extra.held_arm_pose, s.swing);
+        (h.right, h.left) = if left { (off, main) } else { (main, off) };
+        let main_ticks = h.spear_ticks[usize::from(left)];
+        super::anim::humanoid_spears(m, &mut h, s.partial);
+        // An admired off-hand item leaves the main-hand spear at rest.
+        h.spear_ticks[usize::from(left)] = main_ticks;
     }
     h.weapon_swing = pose == PiglinPose::MeleeWeapon;
     h.left_main = left;
@@ -2128,6 +2355,69 @@ pub fn hoglin_anim(m: &Mob, s: &State, p: &mut Poses) {
     p.xrot("left_hind_leg", pos.mcos() * 1.2 * sp);
 }
 
+/// `Brain.Packed`: the guarded-block live ANGRY_AT entry. The existing
+/// anger counter supplies its remaining long TTL, not an absolute timestamp.
+pub fn write_guarded_anger(m: &Mob, map: &mut horizon_core::nbt::Compound) {
+    use horizon_core::nbt::{Compound, Tag};
+    let Some(actor) = m.extra.piglin.guarded_angry_at else {
+        return;
+    };
+    let brain = map
+        .entry("Brain".into())
+        .or_insert_with(|| Tag::Compound(Compound::new()));
+    if !matches!(brain, Tag::Compound(_)) {
+        *brain = Tag::Compound(Compound::new());
+    }
+    let Tag::Compound(brain) = brain else { return };
+    let memories = brain
+        .entry("memories".into())
+        .or_insert_with(|| Tag::Compound(Compound::new()));
+    if !matches!(memories, Tag::Compound(_)) {
+        *memories = Tag::Compound(Compound::new());
+    }
+    let Tag::Compound(memories) = memories else {
+        return;
+    };
+    if let Some(uuid) = actor.filter(|_| m.extra.anger > 0) {
+        // ExpirableValue.codec: the UUID value and optional remaining Long TTL.
+        memories.insert(
+            "minecraft:angry_at".into(),
+            Tag::compound([
+                ("value", Tag::IntArray(uuid.to_vec())),
+                ("ttl", Tag::Long(i64::from(m.extra.anger))),
+            ]),
+        );
+    } else {
+        memories.remove(&"minecraft:angry_at".into());
+    }
+}
+
+/// `Piglin.readAdditionalSaveData` through `Brain.Packed`: the guarded-block
+/// `ANGRY_AT` entry is an entity UUID with the ticks left as its TTL. Vanilla
+/// reads the memory with the brain, and an expired one no longer angers the
+/// piglin; the counter is what Horizon's goals ask.
+pub fn read_guarded_anger(m: &mut Mob, tag: &horizon_core::nbt::Tag) {
+    use horizon_core::nbt::Tag;
+    m.extra.piglin.cannot_hunt = matches!(tag.get("CannotHunt"), Some(Tag::Byte(b)) if *b != 0)
+        || matches!(tag.get("CannotHunt"), Some(Tag::Int(i)) if *i != 0);
+    let memory = tag
+        .get("Brain")
+        .and_then(|b| b.get("memories"))
+        .and_then(|b| b.get("minecraft:angry_at"));
+    let Some(memory) = memory else { return };
+    let Some(uuid) = crate::save::uuid_from_tag(memory.get("value")) else {
+        return;
+    };
+    // The TTL is a long: one past the counter's range holds as long as it can.
+    let ttl = match memory.get("ttl") {
+        Some(Tag::Long(v)) => (*v).clamp(0, i64::from(i32::MAX)) as i32,
+        Some(t) => crate::nbt_path::int_value(t).unwrap_or(i32::MAX),
+        None => i32::MAX,
+    };
+    m.extra.anger = ttl.max(0);
+    m.extra.piglin.guarded_angry_at = Some(Some(uuid));
+}
+
 #[cfg(test)]
 mod brute_sound_tests {
     use super::*;
@@ -2154,25 +2444,36 @@ mod brute_sound_tests {
     /// the fight activity and growls `entity.piglin_brute.angry`, losing the
     /// target is silent, and a piglin keeps `entity.piglin.angry`.
     #[test]
-    fn a_brute_names_the_brute_growl() {
+    fn a_brute_with_a_target_selects_the_fight_activity() {
         let mut brute = mob(Species::PiglinBrute);
         brute.ai.target = Some(Who::Player);
         assert_eq!(activity(&brute), Activity::Fight);
+    }
+
+    /// The growl itself, with the activity switch.
+    #[test]
+    #[ignore = "daily"]
+    fn a_brute_names_the_brute_growl() {
+        let mut brute = mob(Species::PiglinBrute);
+        brute.ai.target = Some(Who::Player);
         // The switch itself takes a level; it runs where the vanilla data is.
-        with_test_world(&[], |w, _| {
-            let mut events = Vec::new();
-            update_activity(&mut brute, w, &mut events);
-            assert_eq!(sounds(&events), ["entity.piglin_brute.angry"]);
-            brute.ai.target = None;
-            let mut events = Vec::new();
-            update_activity(&mut brute, w, &mut events);
-            assert!(sounds(&events).is_empty());
-            let mut piglin = mob(Species::Piglin);
-            piglin.ai.target = Some(Who::Player);
-            let mut events = Vec::new();
-            update_activity(&mut piglin, w, &mut events);
-            assert_eq!(sounds(&events), ["entity.piglin.angry"]);
-        });
+        assert!(
+            with_test_world(&[], |w, _| {
+                let mut events = Vec::new();
+                update_activity(&mut brute, w, &mut events);
+                assert_eq!(sounds(&events), ["entity.piglin_brute.angry"]);
+                brute.ai.target = None;
+                let mut events = Vec::new();
+                update_activity(&mut brute, w, &mut events);
+                assert!(sounds(&events).is_empty());
+                let mut piglin = mob(Species::Piglin);
+                piglin.ai.target = Some(Who::Player);
+                let mut events = Vec::new();
+                update_activity(&mut piglin, w, &mut events);
+                assert_eq!(sounds(&events), ["entity.piglin.angry"]);
+            }),
+            "vanilla data is missing"
+        );
     }
 
     /// `PiglinBruteAi.maybePlayActivitySound`: the level random is drawn on
@@ -2180,7 +2481,7 @@ mod brute_sound_tests {
     #[test]
     fn the_growl_roll_draws_every_tick_and_only_sounds_in_a_fight() {
         let mut brute = mob(Species::PiglinBrute);
-        let mut lr = LegacyRandom::new(7);
+        let mut lr = crate::mobs::world::level_random(7);
         let mut control = LegacyRandom::new(7);
         let mut events = Vec::new();
         let mut growls = 0;
@@ -2216,9 +2517,50 @@ mod hurt_broadcast_tests {
         Mob::new(id, kind, at, 0.0)
     }
 
+    #[test]
+    fn hoglin_broadcast_selection_proposes_without_mutating() {
+        let mut receiver = mob(1, Species::Hoglin, Vec3::ZERO);
+        let near = Who::Mob(2);
+        let far = Who::Mob(3);
+        let position = |who, _current| match who {
+            Who::Mob(2) => Some(Vec3::new(2.0, 0.0, 0.0)),
+            Who::Mob(3) => Some(Vec3::new(4.0, 0.0, 0.0)),
+            Who::Player => Some(Vec3::new(4.0, 0.0, 0.0)),
+            _ => None,
+        };
+        assert_eq!(receive_attack_target(&receiver, far, position), Some(far));
+        assert_eq!(receiver.ai.target, None);
+        receiver.extra.ints[0] = 1;
+        assert_eq!(receive_attack_target(&receiver, near, position), None);
+        receiver.extra.ints[0] = 0;
+        receiver.ai.target = Some(near);
+        assert_eq!(receive_attack_target(&receiver, far, position), None);
+        receiver.ai.target = Some(far);
+        assert_eq!(receive_attack_target(&receiver, near, position), Some(near));
+        assert_eq!(receiver.ai.target, Some(far));
+        assert_eq!(
+            receive_attack_target(&receiver, near, |_, _| position(near, false)),
+            Some(near)
+        );
+        assert_eq!(
+            receive_attack_target(&receiver, Who::Mob(4), position),
+            None
+        );
+        receiver.ai.target = Some(Who::Mob(4));
+        assert_eq!(receive_attack_target(&receiver, near, position), Some(near));
+        receiver.ai.target = Some(Who::Player);
+        assert_eq!(receive_attack_target(&receiver, near, position), Some(near));
+        receiver.ai.target = Some(far);
+        assert_eq!(
+            receive_attack_target(&receiver, Who::Player, position),
+            Some(Who::Player)
+        );
+    }
+
     /// `PiglinBruteAi.wasHurtBy` is `PiglinAi.maybeRetaliate`, which calls the adult piglins
     /// around it, the regular ones too (#7790).
     #[test]
+    #[ignore = "daily"]
     fn a_brute_hit_by_the_player_calls_the_piglins_around_it() {
         let mut events = Vec::new();
         let ran = with_test_world(&[], |w, _| {
@@ -2228,9 +2570,9 @@ mod hurt_broadcast_tests {
             brute.ai.last_hurt_by = Some(Who::Player);
             brute.ai.last_hurt_by_time = 5;
             let piglin = mob(2, Species::Piglin, Vec3::new(3.0, 64.0, 0.0));
-            let others = [piglin.seen(None)];
+            let others = [piglin.seen(None, &crate::items::Items::empty())];
             w.others = &others;
-            let mut lr = LegacyRandom::new(1);
+            let mut lr = crate::mobs::world::level_random(1);
             before_goals(&mut brute, &w, &mut lr, &mut events);
         });
         if !ran {
@@ -2253,6 +2595,7 @@ mod hurt_broadcast_tests {
 mod crossbow_tests {
     use super::*;
     use crate::mobs::sensor_scan_tests::kind;
+    use crate::mobs::world::level_random;
     use horizon_core::geometry::Vec3;
     use std::sync::Arc;
 
@@ -2262,6 +2605,54 @@ mod crossbow_tests {
         k.id = "minecraft:piglin".into();
         k.species = Species::Piglin;
         Mob::new(1, kind, Vec3::ZERO, 0.0)
+    }
+
+    #[test]
+    fn admired_item_drops_when_killed_without_a_player() {
+        use crate::mobs::drops::{Death, Drop, die};
+        use crate::random_sequences::RandomSequences;
+        use horizon_world::loot::{LootData, PackOverlay};
+
+        let root =
+            std::env::temp_dir().join(format!("horizon-piglin-drop-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("data/minecraft/loot_table")).unwrap();
+        std::fs::write(root.join("items.json"), "{}").unwrap();
+        let defaults = horizon_world::item_defaults::read(&root).unwrap();
+        let loot = LootData::load(&root, &PackOverlay::default(), &defaults).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let death = Death {
+            loot: &loot,
+            damage: None,
+            player: None,
+            player_killed: false,
+            luck: 0.0,
+            vehicle: None,
+            mob_drops: true,
+            world_seed: 0,
+        };
+        let mut apple = piglin();
+        hold_in_offhand(
+            &mut apple,
+            crate::items::ItemStack::new("minecraft:golden_apple", 1),
+        );
+        assert!(apple.persistent);
+        let mut m = piglin();
+        hold_in_offhand(
+            &mut m,
+            crate::items::ItemStack::new("minecraft:gold_ingot", 1),
+        );
+        assert!(!m.persistent);
+        let (drops, _) = die(
+            &mut m,
+            &death,
+            &mut RandomSequences::default(),
+            &mut level_random(7),
+        );
+        assert!(
+            drops.iter().any(
+                |drop| matches!(drop, Drop::Item(item) if item.item == "minecraft:gold_ingot")
+            )
+        );
     }
 
     /// The spawn weapon is equipped after the goals are registered, so the
@@ -2328,12 +2719,77 @@ mod crossbow_tests {
 #[cfg(test)]
 mod conversion_tests {
     use super::*;
-    use crate::mobs::world::with_test_world;
+    use crate::mobs::world::{level_random, with_test_world};
+
+    #[test]
+    #[ignore = "daily"]
+    fn converting_piglin_drops_its_inventory_before_conversion() {
+        let ran = with_test_world(&[], |w, types| {
+            let at = [0.5, 64.0, 0.5];
+            let mut m = Mob::new(
+                1,
+                std::sync::Arc::new(types.types["minecraft:piglin"].clone()),
+                Vec3::new(at[0], at[1], at[2]),
+                0.0,
+            );
+            let stacks = vec![
+                crate::items::ItemStack {
+                    item: "minecraft:gold_nugget".into(),
+                    count: 7,
+                    damage: 0,
+                    extra: None,
+                },
+                crate::items::ItemStack {
+                    item: "minecraft:gold_ingot".into(),
+                    count: 3,
+                    damage: 0,
+                    extra: None,
+                },
+            ];
+            m.extra.inventory = stacks.clone();
+            m.extra.set_slot_id(
+                horizon_items::equipment::OFFHAND,
+                Some("minecraft:gold_ingot".into()),
+            );
+            m.extra.using_item = 60;
+            m.extra.counter2 = CONVERSION + 1;
+            let mut events = Vec::new();
+            ai_step(&mut m, w, &mut level_random(0), &mut events);
+            let relevant: Vec<_> = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        MobEvent::DropItem { .. }
+                            | MobEvent::DropStack { .. }
+                            | MobEvent::Convert { .. }
+                    )
+                })
+                .collect();
+            assert!(
+                matches!(relevant.as_slice(), [MobEvent::DropItem { .. }, MobEvent::DropStack { stack: a, at: p, .. }, MobEvent::DropStack { stack: b, .. }, MobEvent::Convert { from, .. }] if *a == stacks[0] && *b == stacks[1] && *p == at && from.extra.inventory.is_empty())
+            );
+            // `AbstractPiglin.finishConversion` leaves the new mob nauseous:
+            // the step rides on the event, not on the new mob's type.
+            let after = relevant
+                .iter()
+                .find_map(|e| match e {
+                    MobEvent::Convert { after, .. } => Some(*after),
+                    _ => None,
+                })
+                .expect("the piglin converts");
+            assert_eq!(after, super::super::conversion::After::Nausea);
+            assert!(m.extra.inventory.is_empty());
+        });
+        // Without the vanilla data there is nothing to check.
+        assert!(ran, "vanilla data is missing");
+    }
 
     /// `Piglin.finishConversion` cancels the admire before it converts: the
     /// item in the off hand is dropped at the piglin's feet and the zombified
     /// piglin does not carry it, where Horizon used to hand it over.
     #[test]
+    #[ignore = "daily"]
     fn a_converted_piglin_drops_the_item_it_was_admiring() {
         let ran = with_test_world(&[], |w, types| {
             let mut m = Mob::new(
@@ -2342,10 +2798,13 @@ mod conversion_tests {
                 Vec3::new(0.5, 64.0, 0.5),
                 0.0,
             );
-            m.extra.off_hand = Some("minecraft:gold_ingot".into());
+            m.extra.set_slot_id(
+                horizon_items::equipment::OFFHAND,
+                Some("minecraft:gold_ingot".into()),
+            );
             m.extra.using_item = 60;
             m.extra.counter2 = CONVERSION + 1;
-            let mut lr = LegacyRandom::new(0);
+            let mut lr = level_random(0);
             let mut events = Vec::new();
             ai_step(&mut m, w, &mut lr, &mut events);
             assert!(
@@ -2363,9 +2822,62 @@ mod conversion_tests {
                     _ => None,
                 })
                 .expect("the piglin converts");
-            assert_eq!(from.extra.off_hand, None, "the new mob carries nothing");
+            assert_eq!(
+                from.extra.off_hand_id(),
+                None,
+                "the new mob carries nothing"
+            );
         });
-        let _ = ran;
+        assert!(ran, "vanilla data is missing");
+    }
+}
+
+#[cfg(test)]
+mod cannot_hunt_save_tests {
+    use super::*;
+    use horizon_core::nbt::Tag;
+
+    fn piglin() -> Mob {
+        let mut kind = crate::mobs::sensor_scan_tests::kind();
+        let k = std::sync::Arc::make_mut(&mut kind);
+        k.id = "minecraft:piglin".into();
+        k.species = Species::Piglin;
+        Mob::new(1, kind, Vec3::ZERO, 0.0)
+    }
+
+    fn saved(cannot_hunt: Option<i8>) -> Tag {
+        let mut fields = vec![
+            ("id", Tag::String("minecraft:piglin".into())),
+            (
+                "Pos",
+                Tag::List(vec![
+                    Tag::Double(0.0f64.to_bits()),
+                    Tag::Double(64.0f64.to_bits()),
+                    Tag::Double(0.0f64.to_bits()),
+                ]),
+            ),
+        ];
+        if let Some(value) = cannot_hunt {
+            fields.push(("CannotHunt", Tag::Byte(value)));
+        }
+        Tag::compound(fields)
+    }
+
+    /// `Piglin.readAdditionalSaveData` reads `CannotHunt` with
+    /// `getBooleanOr`, and `addAdditionalSaveData` always writes it. Horizon
+    /// wrote a hardcoded 0 and never read it back, so a piglin that had
+    /// `cannotHunt` set could hunt hoglins again after a reload.
+    #[test]
+    fn a_saved_cannot_hunt_is_read_and_written_back() {
+        let template = piglin();
+        let types = [("minecraft:piglin".into(), template.kind)].into();
+        for (raw, expected) in [(Some(1), true), (Some(0), false), (None, false)] {
+            let m = crate::entity_nbt::mob_from_nbt(&saved(raw), &types, 1, None).unwrap();
+            assert_eq!(m.extra.piglin.cannot_hunt, expected);
+            assert_eq!(can_hunt(&m), !expected);
+            let out = crate::entity_nbt::mob_to_nbt(&m, [1, 2, 3, 4], None, None, |_| None);
+            assert_eq!(out.get("CannotHunt"), Some(&Tag::Byte(i8::from(expected))));
+        }
     }
 }
 
@@ -2417,74 +2929,247 @@ mod brute_home_tests {
     /// that is near home, past a hundred blocks, or without the memory does
     /// not.
     #[test]
+    #[ignore = "daily"]
     fn a_brute_that_wanders_off_walks_back_home() {
-        with_built_test_world(&[], build, |w, _| {
-            let mut lr = LegacyRandom::new(3);
-            let mut events = Vec::new();
-            for (label, home, walks) in [
-                ("far enough to walk back", Some([24, 0, 0]), true),
-                ("near home", Some([5, 0, 0]), false),
-                ("past the memory's reach", Some([120, 0, 0]), false),
-                ("no home", None, false),
-            ] {
-                let mut m = brute(Vec3::new(0.5, 0.0, 0.5), home);
-                register_brute(&mut m);
-                let mut cx = Cx {
-                    w,
-                    lr: &mut lr,
-                    events: &mut events,
-                };
-                let (running, target) = tick_goals(&mut m, &mut cx);
-                if walks {
-                    assert!(running, "{label}: the brute sets off home");
-                    assert_eq!(target, home, "{label}: and the walk ends at home");
-                } else {
-                    assert!(!running, "{label}: no walk home");
-                    assert_eq!(target, None, "{label}: and no path");
+        assert!(
+            with_built_test_world(&[], build, |w, _| {
+                let mut test_level = crate::health::TestLevel::new(3);
+                let mut events = Vec::new();
+                for (label, home, walks) in [
+                    ("far enough to walk back", Some([24, 0, 0]), true),
+                    ("near home", Some([5, 0, 0]), false),
+                    ("past the memory's reach", Some([120, 0, 0]), false),
+                    ("no home", None, false),
+                ] {
+                    let mut m = brute(Vec3::new(0.5, 0.0, 0.5), home);
+                    register_brute(&mut m);
+                    let mut cx = Cx {
+                        w,
+                        level: &mut test_level.level(),
+                        events: &mut events,
+                    };
+                    let (running, target) = tick_goals(&mut m, &mut cx);
+                    if walks {
+                        assert!(running, "{label}: the brute sets off home");
+                        assert_eq!(target, home, "{label}: and the walk ends at home");
+                    } else {
+                        assert!(!running, "{label}: no walk home");
+                        assert_eq!(target, None, "{label}: and no path");
+                    }
                 }
-            }
-        });
+            }),
+            "vanilla data is missing"
+        );
     }
     /// `StrollToPoi.nextOkStartTime`: after a try the brute waits 80 ticks before the
     /// next one, so a home out of reach is not searched for on every tick.
     #[test]
+    #[ignore = "daily"]
     fn a_brute_tries_the_way_home_once_every_80_ticks() {
-        with_built_test_world(&[], build, |w, _| {
-            let mut lr = LegacyRandom::new(3);
-            let mut events = Vec::new();
-            let mut cx = Cx {
-                w,
-                lr: &mut lr,
-                events: &mut events,
-            };
-            let mut m = brute(Vec3::new(0.5, 0.0, 0.5), Some([24, 0, 0]));
-            let mut goal = BruteStrollHome { next_ok: 0 };
-            assert!(goal.can_use(&mut m, &mut cx), "the first try finds a path");
-            m.ai.pending_path = None;
-            assert!(
-                !goal.can_use(&mut m, &mut cx),
-                "no second search in the same 80 ticks"
-            );
-            assert_eq!(goal.next_ok, w.game_time + 80);
-        });
+        assert!(
+            with_built_test_world(&[], build, |w, _| {
+                let mut test_level = crate::health::TestLevel::new(3);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w,
+                    level: &mut test_level.level(),
+                    events: &mut events,
+                };
+                let mut m = brute(Vec3::new(0.5, 0.0, 0.5), Some([24, 0, 0]));
+                let mut goal = BruteStrollHome { next_ok: 0 };
+                assert!(goal.can_use(&mut m, &mut cx), "the first try finds a path");
+                m.ai.pending_path = None;
+                assert!(
+                    !goal.can_use(&mut m, &mut cx),
+                    "no second search in the same 80 ticks"
+                );
+                assert_eq!(goal.next_ok, w.game_time + 80);
+            }),
+            "vanilla data is missing"
+        );
     }
     /// `PiglinBruteAi.wasHurtBy` erases nothing: a hit does not cost the brute
     /// the home it walks back to. `PiglinAi.wasHurtBy` erases
     /// CELEBRATE_LOCATION, which is the same field for a piglin.
     #[test]
+    #[ignore = "daily"]
     fn a_hit_leaves_the_brutes_home_alone() {
-        with_built_test_world(&[], build, |w, _| {
-            let mut lr = LegacyRandom::new(5);
-            let mut events = Vec::new();
-            let mut m = brute(Vec3::new(0.5, 0.0, 0.5), Some([24, 0, 0]));
-            piglin_hurt(&mut m, w, &mut lr, &mut events, Who::Mob(999));
-            assert_eq!(m.extra.home, Some([24, 0, 0]), "the brute keeps it");
-            let mut kind = kind();
-            Arc::make_mut(&mut kind).species = Species::Piglin;
-            let mut piglin = Mob::new(2, kind, Vec3::new(0.5, 0.0, 0.5), 0.0);
-            piglin.extra.home = Some([24, 0, 0]);
-            piglin_hurt(&mut piglin, w, &mut lr, &mut events, Who::Mob(999));
-            assert_eq!(piglin.extra.home, None, "the piglin drops its celebration");
+        assert!(
+            with_built_test_world(&[], build, |w, _| {
+                let mut lr = crate::mobs::world::level_random(5);
+                let mut events = Vec::new();
+                let mut m = brute(Vec3::new(0.5, 0.0, 0.5), Some([24, 0, 0]));
+                piglin_hurt(&mut m, w, &mut lr, &mut events, Who::Mob(999));
+                assert_eq!(m.extra.home, Some([24, 0, 0]), "the brute keeps it");
+                let mut kind = kind();
+                Arc::make_mut(&mut kind).species = Species::Piglin;
+                let mut piglin = Mob::new(2, kind, Vec3::new(0.5, 0.0, 0.5), 0.0);
+                piglin.extra.home = Some([24, 0, 0]);
+                piglin_hurt(&mut piglin, w, &mut lr, &mut events, Who::Mob(999));
+                assert_eq!(piglin.extra.home, None, "the piglin drops its celebration");
+            }),
+            "vanilla data is missing"
+        );
+    }
+    /// `ATE_RECENTLY` is separate from hunt cooldown and shields in offhand are retained.
+    #[test]
+    fn piglin_eat_separate_from_hunt_timer_and_retains_shield() {
+        let mut kind = kind();
+        Arc::make_mut(&mut kind).species = Species::Piglin;
+        let mut piglin = Mob::new(3, kind, Vec3::new(0.5, 0.0, 0.5), 0.0);
+        piglin.extra.ints[0] = 1200;
+        eat(&mut piglin);
+        assert_eq!(piglin.extra.ints[0], 1200);
+        assert!(has_eaten_recently(&piglin));
+        piglin.extra.set_slot_id(
+            horizon_items::equipment::OFFHAND,
+            Some("minecraft:shield".into()),
+        );
+        stop_admiring(&mut piglin);
+        assert_eq!(piglin.extra.off_hand_id(), Some("minecraft:shield"));
+    }
+}
+
+#[cfg(test)]
+mod hoglin_pacified_feeding_tests {
+    use super::*;
+    use crate::mobs::ai::{feed_animal, takes_food};
+    use crate::mobs::sensor_scan_tests::kind;
+    use crate::mobs::world::with_built_test_world;
+    use horizon_world::registry::BlockRegistry;
+    use std::sync::Arc;
+
+    /// A stone floor under the origin and, at `(3, 0, 0)`, a warped fungus
+    /// (one of `#hoglin_repellents`) while `repellent` is set.
+    fn build(repellent: bool) -> impl FnOnce(&mut crate::world::World, &BlockRegistry) {
+        move |world, registry| {
+            let stone = registry.default_state("minecraft:stone").unwrap();
+            for cx in -4..4 {
+                for cz in -4..4 {
+                    world
+                        .chunks
+                        .insert((cx, cz), Arc::new(crate::chunk::Chunk::empty(cx, cz)));
+                }
+            }
+            for x in -64..64 {
+                for z in -64..64 {
+                    world.set(x, -1, z, stone).unwrap();
+                }
+            }
+            if repellent {
+                let fungus = registry.default_state("minecraft:warped_fungus").unwrap();
+                world.set(3, 0, 0, fungus).unwrap();
+            }
+        }
+    }
+    /// A hoglin of `age` on the floor at the origin.
+    fn hoglin(age: i32) -> Mob {
+        let mut kind = kind();
+        Arc::make_mut(&mut kind).species = Species::Hoglin;
+        let mut m = Mob::new(20, kind, Vec3::new(0.5, 0.0, 0.5), 0.0);
+        m.extra.age = age;
+        m
+    }
+    /// `HoglinAi.isPacified`: the `PACIFIED` memory, which the hoglin keeps in
+    /// `extra.ints[0]`.
+    fn pacified(m: &Mob) -> bool {
+        m.extra.ints[0] > 0
+    }
+    /// Ticks the hoglin's per-tick piglin state `n` times (`ai_step` calls
+    /// `hoglin_repellent` for a live hoglin): the sensor every 20 ticks, the
+    /// `PACIFIED` countdown every tick. Twenty ticks always hold one sensor
+    /// tick.
+    fn tick(m: &mut Mob, w: &MobWorld, n: usize) {
+        for _ in 0..n {
+            m.age += 1;
+            hoglin_repellent(m, w);
+        }
+    }
+    /// Without any world (CI has no vanilla data): the `PACIFIED` memory alone
+    /// makes an adult refuse its food, and a baby still grows.
+    #[test]
+    fn the_pacified_memory_alone_refuses_an_adult_and_lets_a_baby_grow() {
+        let mut level = LegacyRandom::new(0);
+        let mut adult = hoglin(0);
+        assert!(takes_food(&adult), "an unpacified adult breeds");
+        adult.extra.ints[0] = 200;
+        assert!(!takes_food(&adult), "a pacified adult refuses its food");
+        assert!(feed_animal(&mut adult, &mut level, None).is_none());
+        assert_eq!(adult.extra.in_love, 0);
+
+        let mut baby = hoglin(-24000);
+        baby.extra.ints[0] = 200;
+        assert!(feed_animal(&mut baby, &mut level, None).is_some());
+        assert_eq!(baby.extra.age, -24000 + 120 * 20, "a tenth of the growth");
+    }
+    /// `Hoglin.canFallInLove` is
+    /// `!HoglinAi.isPacified(this) && super.canFallInLove()`, so
+    /// `Animal.mobInteract` refuses the crimson fungus of an
+    /// adult pacified by a nearby repellent: no food used, no love, no baby.
+    /// The baby's branch asks `canAgeUp`, not `canFallInLove`, so a pacified
+    /// baby still grows up, and no other species reads the hoglin's memory.
+    #[test]
+    #[ignore = "daily"]
+    fn a_pacified_hoglin_refuses_breeding_food_and_a_baby_still_grows() {
+        let mut level = LegacyRandom::new(0);
+        let ran = with_built_test_world(&[], build(true), |w, _| {
+            let mut adult = hoglin(0);
+            assert!(!pacified(&adult), "no repellent memory yet");
+            assert!(takes_food(&adult), "an adult away from fungus breeds");
+            tick(&mut adult, w, 20);
+            assert_eq!(adult.extra.repellent, Some([3, 0, 0]), "the sensor sees it");
+            assert!(pacified(&adult), "and the hoglin turns passive");
+            assert!(!takes_food(&adult), "a pacified adult refuses its food");
+            assert!(
+                feed_animal(&mut adult, &mut level, None).is_none(),
+                "so the fungus is not eaten"
+            );
+            assert_eq!(adult.extra.in_love, 0, "and it does not fall in love");
+
+            let mut baby = hoglin(-24000);
+            tick(&mut baby, w, 20);
+            assert!(pacified(&baby), "the baby is pacified too");
+            assert!(takes_food(&baby), "but it still takes food to grow");
+            assert!(feed_animal(&mut baby, &mut level, None).is_some());
+            assert_eq!(baby.extra.age, -24000 + 120 * 20, "a tenth of the growth");
+            assert_eq!(baby.extra.in_love, 0, "a baby never falls in love");
+
+            let mut cow = kind();
+            Arc::make_mut(&mut cow).id = "minecraft:cow".into();
+            let mut cow = Mob::new(21, cow, Vec3::new(0.5, 0.0, 0.5), 0.0);
+            cow.extra.ints[0] = 200;
+            assert!(takes_food(&cow), "another species ignores the memory");
         });
+        assert!(ran, "vanilla data is missing");
+    }
+    /// `BecomePassiveIfMemoryPresent.create(NEAREST_REPELLENT, 200)` sets
+    /// `PACIFIED` for 200 ticks while the sensor holds the repellent, and the
+    /// sensor drops it as soon as no repellent is in reach: walking away from
+    /// the fungus keeps the adult refusing food for the rest of the 200 ticks,
+    /// then it breeds again (`HoglinAi.wasHurtBy` is the other way out).
+    #[test]
+    #[ignore = "daily"]
+    fn pacification_outlives_the_repellent_by_200_ticks() {
+        let mut level = LegacyRandom::new(0);
+        let ran = with_built_test_world(&[], build(true), |w, _| {
+            let mut m = hoglin(0);
+            tick(&mut m, w, 20);
+            assert!(pacified(&m));
+            // Out of `HoglinSpecificSensor`'s reach (8 sideways, 4 up or down).
+            m.position = Vec3::new(40.5, 0.0, 0.5);
+            tick(&mut m, w, 20);
+            assert_eq!(m.extra.repellent, None, "the sensor lost the fungus");
+            assert!(pacified(&m), "but PACIFIED still has 180 ticks left");
+            assert!(!takes_food(&m));
+            assert!(feed_animal(&mut m, &mut level, None).is_none());
+            assert_eq!(m.extra.in_love, 0);
+
+            tick(&mut m, w, 180);
+            assert!(!pacified(&m), "PACIFIED expires after 200 ticks");
+            assert!(takes_food(&m), "the adult breeds again");
+            assert!(feed_animal(&mut m, &mut level, None).is_some());
+            assert_eq!(m.extra.in_love, 600);
+        });
+        assert!(ran, "vanilla data is missing");
     }
 }

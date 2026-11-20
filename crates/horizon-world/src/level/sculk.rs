@@ -6,7 +6,10 @@ use super::{
     classes::Class,
     update::{above, below, rel},
 };
-use crate::{fluid::FluidState, registry::BlockStateId};
+use crate::{
+    fluid::{FluidKind, FluidState},
+    registry::BlockStateId,
+};
 use horizon_core::{geometry::Direction, position::BlockPos, random::RandomSource};
 
 /// `SculkSensorBlock.ACTIVE_TICKS` (calibrated sensors use 10).
@@ -94,6 +97,13 @@ pub fn unpack_faces(data: i32) -> Vec<Direction> {
         .into_iter()
         .filter(|d| data & (1 << *d as i32) != 0)
         .collect()
+}
+
+/// `FluidState.is(Fluids.WATER)`: the source water fluid, which every
+/// waterlogged state holds (`Fluids.WATER.getSource(...)`), but neither
+/// flowing water nor another fluid.
+fn is_water(fluid: FluidState) -> bool {
+    fluid.kind() == FluidKind::Water
 }
 
 impl<L: LevelAccess + ?Sized> Sim<'_, L> {
@@ -326,8 +336,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
 
     /// `ChargeCursor.update`.
     fn sculk_cursor_update(&mut self, cursor: &mut ChargeCursor, origin: BlockPos, veins: bool) {
-        // shouldUpdate: charge left and the origin's chunk is ticking.
-        if cursor.charge <= 0 || !self.level.is_ticking_chunk(origin.chunk()) {
+        // shouldUpdate: charge left and the origin is in block-ticking ticket range.
+        if cursor.charge <= 0 || !self.level.should_tick_blocks_at(origin.chunk()) {
             return;
         }
         if cursor.update_delay > 0 {
@@ -382,8 +392,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 }
                 Some(faces) if !faces.is_empty() => {
                     let b = self.b;
-                    let water = b.is_block(state, b.named.water) && b.fluid(state).is_source();
-                    if !b.is_air(state) && !water {
+                    if !b.is_air(state) && !is_water(b.fluid(state)) {
                         return false;
                     }
                     return self.sculk_regrow(pos, state, faces);
@@ -478,7 +487,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         let b = self.b;
         let base = if self.is_vein(old) {
             old
-        } else if b.fluid(old) == FluidState::WATER {
+        } else if is_water(b.fluid(old)) {
             b.table
                 .set_bool(b.default_of(b.named.sculk_vein), b.props.waterlogged, true)
         } else {
@@ -507,8 +516,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             }
         }
         let fluid = b.fluid(existing);
-        if fluid != FluidState::EMPTY && !(b.is_block(existing, b.named.water) && fluid.is_source())
-        {
+        if fluid != FluidState::EMPTY && !is_water(fluid) {
             return false;
         }
         if self.sculk_in_tag(existing, "minecraft:fire") {
@@ -646,6 +654,11 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 continue;
             }
             let default_sculk = self.b.default_of(self.b.named.sculk);
+            self.emit(LevelEvent::BlockEvent {
+                pos: support_pos,
+                state: support_state,
+                kind: "push_entities_up",
+            });
             self.set_block_and_update(support_pos, default_sculk);
             self.sculk_sound(support_pos, "minecraft:block.sculk.spread", 1.0, 1.0);
             self.sculk_spread_all(default_sculk, support_pos, &ALL_SPREADS);

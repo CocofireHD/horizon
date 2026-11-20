@@ -1,7 +1,13 @@
 package dev.horizonlab.parity;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonNull;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Optional;
 import net.minecraft.client.multiplayer.resolver.AddressCheck;
 import net.minecraft.client.multiplayer.resolver.ResolvedServerAddress;
@@ -13,6 +19,32 @@ import net.minecraft.client.multiplayer.resolver.ServerRedirectHandler;
 /** ConnectScreen.startConnecting uses the resolved socket's host and port for login. */
 public final class VanillaServerAddressOracle {
     public static void main(String[] args) throws Exception {
+        if (args.length == 2) {
+            JsonArray output = new JsonArray();
+            try (var reader = Files.newBufferedReader(Path.of(args[0]))) {
+                for (var input : JsonParser.parseReader(reader).getAsJsonArray()) {
+                    String text = input.getAsString();
+                    JsonObject result = new JsonObject();
+                    result.addProperty("valid", ServerAddress.isValidAddress(text));
+                    try {
+                        var address = ServerAddress.parseString(text);
+                        if (address == null) {
+                            result.add("parsed", JsonNull.INSTANCE);
+                        } else {
+                            JsonArray parsed = new JsonArray();
+                            parsed.add(address.getHost());
+                            parsed.add(address.getPort());
+                            result.add("parsed", parsed);
+                        }
+                    } catch (RuntimeException error) {
+                        result.add("parsed", JsonNull.INSTANCE);
+                    }
+                    output.add(result);
+                }
+            }
+            Files.writeString(Path.of(args[1]), output.toString());
+            return;
+        }
         AddressCheck allow = new AddressCheck() {
             public boolean isAllowed(ResolvedServerAddress address) { return true; }
             public boolean isAllowed(ServerAddress address) { return true; }

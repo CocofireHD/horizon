@@ -6,60 +6,12 @@
 //! drawing so the parity fixture can compare them with the vanilla client.
 use crate::{font::Font, text::Text};
 use horizon_core::random::{LegacyRandom, RandomSource};
+pub use mod_api::client::hud_layout::{Blend, HealthInputs, HeartKind, PoseOp};
 use std::borrow::Cow;
-
-/// A `Matrix3x2fStack` operation applied to a copy of the current pose.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PoseOp {
-    Translate(f32, f32),
-    Scale(f32, f32),
-}
-
-/// A JOML `Matrix3x2f` as `[m00, m01, m10, m11, m20, m21]`.
-pub type Pose = [f32; 6];
-pub const IDENTITY: Pose = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-
-/// Applies `op` like JOML's `translate` / `scale` (same float order).
-pub fn pose_apply(m: &mut Pose, op: PoseOp) {
-    match op {
-        PoseOp::Translate(x, y) => {
-            m[4] += m[0] * x + m[2] * y;
-            m[5] += m[1] * x + m[3] * y;
-        }
-        PoseOp::Scale(x, y) => {
-            m[0] *= x;
-            m[1] *= x;
-            m[2] *= y;
-            m[3] *= y;
-        }
-    }
-}
-
-/// The render pipeline of a texture blit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Blend {
-    /// `GUI_TEXTURED`.
-    Textured,
-    /// `VIGNETTE`: `dst * (1 - src)`.
-    Vignette,
-    /// `GUI_NAUSEA_OVERLAY`: additive.
-    Nausea,
-    /// `CROSSHAIR`: `BlendFunction.INVERT`, the colour under it inverted.
-    Crosshair,
-}
-impl Blend {
-    pub fn pipeline(self) -> &'static str {
-        match self {
-            Blend::Textured => "pipeline/gui_textured",
-            Blend::Vignette => "pipeline/vignette",
-            Blend::Nausea => "pipeline/gui_nausea_overlay",
-            Blend::Crosshair => "pipeline/crosshair",
-        }
-    }
-}
 
 /// One `GuiGraphicsExtractor` call.
 #[derive(Clone, Debug, PartialEq)]
+// exhaustive: a closed set the game matches without a wildcard
 pub enum GuiDraw {
     /// `blitSprite(pipeline, sprite, x, y, w, h, color)`; `region` =
     /// (spriteW, spriteH, u, v) for the partial overload.
@@ -105,6 +57,18 @@ pub enum GuiDraw {
         y1: i32,
         color: u32,
     },
+    /// `fillGradient(x0, y0, x1, y1, top, bottom)`: ARGB `top` along the `y0` edge
+    /// blending to `bottom` along the `y1` edge, in the current pose and clip.
+    /// Zero area or inversion on exactly one axis draws nothing. With both axes inverted,
+    /// bounds are sorted and colours flipped: `top` stays on `y0`, now the lower edge.
+    FillGradient {
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        top: u32,
+        bottom: u32,
+    },
     /// `text(font, text, x, y, argb, dropShadow)`.
     Text {
         text: Text,
@@ -129,7 +93,44 @@ pub enum GuiDraw {
     Pop,
 }
 
+/// A JOML `Matrix3x2f` as `[m00, m01, m10, m11, m20, m21]`.
+pub type Pose = [f32; 6];
+pub const IDENTITY: Pose = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// Applies `op` like JOML's `translate` / `scale` (same float order).
+pub fn pose_apply(m: &mut Pose, op: PoseOp) {
+    match op {
+        PoseOp::Translate(x, y) => {
+            m[4] += m[0] * x + m[2] * y;
+            m[5] += m[1] * x + m[3] * y;
+        }
+        PoseOp::Scale(x, y) => {
+            m[0] *= x;
+            m[1] *= x;
+            m[2] *= y;
+            m[3] *= y;
+        }
+    }
+}
+
 pub const WHITE: u32 = 0xFFFF_FFFF;
+
+/// The highest top, in GUI px, of the draws that sit on the view (`None` for none): where a row
+/// of the HUD begins.
+pub fn draws_top(draws: &[GuiDraw]) -> Option<i32> {
+    draws
+        .iter()
+        .filter_map(|d| match *d {
+            GuiDraw::Sprite { y, .. }
+            | GuiDraw::AtlasSprite { y, .. }
+            | GuiDraw::Blit { y, .. }
+            | GuiDraw::Text { y, .. }
+            | GuiDraw::Item { y, .. } => Some(y),
+            GuiDraw::Fill { y0, .. } | GuiDraw::FillGradient { y0, .. } => Some(y0),
+            GuiDraw::Push(_) | GuiDraw::Pop => None,
+        })
+        .min()
+}
 
 fn sprite(sprite: &'static str, x: i32, y: i32, w: i32, h: i32) -> GuiDraw {
     GuiDraw::Sprite {
@@ -237,24 +238,6 @@ pub fn multiply(l: u32, r: u32) -> u32 {
 /// `Mth.lerpDiscrete`.
 pub fn lerp_discrete(alpha: f32, p0: i32, p1: i32) -> i32 {
     p0 + floor(alpha * (p1 - p0 - 1) as f32) + i32::from(alpha > 0.0)
-}
-/// `Mth.hsvToArgb`.
-pub fn hsv_to_argb(hue: f32, saturation: f32, value: f32, alpha: u32) -> u32 {
-    let h = (hue * 6.0) as i32 % 6;
-    let f = hue * 6.0 - h as f32;
-    let p = value * (1.0 - saturation);
-    let q = value * (1.0 - f * saturation);
-    let t = value * (1.0 - (1.0 - f) * saturation);
-    let (r, g, b) = match h {
-        0 => (value, t, p),
-        1 => (q, value, p),
-        2 => (p, value, t),
-        3 => (p, q, value),
-        4 => (t, p, value),
-        _ => (value, p, q),
-    };
-    let c = |v: f32| ((v * 255.0) as i32).clamp(0, 255) as u32;
-    argb(alpha, c(r), c(g), c(b))
 }
 /// `Font.width` of styled text.
 pub fn width(font: &Font, t: &Text) -> i32 {
@@ -434,6 +417,19 @@ pub fn experience(
     bar: bool,
     width: &dyn Fn(&str) -> i32,
 ) -> Vec<GuiDraw> {
+    experience_colored([None; 2], w, h, progress, level, bar, width)
+}
+/// [`experience`] with a resource pack's level number colours (Polytone `text.xpbar`: the
+/// number's, then its outline's; `None` keeps vanilla's).
+pub fn experience_colored(
+    [number, outline]: [Option<u32>; 2],
+    w: i32,
+    h: i32,
+    progress: f32,
+    level: i32,
+    bar: bool,
+    width: &dyn Fn(&str) -> i32,
+) -> Vec<GuiDraw> {
     let mut out = Vec::new();
     if bar {
         let (left, top) = (w / 2 - 91, h - 32 + 3);
@@ -460,21 +456,14 @@ pub fn experience(
                 Text::literal(&text),
                 x + dx,
                 y + dy,
-                0xFF00_0000,
+                outline.map_or(0xFF00_0000, opaque),
                 false,
             );
         }
-        self::text(&mut out, Text::literal(text), x, y, 0xFF80_FF20, false);
+        let color = number.map_or(0xFF80_FF20, opaque);
+        self::text(&mut out, Text::literal(text), x, y, color, false);
     }
     out
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum HeartKind {
-    Normal,
-    Poisoned,
-    Withered,
-    Frozen,
 }
 
 /// State kept between frames (`Hud.lastHealth`, `displayHealth`, ...).
@@ -485,41 +474,11 @@ pub struct HealthHud {
     /// `Util.getMillis()` of the last health change.
     pub last_health_time: i64,
     pub health_blink_time: i64,
-    /// `Hud.leftHeight` and `rightHeight` once the health, armor, food, mount
-    /// and air layers have run; the selected item name and the action bar sit
-    /// above them.
-    pub left_height: i32,
-    pub right_height: i32,
     /// `Hud.lastBubblePopSoundPlayed`.
     pub last_bubble_pop_sound: i32,
     /// The `ui.hud.bubble_pop` volume and pitch `playAirBubblePoppedSound`
     /// asked for this frame; the caller plays it and clears it.
     pub bubble_pop_sound: Option<(f32, f32)>,
-}
-
-pub struct HealthInputs {
-    /// `Hud.tickCount`.
-    pub tick: i32,
-    /// `Util.getMillis()` now.
-    pub millis: i64,
-    pub health: f32,
-    pub max_health: f32,
-    pub absorption: f32,
-    pub armor: i32,
-    pub food: i32,
-    pub saturation: f32,
-    pub kind: HeartKind,
-    pub regeneration: bool,
-    pub hunger: bool,
-    pub hardcore: bool,
-    /// `damageCooldownTime > 0`.
-    pub damage_cooldown: bool,
-    /// `getAirSupply`, `getMaxAirSupply`, `isEyeInFluid(WATER)`.
-    pub air: i32,
-    pub max_air: i32,
-    pub under_water: bool,
-    /// `getVehicleMaxHearts` of the ridden living vehicle (0 = none).
-    pub vehicle_hearts: i32,
 }
 
 /// `Hud.getVehicleMaxHearts` for a vehicle that shows its health.
@@ -655,9 +614,6 @@ impl HealthHud {
         let rows = ceil((max_health + absorption as f32) / 2.0 / 10.0);
         let row_height = (10 - (rows - 2)).max(3);
         let mut y_air = y_base - 10;
-        self.left_height = 39 + (rows - 1) * row_height + 10 + if i.armor > 0 { 10 } else { 0 };
-        // The mount's heart rows (`extractVehicleHealth`); food adds its row below.
-        self.right_height = 39 + 10 * ((i.vehicle_hearts + 9) / 10);
         let offset_index = if i.regeneration {
             i.tick % ceil(max_health + 5.0)
         } else {
@@ -752,13 +708,11 @@ impl HealthHud {
                 }
             }
             y_air -= 10;
-            self.right_height += 10;
         }
         // Hud.extractAirBubbles.
         let max_air = i.max_air.max(1);
         let air = i.air.clamp(0, max_air);
         if i.under_water || air < max_air {
-            self.right_height += 10;
             let rows = (f64::from(i.vehicle_hearts) / 10.0).ceil() as i32;
             let y = y_air - (rows - 1) * 10;
             let bubble = |offset: i32| ceil(((air + offset) * 10) as f32 / max_air as f32);
@@ -845,7 +799,16 @@ pub fn paint(batch: &mut crate::hud::HudBatch, atlas: &crate::hud::HudAtlas, dra
                     r.u0 = u0;
                     r.v0 = v0;
                 }
-                batch.rect_uv(*x as f32, *y as f32, *w as f32, *h as f32, r, abgr(*color));
+                let at = [*x as f32, *y as f32, *w as f32, *h as f32];
+                match crate::hud::sprite_modifiers::draws(atlas, &name, r, at, abgr(*color)) {
+                    // A Polytone screen sprite modifier: the sprite changed, then its overlays.
+                    Some(draws) => {
+                        for d in draws {
+                            batch.rect_uv(d.at[0], d.at[1], d.at[2], d.at[3], d.rect, d.color);
+                        }
+                    }
+                    None => batch.rect_uv(at[0], at[1], at[2], at[3], r, abgr(*color)),
+                }
                 if *blend == Blend::Crosshair {
                     batch.invert_since(start);
                 }
@@ -909,6 +872,25 @@ pub fn paint(batch: &mut crate::hud::HudBatch, atlas: &crate::hud::HudAtlas, dra
                     abgr(*color),
                 );
             }
+            GuiDraw::FillGradient {
+                x0,
+                y0,
+                x1,
+                y1,
+                top,
+                bottom,
+            } => {
+                if x1 != x0 && y1 != y0 && (x1 > x0) == (y1 > y0) {
+                    let (x, y) = ((*x0).min(*x1) as f32, (*y0).min(*y1) as f32);
+                    let rect = (x, y, (*x0).max(*x1) as f32 - x, (*y0).max(*y1) as f32 - y);
+                    let (top, bottom) = if y1 > y0 {
+                        (*top, *bottom)
+                    } else {
+                        (*bottom, *top)
+                    };
+                    batch.fill_gradient(atlas, rect, abgr(top), abgr(bottom));
+                }
+            }
             GuiDraw::Text {
                 text,
                 x,
@@ -948,3 +930,16 @@ pub fn abgr(color: u32) -> u32 {
     let [a, r, g, b] = color.to_be_bytes();
     crate::hud::rgba(r, g, b, a)
 }
+
+/// A pack colour without an alpha drawn opaque, as `ARGB.opaque` makes it (one with alpha keeps it).
+fn opaque(color: u32) -> u32 {
+    if color >> 24 == 0 {
+        color | 0xFF00_0000
+    } else {
+        color
+    }
+}
+
+#[cfg(test)]
+#[path = "hud_layout_gradient_tests.rs"]
+mod gradient_tests;

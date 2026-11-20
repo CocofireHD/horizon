@@ -244,6 +244,7 @@ impl Fixture {
                 weather: false,
                 hand: false,
             },
+            &Default::default(),
         )
     }
 
@@ -268,7 +269,7 @@ impl Fixture {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let hud = HudBatch::new(size);
+        let hud = HudBatch::scratch(size);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         post.run(
             &self.device,
@@ -317,6 +318,7 @@ impl Fixture {
 
 #[test]
 fn partial_writes_retain_the_alternate_with_flip_scale_and_mrt_controls() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = Fixture::new() else { return };
     let mut failures = Vec::new();
     for (coverage, mrt, keep_main, shadow) in [
@@ -374,6 +376,7 @@ fn partial_writes_retain_the_alternate_with_flip_scale_and_mrt_controls() {
 
 #[test]
 fn frame_clear_and_retained_history_apply_before_partial_post_writes() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = Fixture::new() else { return };
     for clear in [true, false] {
         let mut post = gpu.build(pack(Coverage::Full, false, false, Some(clear), false));
@@ -431,6 +434,7 @@ fn fixture_frame(hud: &HudBatch) -> Frame<'_> {
         skybox: false,
         end_sky: false,
         end_sky_sprite: None,
+        boss_world_fog: false,
         environment_fog: None,
         water_fog: [0.0; 3],
         fog: None,
@@ -451,6 +455,7 @@ fn fixture_frame(hud: &HudBatch) -> Frame<'_> {
         visible_static_block_entity_sections: &[],
         static_block_entity_stats: crate::block_entity_render::StaticCacheFrameStats::default(),
         entity_motion: &[],
+        entity_motion_posed: &[],
         colored_lights: &[],
         emissive_layers: &[],
         shadow_only: &[],
@@ -495,6 +500,7 @@ mod clear_budget_tests;
 /// pack of our own with these three programs reads 0 there, not the previous frame's 0.25).
 #[test]
 fn a_cleared_buffer_starts_every_frame_cleared_on_both_textures() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = Fixture::new() else { return };
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let mut add = |name: &str, source: &str| {

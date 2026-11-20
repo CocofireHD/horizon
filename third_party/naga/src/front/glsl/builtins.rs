@@ -1091,7 +1091,8 @@ fn inject_standard_builtins(
         | "subgroupMemoryBarrierBuffer"
         | "subgroupMemoryBarrierShared"
         | "subgroupMemoryBarrierImage" => {
-            let all = crate::Barrier::STORAGE | crate::Barrier::WORK_GROUP | crate::Barrier::TEXTURE;
+            let all =
+                crate::Barrier::STORAGE | crate::Barrier::WORK_GROUP | crate::Barrier::TEXTURE;
             let flags = match name {
                 "memoryBarrierBuffer" | "subgroupMemoryBarrierBuffer" => crate::Barrier::STORAGE,
                 "memoryBarrierShared" | "subgroupMemoryBarrierShared" => crate::Barrier::WORK_GROUP,
@@ -1115,8 +1116,14 @@ fn inject_standard_builtins(
                 declaration.overloads.push(overload);
             }
         }
-        "imageAtomicAdd" | "imageAtomicMin" | "imageAtomicMax" | "imageAtomicAnd"
-        | "imageAtomicOr" | "imageAtomicXor" | "imageAtomicExchange" | "imageAtomicCompSwap" => {
+        "imageAtomicAdd"
+        | "imageAtomicMin"
+        | "imageAtomicMax"
+        | "imageAtomicAnd"
+        | "imageAtomicOr"
+        | "imageAtomicXor"
+        | "imageAtomicExchange"
+        | "imageAtomicCompSwap" => {
             let compare = name == "imageAtomicCompSwap";
             let kind = atomic_kind(&name["image".len()..].replacen('A', "a", 1));
             for sk in [Sk::Sint, Sk::Uint] {
@@ -1147,18 +1154,19 @@ fn inject_standard_builtins(
                 }
             }
         }
-        "subgroupBarrier" => declaration.overloads.push(
-            module.add_builtin(Vec::new(), MacroCall::ControlBarrier(crate::Barrier::SUB_GROUP)),
-        ),
+        "subgroupBarrier" => declaration.overloads.push(module.add_builtin(
+            Vec::new(),
+            MacroCall::ControlBarrier(crate::Barrier::SUB_GROUP),
+        )),
         "subgroupAll" | "subgroupAny" => {
             let op = match name {
                 "subgroupAll" => crate::SubgroupOperation::All,
                 _ => crate::SubgroupOperation::Any,
             };
             let builtin = MacroCall::SubgroupCollective(op, crate::CollectiveOperation::Reduce);
-            declaration.overloads.push(
-                module.add_builtin(vec![TypeInner::Scalar(Scalar::BOOL)], builtin),
-            )
+            declaration
+                .overloads
+                .push(module.add_builtin(vec![TypeInner::Scalar(Scalar::BOOL)], builtin))
         }
         "subgroupBallot" => declaration.overloads.push(module.add_builtin(
             vec![TypeInner::Scalar(Scalar::BOOL)],
@@ -1173,7 +1181,12 @@ fn inject_standard_builtins(
                 _ => &[Scalar::F32, Scalar::I32, Scalar::U32],
             };
             for &scalar in kinds {
-                for size in [None, Some(VectorSize::Bi), Some(VectorSize::Tri), Some(VectorSize::Quad)] {
+                for size in [
+                    None,
+                    Some(VectorSize::Bi),
+                    Some(VectorSize::Tri),
+                    Some(VectorSize::Quad),
+                ] {
                     let ty = match size {
                         Some(size) => TypeInner::Vector { size, scalar },
                         None => TypeInner::Scalar(scalar),
@@ -1189,10 +1202,22 @@ fn inject_standard_builtins(
         | "subgroupShuffle"
         | "subgroupShuffleXor"
         | "subgroupShuffleUp"
-        | "subgroupShuffleDown" => {
-            let indexed = name != "subgroupBroadcastFirst";
+        | "subgroupShuffleDown"
+        | "subgroupQuadSwapHorizontal"
+        | "subgroupQuadSwapVertical"
+        | "subgroupQuadSwapDiagonal" => {
+            // GL_KHR_shader_subgroup_quad: the quad swaps take only the value.
+            let indexed = !matches!(
+                gather_kind(name),
+                GatherKind::BroadcastFirst | GatherKind::QuadSwap(_)
+            );
             for scalar in [Scalar::F32, Scalar::I32, Scalar::U32, Scalar::BOOL] {
-                for size in [None, Some(VectorSize::Bi), Some(VectorSize::Tri), Some(VectorSize::Quad)] {
+                for size in [
+                    None,
+                    Some(VectorSize::Bi),
+                    Some(VectorSize::Tri),
+                    Some(VectorSize::Quad),
+                ] {
                     let ty = match size {
                         Some(size) => TypeInner::Vector { size, scalar },
                         None => TypeInner::Scalar(scalar),
@@ -1201,9 +1226,9 @@ fn inject_standard_builtins(
                     if indexed {
                         args.push(TypeInner::Scalar(Scalar::U32));
                     }
-                    declaration
-                        .overloads
-                        .push(module.add_builtin(args, MacroCall::SubgroupGather(gather_kind(name))));
+                    declaration.overloads.push(
+                        module.add_builtin(args, MacroCall::SubgroupGather(gather_kind(name))),
+                    );
                 }
             }
         }
@@ -1292,6 +1317,7 @@ pub enum GatherKind {
     ShuffleXor,
     ShuffleUp,
     ShuffleDown,
+    QuadSwap(crate::Direction),
 }
 
 fn gather_kind(name: &str) -> GatherKind {
@@ -1301,6 +1327,9 @@ fn gather_kind(name: &str) -> GatherKind {
         "subgroupShuffle" => GatherKind::Shuffle,
         "subgroupShuffleXor" => GatherKind::ShuffleXor,
         "subgroupShuffleUp" => GatherKind::ShuffleUp,
+        "subgroupQuadSwapHorizontal" => GatherKind::QuadSwap(crate::Direction::X),
+        "subgroupQuadSwapVertical" => GatherKind::QuadSwap(crate::Direction::Y),
+        "subgroupQuadSwapDiagonal" => GatherKind::QuadSwap(crate::Direction::Diagonal),
         _ => GatherKind::ShuffleDown,
     }
 }
@@ -2396,8 +2425,7 @@ impl MacroCall {
             }
             MacroCall::ControlBarrier(flags) => {
                 ctx.emit_restart();
-                ctx.body
-                    .push(crate::Statement::ControlBarrier(flags), meta);
+                ctx.body.push(crate::Statement::ControlBarrier(flags), meta);
                 return Ok(None);
             }
             MacroCall::MemoryBarrier(flags) => {
@@ -2407,9 +2435,13 @@ impl MacroCall {
             }
             MacroCall::SubgroupCollective(op, collective_op) => {
                 let inner = ctx.resolve_type(args[0], meta)?.clone();
-                let ty = ctx.module.types.insert(Type { name: None, inner }, Span::default());
+                let ty = ctx
+                    .module
+                    .types
+                    .insert(Type { name: None, inner }, Span::default());
                 ctx.emit_end();
-                let result = ctx.add_expression(Expression::SubgroupOperationResult { ty }, meta)?;
+                let result =
+                    ctx.add_expression(Expression::SubgroupOperationResult { ty }, meta)?;
                 ctx.body.push(
                     crate::Statement::SubgroupCollectiveOperation {
                         op,
@@ -2425,7 +2457,10 @@ impl MacroCall {
             MacroCall::SubgroupGather(kind) => {
                 use crate::GatherMode as G;
                 let inner = ctx.resolve_type(args[0], meta)?.clone();
-                let ty = ctx.module.types.insert(Type { name: None, inner }, Span::default());
+                let ty = ctx
+                    .module
+                    .types
+                    .insert(Type { name: None, inner }, Span::default());
                 let mode = match kind {
                     GatherKind::BroadcastFirst => G::BroadcastFirst,
                     GatherKind::Broadcast => G::Broadcast(args[1]),
@@ -2433,9 +2468,11 @@ impl MacroCall {
                     GatherKind::ShuffleXor => G::ShuffleXor(args[1]),
                     GatherKind::ShuffleUp => G::ShuffleUp(args[1]),
                     GatherKind::ShuffleDown => G::ShuffleDown(args[1]),
+                    GatherKind::QuadSwap(direction) => G::QuadSwap(direction),
                 };
                 ctx.emit_end();
-                let result = ctx.add_expression(Expression::SubgroupOperationResult { ty }, meta)?;
+                let result =
+                    ctx.add_expression(Expression::SubgroupOperationResult { ty }, meta)?;
                 ctx.body.push(
                     crate::Statement::SubgroupGather {
                         mode,
@@ -2521,7 +2558,13 @@ impl MacroCall {
                     },
                     meta,
                 )?;
-                let old = ctx.add_expression(Expression::AccessIndex { base: old, index: 0 }, meta)?;
+                let old = ctx.add_expression(
+                    Expression::AccessIndex {
+                        base: old,
+                        index: 0,
+                    },
+                    meta,
+                )?;
                 ctx.emit_restart();
                 ctx.body.push(
                     crate::Statement::ImageAtomic {
@@ -2582,12 +2625,60 @@ fn texture_call(
             ctx.conversion(array_index_expr, meta, Scalar::I32)?;
         }
 
+        // A texel offset must be a constant expression, but GL drivers also take one a
+        // function gets as a parameter (`const in ivec2 offset`, Arc's FXAA). Such an offset
+        // moves the coordinate by that many texels of the base level instead.
+        let mut coordinate = comps.coordinate;
+        let mut offset = offset;
+        if let Some(by) = offset.filter(|&o| !ctx.local_expression_kind_tracker.is_const(o)) {
+            let size = ctx.add_expression(
+                Expression::ImageQuery {
+                    image,
+                    query: ImageQuery::Size { level: None },
+                },
+                meta,
+            )?;
+            let size = ctx.add_expression(
+                Expression::As {
+                    expr: size,
+                    kind: Sk::Float,
+                    convert: Some(4),
+                },
+                meta,
+            )?;
+            let by = ctx.add_expression(
+                Expression::As {
+                    expr: by,
+                    kind: Sk::Float,
+                    convert: Some(4),
+                },
+                meta,
+            )?;
+            let shift = ctx.add_expression(
+                Expression::Binary {
+                    op: BinaryOperator::Divide,
+                    left: by,
+                    right: size,
+                },
+                meta,
+            )?;
+            coordinate = ctx.add_expression(
+                Expression::Binary {
+                    op: BinaryOperator::Add,
+                    left: coordinate,
+                    right: shift,
+                },
+                meta,
+            )?;
+            offset = None;
+        }
+
         Ok(ctx.add_expression(
             Expression::ImageSample {
                 image,
                 sampler,
                 gather: None, //TODO
-                coordinate: comps.coordinate,
+                coordinate,
                 array_index,
                 offset,
                 level,
@@ -2613,12 +2704,13 @@ fn gather_component(
     let value = match ctx[comp] {
         Expression::Literal(crate::Literal::I32(v)) => Some(v as i64),
         Expression::Literal(crate::Literal::U32(v)) => Some(v as i64),
-        Expression::Constant(c) => match ctx.module.global_expressions[ctx.module.constants[c].init]
-        {
-            Expression::Literal(crate::Literal::I32(v)) => Some(v as i64),
-            Expression::Literal(crate::Literal::U32(v)) => Some(v as i64),
-            _ => None,
-        },
+        Expression::Constant(c) => {
+            match ctx.module.global_expressions[ctx.module.constants[c].init] {
+                Expression::Literal(crate::Literal::I32(v)) => Some(v as i64),
+                Expression::Literal(crate::Literal::U32(v)) => Some(v as i64),
+                _ => None,
+            }
+        }
         _ => None,
     };
     match value {

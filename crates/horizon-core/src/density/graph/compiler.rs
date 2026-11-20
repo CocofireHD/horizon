@@ -10,10 +10,14 @@ pub struct DensityCompiler {
     prepared: HashMap<FunctionId, FunctionId>,
     next_cache: usize,
     context: Option<seeded::SeededContext>,
+    /// Distinguishes this compiler's function ids from other compilers'.
+    instance: u64,
 }
 impl DensityCompiler {
     pub fn new(graph: DensityGraph) -> Self {
+        static INSTANCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
+            instance: INSTANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             graph,
             samplers: HashMap::new(),
             prepared: HashMap::new(),
@@ -150,6 +154,14 @@ impl DensityCompiler {
     pub fn compile_raw(&self, id: FunctionId) -> Result<Arc<dyn DensitySampler>, CompileError> {
         let node = match &self.graph.entry(id)?.definition {
             Definition::Bound { sampler, .. } => return Ok(sampler.clone()),
+            Definition::Seeded { factory, .. } => {
+                let seed = self
+                    .context
+                    .as_ref()
+                    .ok_or(CompileError::MissingSeededContext)?
+                    .seed();
+                return Ok(factory.sampler(seed));
+            }
             Definition::Node(node) => node,
         };
         let sampler: Arc<dyn DensitySampler> = match *node {
@@ -406,9 +418,10 @@ impl DensityCompiler {
                 })
             }
             GraphNode::Cache(_) => return Err(CompileError::UnpreparedCache),
-            GraphNode::Interpolated { input, xz, y } => {
-                Arc::new(InterpolatedSampler::new(self.compile_raw(input)?, xz, y)?)
-            }
+            GraphNode::Interpolated { input, xz, y } => Arc::new(
+                InterpolatedSampler::new(self.compile_raw(input)?, xz, y)?
+                    .with_identity(self.instance, id.0),
+            ),
             GraphNode::Surface {
                 density,
                 upper,

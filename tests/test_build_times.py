@@ -55,6 +55,10 @@ class TimingsTests(unittest.TestCase):
         self.assertIsNone(bt.parse_timings("const UNIT_DATA = [ {oops"))
         self.assertEqual(bt.parse_timings(page([])), [])
 
+    def test_non_finite_timings_are_rejected_instead_of_written_as_invalid_json(self):
+        self.assertIsNone(bt.parse_timings(page([{"i": 0, "name": "a", "start": 0, "duration": float("nan")}])))
+        self.assertIsNone(bt.parse_timings(page([{"i": 0, "name": "a", "start": float("inf"), "duration": 1.0}])))
+
     def test_critical_path_follows_what_each_unit_waited_for(self):
         path = bt.critical_path(REAL_UNITS)
         self.assertEqual([p["unit"] for p in path],
@@ -285,7 +289,7 @@ class RunTests(unittest.TestCase):
         self.report("--profiles", "dev,fast", "--crates", "horizon-items", "--jobs", "3")
         for call in self.builds():
             args = call["args"]
-            self.assertEqual(args[:5], ["build", "--locked", "-p", "horizon-client", "--profile"])
+            self.assertEqual(args[:5], ["build", "--locked", "-p", "horizon-game", "--profile"])
             self.assertIn(args[5], ["dev", "fast"])
             self.assertIn("--timings", args)
             self.assertEqual(args[args.index("--jobs") + 1], "3")
@@ -476,6 +480,21 @@ class RunTests(unittest.TestCase):
         self.assertEqual(Path(build["args"][build["args"].index("--target-dir") + 1]), ours)
         self.assertEqual(Path(build["CARGO_TARGET_DIR"]), ours)
         self.assertTrue(any("CARGO_TARGET_DIR is set" in w for w in report["warnings"]))
+
+    def test_relative_target_dir_uses_the_invocation_directory(self):
+        caller = Path(self.tmp.name)
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(caller)
+            code, report, _, _ = self.report("--profiles", "dev", "--only", "cold", "--target-dir", "benchmark")
+        finally:
+            os.chdir(previous_cwd)
+        self.assertEqual(code, 0)
+        target = caller / "benchmark/target-dev"
+        self.assertTrue((target / bt.MARKER).is_file())
+        self.assertTrue((target / "built").is_file())
+        self.assertIsNotNone(report["cold"]["dev"]["timings"])
+        self.assertFalse((self.root / "benchmark").exists())
 
     def test_cold_build_empties_only_its_own_target_folder(self):
         ours = self.root / ".local/build-times/target-dev"

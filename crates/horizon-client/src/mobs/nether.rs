@@ -105,24 +105,32 @@ impl Goal for BlazeAttack {
                 }
                 if self.step > 1 {
                     let sqd = d2.sqrt().sqrt() * 0.5;
-                    cx.events.push(MobEvent::Sound(
-                        "entity.blaze.shoot",
-                        m.center(),
-                        1.0,
-                        (m.random.next_float() - m.random.next_float()) * 0.2 + 1.0,
-                    ));
+                    // LevelEvent 1018 at the blaze's block: the client plays the
+                    // shot (volume 2, its own pitch); nothing is drawn here.
+                    if !m.silent {
+                        let p = m.position;
+                        cx.events.push(MobEvent::LevelEventSound {
+                            sound: "entity.blaze.shoot",
+                            at: [p.x.floor() + 0.5, p.y.floor() + 0.5, p.z.floor() + 0.5],
+                            volume: 2.0,
+                            spread: 0.2,
+                        });
+                    }
                     let dir = [
                         triangle(m, xd, 2.297 * sqd),
                         yd,
                         triangle(m, zd, 2.297 * sqd),
                     ];
                     let start = Vec3::new(m.position.x, m.position.y + half + 0.5, m.position.z);
-                    cx.events.push(MobEvent::Projectile(Projectile::fireball(
-                        ProjectileKind::SmallFireball,
-                        start,
-                        Some(Who::Mob(m.id)),
-                        dir,
-                    )));
+                    cx.events.push(MobEvent::Projectile(
+                        Projectile::fireball(
+                            ProjectileKind::SmallFireball,
+                            start,
+                            Some(Who::Mob(m.id)),
+                            dir,
+                        )
+                        .shot_by(m.yaw, m.head_pitch),
+                    ));
                 }
             }
             m.look_at_speed([t.position.x, t.eye_y, t.position.z], 10.0, 10.0);
@@ -131,34 +139,12 @@ impl Goal for BlazeAttack {
         }
     }
 }
-/// `Blaze.aiStep`: slow falling, the burning sound and smoke.
-pub fn blaze_ai_step(m: &mut Mob, events: &mut Vec<MobEvent>) {
+/// `Blaze.aiStep`: slow falling. The burning sound and the smoke are its
+/// `isClientSide()` branch, which the window's game makes for itself
+/// (`ambient::client_ai_step`): a server neither plays them nor draws for them.
+pub fn blaze_ai_step(m: &mut Mob) {
     if !m.on_ground && m.velocity.y < 0.0 {
         m.velocity.y *= 0.6;
-    }
-    if m.random.next_int_bound(24).unwrap_or(1) == 0 {
-        let volume = 1.0 + m.random.next_float();
-        let pitch = m.random.next_float() * 0.7 + 0.3;
-        events.push(MobEvent::Sound(
-            "entity.blaze.burn",
-            m.center(),
-            volume,
-            pitch,
-        ));
-    }
-    // getRandomX(0.5), getRandomY(), getRandomZ(0.5), at rest.
-    let (w, h) = (f64::from(m.width()), f64::from(m.height()));
-    for _ in 0..2 {
-        let at = [
-            m.position.x + w * (2.0 * m.random.next_double() - 1.0) * 0.5,
-            m.position.y + h * m.random.next_double(),
-            m.position.z + w * (2.0 * m.random.next_double() - 1.0) * 0.5,
-        ];
-        events.push(MobEvent::Particles {
-            kind: "large_smoke",
-            at,
-            count: 0,
-        });
     }
 }
 /// `Blaze.customServerAiStep`: rise toward a target above the allowed offset.
@@ -173,7 +159,9 @@ pub fn blaze_server_ai_step(m: &mut Mob, cx: &mut Cx) {
         && !(t.is_player && t.creative)
         && t.eye_y > m.eye_y() + m.extra.vector[0]
     {
-        m.velocity.y += (0.3 - m.velocity.y) * 0.3;
+        // (0.3F - y) * 0.3F: the floats widened.
+        let k = f64::from(0.3_f32);
+        m.velocity.y += (k - m.velocity.y) * k;
     }
 }
 /// `BlazeModel.setupAnim`: three rings of rods circling and bobbing.
@@ -207,7 +195,12 @@ pub fn blaze_anim(s: &State, p: &mut Poses) {
     p.xrot("head", s.x_rot.to_radians());
 }
 
+/// `Ghast.explosionPower`'s `Extra::ints` slot.
+const EXPLOSION_POWER: usize = 0;
+
 pub fn register_ghast(m: &mut Mob) {
+    // `Ghast.explosionPower = 1` until a save or a command sets it.
+    m.extra.ints[EXPLOSION_POWER] = 1;
     m.ai.mov.kind = MoveKind::Custom;
     let g = &mut m.ai.goals;
     g.add(5, RandomFloatAround);
@@ -216,11 +209,24 @@ pub fn register_ghast(m: &mut Mob) {
     m.ai.targets.add(
         1,
         NearestTarget::player(true).when(|m, w| {
-            w.player
-                .as_ref()
+            w.selected_player()
                 .is_some_and(|p| (p.position.y - m.position.y).abs() <= 4.0)
         }),
     );
+}
+/// `Ghast.addAdditionalSaveData`: `putByte("ExplosionPower", (byte)explosionPower)`,
+/// the power the blast of the fireball it shoots uses (`LargeFireball.onHit`).
+pub fn to_nbt(m: &Mob, map: &mut horizon_core::nbt::Compound) {
+    map.insert(
+        "ExplosionPower".into(),
+        horizon_core::nbt::Tag::Byte(m.extra.ints[EXPLOSION_POWER] as i8),
+    );
+}
+/// `Ghast.readAdditionalSaveData`: `getByteOr("ExplosionPower", (byte)1)`, any
+/// numeric tag narrowed to a byte.
+pub fn from_nbt(m: &mut Mob, tag: &horizon_core::nbt::Tag) {
+    m.extra.ints[EXPLOSION_POWER] =
+        i32::from(crate::save::number(tag.get("ExplosionPower")).unwrap_or(1) as i8);
 }
 /// `Ghast.GhastMoveControl`: a push toward the wanted point every few ticks.
 pub fn ghast_move_control(m: &mut Mob, w: &MobWorld) {
@@ -394,12 +400,17 @@ impl Goal for GhastShoot {
                     m.position.y + half + 0.5,
                     m.position.z + view[1] * 4.0,
                 );
-                cx.events.push(MobEvent::Projectile(Projectile::fireball(
-                    ProjectileKind::LargeFireball { power: 1 },
-                    start,
-                    Some(Who::Mob(m.id)),
-                    dir,
-                )));
+                cx.events.push(MobEvent::Projectile(
+                    Projectile::fireball(
+                        ProjectileKind::LargeFireball {
+                            power: m.extra.ints[EXPLOSION_POWER],
+                        },
+                        start,
+                        Some(Who::Mob(m.id)),
+                        dir,
+                    )
+                    .shot_by(m.yaw, m.head_pitch),
+                ));
                 self.charge = -40;
             }
         } else if self.charge > 0 {
@@ -417,3 +428,6 @@ pub fn ghast_anim(s: &State, p: &mut Poses) {
         }
     }
 }
+#[cfg(test)]
+#[path = "nether_ghast_power_tests.rs"]
+mod nether_ghast_power_tests;

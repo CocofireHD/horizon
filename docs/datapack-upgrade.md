@@ -5,9 +5,9 @@ worldgen data pack written for 26.2 (registry errors on load). Horizon
 targets 26.3, so such a pack has to be rewritten first:
 
 ```sh
-cargo run --release -p horizon-port-pack -- upgrade-datapack PACK.zip --world <world folder>
+cargo run --release -p horizon-port-pack-cli -- upgrade-datapack PACK.zip --world <world folder>
 # or into any folder:
-cargo run --release -p horizon-port-pack -- upgrade-datapack PACK.zip OUT/
+cargo run --release -p horizon-port-pack-cli -- upgrade-datapack PACK.zip OUT/
 ```
 
 `--world` writes the upgraded pack to `<world>/datapacks/<pack name>-26.3/`.
@@ -15,9 +15,14 @@ The input is a zip or a folder; nothing is downloaded, and the pack stays on
 your machine (packs are often All Rights Reserved: do not commit or share an
 upgraded copy).
 
-Horizon does not apply a data pack's world generation yet (see
-[the mod browser](mod-browser.md)); the upgraded pack loads in vanilla 26.3,
-and the checks below run it there.
+Horizon applies most of a data pack's world generation (biomes, features,
+structures, dimensions; not world presets), so the upgraded pack can also be
+tried in Horizon (see [the mod browser](mod-browser.md)). The checks below run
+it in vanilla 26.3.
+
+A modpack's mod jars that are only a data pack go through the same upgrade when the launcher
+ports the pack, into the packs every new world of its profile starts with
+([modpacks.md](modpacks.md#data-packs-in-mod-jars)).
 
 The command prints what it rewrote, what it could not rewrite faithfully
 (`not faithful`) and the types it does not know (`left as it is`).

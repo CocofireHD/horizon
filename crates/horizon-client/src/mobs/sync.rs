@@ -3,9 +3,9 @@
 //! client of a server only gets synched data and entity events, and runs the
 //! animation steps vanilla runs on the client (`Entity.onSyncedDataUpdated`,
 //! `handleEntityEvent` and the per tick animation states). The server's half
-//! is `game/lan.rs` (`mob_meta`, with `pose_id` here for index 6) and
-//! `MobEvent::EntityEvent`; the client's half is `game/remote_mob_data.rs`,
-//! `game/remote.rs` (`C::EntityEvent`) and `client_tick` here.
+//! is `game/network/lan/mod.rs` (`mob_meta`, with `pose_id` here for index 6) and
+//! `MobEvent::EntityEvent`; the client's half is `game/network/remote_mob_data.rs`,
+//! `game/network/remote/mod.rs` (`C::EntityEvent`) and `client_tick` here.
 //!
 //! To animate another species for a client:
 //! - send its synched data in `mob_meta` and read it in
@@ -71,7 +71,12 @@ pub fn client_tick(m: &mut Mob, game_time: i64, events: &mut Vec<MobEvent>) {
         // (`Warden.clientDiggingParticles`), so the events have to leave here.
         Species::Warden => warden::client_tick(m, events),
         Species::Sniffer => sniffer::animate(m),
-        Species::Breeze => breeze::ai_step(m),
+        // Breeze.tick and Mob.baseTick: the whirl and idle sounds are local
+        // sounds, so the client makes its own.
+        Species::Breeze => {
+            breeze::ai_step(m);
+            breeze::client_sounds(m, events);
+        }
         Species::Camel | Species::CamelHusk => camel::client_tick(m, game_time),
         Species::Shulker => shulker::client_tick(m),
         Species::Ravager => ravager::client_tick(m),

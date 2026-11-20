@@ -26,8 +26,25 @@ class StartupTraceTests(unittest.TestCase):
         # The first time a mark happened.
         self.assertEqual(marks, {"title.shown": 450.0})
 
+    def test_p95_is_nearest_rank_when_the_count_is_a_multiple_of_twenty(self):
+        runs = [[(0.0, float(value), "step", "main") for value in range(1, 21)]]
+        self.assertEqual(startup_trace.step_stats(runs)["step"]["p95_ms"], 19.0)
+
     def test_a_missing_trace_has_no_events(self):
         self.assertEqual(startup_trace.read_trace("/nonexistent/trace.jsonl"), [])
+
+    def test_step_stats_aggregate_named_durations(self):
+        runs = [
+            [(0.0, 10.0, "core.assets", "main"), (0.0, 4.0, "rest.recipes", "rest")],
+            [(0.0, 14.0, "core.assets", "main"), (0.0, 6.0, "rest.recipes", "rest")],
+        ]
+        self.assertEqual(
+            startup_trace.step_stats(runs),
+            {
+                "core.assets": {"n": 2, "median_ms": 12.0, "p95_ms": 14.0, "total_ms": 24.0},
+                "rest.recipes": {"n": 2, "median_ms": 5.0, "p95_ms": 6.0, "total_ms": 10.0},
+            },
+        )
 
 
 if __name__ == "__main__":

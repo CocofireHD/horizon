@@ -1,43 +1,67 @@
-//! Embeds Horizon's icon (`packaging/icons/horizon.ico`) in the Windows executables, as icon
-//! resource 1: Explorer and the task bar show it, and the window takes it as its icon.
-//! The optional Segment Heap manifest is embedded in the same resource compilation.
+//! Generates the native mod API, and gives the Windows executable Horizon's icon and its stack
+//! (`packaging/windows/exe.rs`, shared with the official executable's build script).
+#[path = "../../packaging/windows/exe.rs"]
+mod windows_exe;
+
 fn main() {
-    let root =
-        std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../..");
+    let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let root = std::path::Path::new(&dir).join("../..");
     let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("crates/horizon-client/src/game").display()
+    );
+    std::fs::write(
+        out_dir.join("game_modules.rs"),
+        horizon_game_discovery::declarations(
+            &root.join("crates/horizon-client/src/game"),
+            &["native_hooks", "host", "creatures"],
+        )
+        .expect("discovering game modules"),
+    )
+    .expect("writing game modules");
+    let tests =
+        root.join("crates/horizon-client/src/crafting/ingredient/builtin_kinds_tests/families");
+    println!("cargo:rerun-if-changed={}", tests.display());
+    std::fs::write(
+        out_dir.join("builtin_ingredient_test_modules.rs"),
+        horizon_game_discovery::folder_modules(&tests).expect("discovering ingredient tests"),
+    )
+    .expect("writing ingredient test modules");
     horizon_mod_api_gen::generate(&root, &out_dir, horizon_mod_api_gen::Target::Client)
         .expect("generating native mod API");
-    let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let ico = format!("{dir}/../../packaging/icons/horizon.ico");
-    println!("cargo:rerun-if-changed={ico}");
-    // The game's main thread gets 8 MB of stack on Windows as on macOS and Linux (Windows gives 1
-    // MB): splitscreen builds a joining player's `Game`, ~67 KB, deep in the event loop.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        let arg = match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
-            Ok("msvc") => "/STACK:8388608",
-            _ => "-Wl,--stack,8388608",
-        };
-        println!("cargo:rustc-link-arg-bin=horizon-client={arg}");
+    // Whether a native mod can run in a mob's turn (`game/creatures/mob_islands.rs`). The
+    // launcher adds trait packages to the workspace's members.
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("Cargo.toml").display()
+    );
+    for dir in ["native-api", "native-crates"] {
+        if root.join(dir).is_dir() {
+            println!("cargo:rerun-if-changed={}", root.join(dir).display());
+        }
     }
-    #[cfg(windows)]
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        let mut resource = winresource::WindowsResource::new();
-        resource.set_icon(&ico);
-        if std::env::var_os("CARGO_FEATURE_WINDOWS_SEGMENT_HEAP").is_some() {
-            let manifest = format!("{dir}/windows-segment-heap.manifest");
-            println!("cargo:rerun-if-changed={manifest}");
-            resource.set_manifest_file(&manifest);
-        }
-        if let Err(e) = resource.compile() {
-            // The GNU toolchain's `windres` (the launcher's mod builds use it) can't take a path
-            // with a space, and a Windows user name often has one: such a build goes on without
-            // the icon. Release builds run in CI, where the icon stays required.
-            if std::env::var_os("CI").is_some() {
-                panic!("embedding Windows resources: {e}");
-            }
-            println!(
-                "cargo:warning=building without Horizon's icon: embedding Windows resources failed: {e}"
-            );
-        }
+    if let Some(found) = horizon_mod_api_gen::mob_turn(&root) {
+        println!("cargo:rustc-env=HORIZON_MOB_TURN={found}");
+    }
+    // The SDK builds this library, not the platform executable. Carry the same executable
+    // policy without asking Cargo to link a binary this package no longer owns.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").expect("Cargo must provide the target OS");
+    let target_env =
+        std::env::var("CARGO_CFG_TARGET_ENV").expect("Cargo must provide the target environment");
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("packaging/executable_link.rs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("crates/horizon-guest-stack/src/guest_stack_constants.rs")
+            .display()
+    );
+    for arg in windows_exe::executable_link::arguments(&target_os, &target_env) {
+        println!("cargo:horizon-executable-link-arg={arg}");
+    }
+    if std::env::var("CARGO_PKG_NAME").as_deref() != Ok("horizon-client") {
+        windows_exe::resources("horizon-client");
     }
 }

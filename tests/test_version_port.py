@@ -44,6 +44,14 @@ class ReportDiffTests(unittest.TestCase):
         self.assertEqual(port.json_diff([1], [1, 2]), [("/", [1], [1, 2])])
         self.assertEqual(len(port.json_diff({str(i): i for i in range(9)}, {}, limit=3)), 3)
 
+    def test_json_boolean_changes_are_distinct_from_numbers(self):
+        old = {"enabled": [True, 0, 1]}
+        new = {"enabled": [1, False, 1.0]}
+        changes = [("/enabled[0]", True, 1), ("/enabled[1]", 0, False)]
+        self.assertEqual(port.json_diff(old, new), changes)
+        items = port.diff_items({"stone": {"settings": old}}, {"stone": {"settings": new}})
+        self.assertEqual(items["changed"]["stone"]["changed"], {"settings": changes})
+
     def test_packets_added_removed_renumbered(self):
         old = {"play": {"serverbound": {"minecraft:swing": {"protocol_id": 0}, "minecraft:use": {"protocol_id": 1}}}}
         new = {"play": {"serverbound": {"minecraft:punch": {"protocol_id": 0}, "minecraft:use": {"protocol_id": 2},
@@ -138,6 +146,14 @@ class GcTests(unittest.TestCase):
                          [".datagen-x", "26.1", "26.2", "diff-26.2-26.3"])
         self.assertEqual(port.to_remove(entries, "26.3", {"26.1"}),
                          [".datagen-x", "26.2", "diff-26.2-26.3"])
+
+    def test_dot_prefixed_scratch_does_not_steal_a_keep_slot(self):
+        # A fresh scratch folder that looks like a version (it has prepared.json) must not take one
+        # of the two "newest others" slots: 26.1 is the second-newest real version and must survive.
+        entries = [("26.3", 100, True), (".tmp-datagen", 300, True), ("26.2", 200, True), ("26.1", 50, True)]
+        self.assertEqual(port.to_remove(entries, "26.3", set()), [".tmp-datagen"])
+        # Control: with no scratch entry, nothing is removed.
+        self.assertEqual(port.to_remove([e for e in entries if not e[0].startswith(".")], "26.3", set()), [])
 
 
 if __name__ == "__main__":

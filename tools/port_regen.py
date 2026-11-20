@@ -23,6 +23,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 
@@ -32,8 +33,7 @@ except ImportError:
     import lab
 
 # Classes whose decompiled source a generator parses: (side, class).
-SOURCES = [("client", "net/minecraft/world/entity/EntityTypes"),
-           ("server", "net/minecraft/util/datafix/fixes/BlockStateData")]
+SOURCES = [("client", "net/minecraft/world/entity/EntityTypes")]
 PARITY = "mods/horizon/src/test/java/dev/horizonlab/parity"
 
 
@@ -260,9 +260,6 @@ GENERATORS = [
     ("entity_tracking", ["crates/horizon-client/src/lan/tracking.rs"],
      lambda root, version, store, build: [python(), "tools/generate_entity_tracking.py", "--sources",
                                           store / "sources" / "client"]),
-    ("block_state_data", ["crates/horizon-world/src/datafix/block_state_data.txt"],
-     lambda root, version, store, build: [python(), "tools/gen_block_state_data.py",
-                                          store / "sources/server" / f"{SOURCES[1][1]}.java"]),
     ("lan_command_order", ["crates/horizon-client/src/lan/command_order.rs"],
      lambda root, version, store, build: [python(), "tools/generate_lan_command_order.py"]),
     ("command_suggestions", ["crates/horizon-client/src/lan/command_suggestions.rs"], gen_suggestions),
@@ -273,6 +270,10 @@ GENERATORS = [
 def status(root, outputs):
     """unchanged, or regenerated with {path: [added, removed]} against the candidate's last commit."""
     stat = {}
+    # `git diff` never lists untracked files: mark a first-time output as intent-to-add so it counts.
+    new = git("ls-files", "-z", "--others", "--exclude-standard", "--", *outputs, cwd=root).split("\0")
+    if any(new):
+        git("add", "-N", "--", *filter(None, new), cwd=root)
     for line in git("diff", "--numstat", "HEAD", "--", *outputs, cwd=root).splitlines():
         added, removed, path = line.split("\t")
         stat[path] = [int(added), int(removed)]
@@ -324,3 +325,9 @@ def regen(version, found, store, base, path, names=None):
     results = run_generators(root, version, store, names)
     return {"old": old, "new": version, "candidate": str(root), "commit": commit(root, version, results),
             "generators": results}
+
+
+if __name__ == "__main__":
+    # A module, not a command: say how it is used instead of doing nothing at all.
+    print(__doc__, file=sys.stderr)
+    raise SystemExit(2)

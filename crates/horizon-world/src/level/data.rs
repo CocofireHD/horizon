@@ -49,7 +49,7 @@ pub enum PushReaction {
     IgnoreEntity,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct StateFacts {
     pub flags: u32,
     /// isFaceSturdy bits: support type (FULL, CENTER, RIGID) * 6 + direction.
@@ -61,7 +61,9 @@ pub struct StateFacts {
     pub emission: u8,
     pub dampening: u8,
     pub hardness: f32,
+    /// Original properties reaction, retained when a reload removes an override.
     pub push: PushReaction,
+    pub(crate) resolved_push: super::piston_reactions::CachedReaction,
     pub instrument: u8,
     /// Index into `Behaviours::shapes`, or -1 for an uncached (dynamic) shape.
     pub shape: i32,
@@ -418,9 +420,6 @@ tags! {
     sand = "sand",
     ice = "ice",
     snow = "snow",
-    infiniburn_overworld = "infiniburn_overworld",
-    infiniburn_nether = "infiniburn_nether",
-    infiniburn_end = "infiniburn_end",
     soul_fire_base_blocks = "soul_fire_base_blocks",
     washed_away_by_fluids = "washed_away_by_fluids",
     blocks_fluid_flow = "blocks_fluid_flow",
@@ -731,6 +730,8 @@ fn build_with_gameplay<G: GameplayStateSource>(
         return Err(fail("fluid registry order differs from Horizon's"));
     }
 
+    let fluid_state_definitions = crate::fluid_definitions::load(behaviour, &fluids)?;
+
     // Tags.
     let bundle = read_json(&root.join("block-tags.json"))?;
     let mut definitions = TagDefinitions::default();
@@ -809,7 +810,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
             .map_err(|e| invalid(e.to_string()))?;
     }
     let fluid_built = fluid_definitions
-        .build(|name, _| FluidKind::from_name(name).map(|kind| kind as u8))
+        .build(|name, _| FluidKind::from_name(name).and_then(FluidKind::vanilla_index))
         .map_err(|e| invalid(e.to_string()))?;
     let fluid_mask = |name: &str| -> u8 {
         fluid_built
@@ -863,7 +864,21 @@ fn build_with_gameplay<G: GameplayStateSource>(
             int(3) as u8,
             row.get(4).and_then(Value::as_bool).unwrap_or(false),
         );
+        let fluid = registry
+            .state(BlockStateId(id as u32))
+            .map(crate::fluid::mod_fluid_of_block)
+            .transpose()?
+            .flatten()
+            .unwrap_or(fluid);
+        let push = match game.text("push") {
+            "PUSH" => PushReaction::Push,
+            "POPPED" => PushReaction::Popped,
+            "IMMOVEABLE" => PushReaction::Immoveable,
+            "IGNORE_ENTITY" => PushReaction::IgnoreEntity,
+            _ => PushReaction::PushPull,
+        };
         facts.push(StateFacts {
+            resolved_push: super::piston_reactions::CachedReaction::new(push),
             flags,
             sturdy: int(0) as u32,
             weak: int(5) as u32,
@@ -872,13 +887,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
             emission: game.unsigned("emission") as u8,
             dampening: game.unsigned("dampening") as u8,
             hardness: game.number("hardness") as f32,
-            push: match game.text("push") {
-                "PUSH" => PushReaction::Push,
-                "POPPED" => PushReaction::Popped,
-                "IMMOVEABLE" => PushReaction::Immoveable,
-                "IGNORE_ENTITY" => PushReaction::IgnoreEntity,
-                _ => PushReaction::PushPull,
-            },
+            push,
             instrument: instrument_index(row.get(8).and_then(Value::as_str).unwrap_or("HARP")),
             shape: shape_ids[id],
         });
@@ -1120,6 +1129,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
         shapes,
         shape_info,
         fluid_tags,
+        fluid_definitions: fluid_state_definitions,
         blocks,
         items,
         potted_by_content,
@@ -1127,6 +1137,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
         dynamic,
         occlusion_cache: Default::default(),
         growth: Default::default(),
+        block_maps: Default::default(),
     })
 }
 

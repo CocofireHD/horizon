@@ -209,22 +209,47 @@ impl Launcher {
                 n,
                 tr("Data folder"),
                 Some(div().font_family(theme::MONO).child(short(&backend::data_dir())).into_any_element()),
-                Some(move_button.into_any_element()),
+                Some(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(
+                            button("about-open-data", "Open", Kind::Secondary, &t).on_click(
+                                |_, _, cx| crate::glass_toast::open(cx, &backend::data_dir()),
+                            ),
+                        )
+                        .child(move_button)
+                        .into_any_element(),
+                ),
                 &t,
             ))
-            .child(text(theme::CAPTION).text_color(t.muted).child(tr(
+            .child(text(theme::CAPTION).px(px(if t.glass { 14. } else { 0. })).text_color(t.muted).child(tr(
                 "Moves all launcher, game and build data, including settings, worlds, instances and installed versions. Choose an empty folder with enough free space.",
             ).to_string()))
-            .child(text(theme::CAPTION).text_color(t.muted).child(tr(
+            .child(text(theme::CAPTION).px(px(if t.glass { 14. } else { 0. })).text_color(t.muted).child(tr(
                 "The launcher closes while your data is copied and verified, then reopens. Old folders are kept and still use disk space until you verify the move and remove them yourself.",
             ).to_string()))
-            .children(blocked.map(|message| text(theme::CAPTION).text_color(t.warn).child(message)))
+            .children(blocked.map(|message| text(theme::CAPTION).px(px(if t.glass { 14. } else { 0. })).text_color(t.warn).child(message)))
             .children(self.location_note.as_ref().map(|message| {
-                text(theme::CAPTION).text_color(t.ink).child(message.clone())
+                text(theme::CAPTION).px(px(if t.glass { 14. } else { 0. })).text_color(t.ink).child(message.clone())
             }))
             .children(self.location_error.as_ref().map(|message| {
-                text(theme::CAPTION).text_color(t.danger).child(message.clone())
+                text(theme::CAPTION).px(px(if t.glass { 14. } else { 0. })).text_color(t.danger).child(message.clone())
             }));
+        if cfg!(windows) {
+            body = body.child(text(theme::CAPTION).px(px(if t.glass { 14. } else { 0. })).text_color(t.muted).child(tr(
+                "On Windows, folders with spaces or non-English characters use a separate build folder. The chosen drive is preferred; otherwise the previous build drive is used. Allow enough free space in both locations.",
+            ).to_string()));
+        }
+        body = body.child(
+            text(theme::CAPTION)
+                .px(px(if t.glass { 14. } else { 0. }))
+                .text_color(t.muted)
+                .child(trf(
+                    "Build data: {path}",
+                    &[("path", &backend::build_dir().display().to_string())],
+                )),
+        );
         if horizon_launcher::data_location::startup_error().is_some() {
             body = body.child(
                 div()

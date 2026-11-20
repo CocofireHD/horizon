@@ -1,8 +1,9 @@
 //! Optional, texture-matched overlays drawn full bright over their base texture in the same
 //! terrain fragment: native mods' (`<ns>:emissive/...`) and OptiFine's emissive block textures
 //! (`block/stone_e.png` beside `block/stone.png`). No extra draw calls or world light changes.
+use crate::resource_source::ResourceSource;
 use crate::sprites::Sprites;
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 /// Overlay pairs the terrain shader reads (`Globals.emissive_layers`, terrain.wgsl).
 pub const MAX: usize = 128;
@@ -10,7 +11,7 @@ pub const MAX: usize = 128;
 const NATIVE: usize = 32;
 
 /// Load only bounded, explicitly named emissive textures from the active pack.
-pub fn load(root: &Path, sprites: &mut Sprites) {
+pub fn load(root: &ResourceSource, sprites: &mut Sprites) {
     let mut names: Vec<_> = crate::atlas_sources::list_textures(root)
         .into_iter()
         .filter(|name| {
@@ -21,10 +22,7 @@ pub fn load(root: &Path, sprites: &mut Sprites) {
         .collect();
     names.sort();
     for name in names {
-        let file = crate::atlas_sources::texture_path(root, &name, "textures");
-        if std::fs::metadata(file).is_ok_and(|m| m.len() <= 1 << 20) {
-            let _ = sprites.insert(root, &name);
-        }
+        let _ = sprites.insert_limited(&name, 1 << 20);
     }
 }
 
@@ -41,7 +39,7 @@ fn tile_file(name: &str) -> Option<&str> {
 /// `<name><suffix>.png` sits beside it, the overlay is loaded too and paired with it, blocks
 /// first, then tiles, each by name, at most [`MAX`] - [`NATIVE`] (native mods keep their share of
 /// the table). A pack without such files adds nothing.
-pub fn load_optifine(root: &Path, sprites: &mut Sprites) -> Vec<(String, String)> {
+pub fn load_optifine(root: &ResourceSource, sprites: &mut Sprites) -> Vec<(String, String)> {
     let suffix = horizon_optifine::emissive::suffix(root);
     // Blocks with identical pixels share a layer (and the shader pairs by layer): a shared
     // base would glow on every block that shares it, so it gets no overlay.
@@ -69,15 +67,15 @@ pub fn load_optifine(root: &Path, sprites: &mut Sprites) -> Vec<(String, String)
         let (overlay, file) = match tile_file(&base) {
             Some(stem) => {
                 let overlay = format!("{stem}{suffix}.png");
-                (overlay.clone(), root.join(overlay))
+                (overlay.clone(), overlay)
             }
             None => {
                 let overlay = format!("{base}{suffix}");
-                let file = crate::atlas_sources::texture_path(root, &overlay, "textures");
+                let file = crate::atlas_sources::texture_resource(&overlay, "textures");
                 (overlay, file)
             }
         };
-        if !std::fs::metadata(&file).is_ok_and(|m| m.is_file()) {
+        if !root.contains(&file) {
             continue;
         }
         if pairs.len() == MAX - NATIVE {
@@ -87,16 +85,8 @@ pub fn load_optifine(root: &Path, sprites: &mut Sprites) -> Vec<(String, String)
             );
             break;
         }
-        if std::fs::metadata(&file).is_ok_and(|m| m.len() > 1 << 20) {
-            log::warn!("Horizon: emissive overlay {overlay} is over 1 MiB, skipped");
-            continue;
-        }
-        // A file that doesn't load would glow as the missing texture: no pair instead.
-        let loaded = if overlay.starts_with("assets/") {
-            sprites.insert_file(root, &overlay)
-        } else {
-            sprites.try_insert(root, &overlay)
-        };
+        // Bound the actual PNG bytes even when an archive lies about their size.
+        let loaded = sprites.try_insert_limited(&overlay, 1 << 20);
         match loaded {
             Ok(_) => pairs.push((base, overlay)),
             Err(e) => log::warn!("Horizon: emissive overlay {overlay} skipped: {e}"),
@@ -145,6 +135,7 @@ pub fn mappings<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// A 16x16 image of one colour, `shade` its red (images of different shades never share a
     /// sprite layer).
@@ -188,7 +179,9 @@ mod tests {
             &root.join("assets/minecraft/textures/item/stick_e.png"),
             220,
         );
-        let mut sprites = Sprites::default();
+        let mut sprites = Sprites::new(crate::resource_source::ResourceSource::directory(
+            root.clone(),
+        ));
         for name in [
             "stone",
             "dirt",
@@ -197,14 +190,12 @@ mod tests {
             "diorite",
             "granite",
         ] {
-            sprites
-                .insert(&root, &format!("minecraft:block/{name}"))
-                .unwrap();
+            sprites.insert(&format!("minecraft:block/{name}")).unwrap();
         }
         // Items draw from the HUD atlas, not the terrain: no pair.
-        sprites.insert(&root, "minecraft:item/stick").unwrap();
+        sprites.insert("minecraft:item/stick").unwrap();
         // glowstone isn't loaded: its overlay pairs with nothing.
-        let pairs = load_optifine(&root, &mut sprites);
+        let pairs = load_optifine(&ResourceSource::directory(root.clone()), &mut sprites);
         assert_eq!(
             pairs,
             [(
@@ -231,10 +222,10 @@ mod tests {
         );
         for tile in ["ctm/lamp/0", "ctm/lamp/1", "glass/2"] {
             sprites
-                .insert_file(&root, &format!("assets/minecraft/optifine/{tile}.png"))
+                .insert_file(&format!("assets/minecraft/optifine/{tile}.png"))
                 .unwrap();
         }
-        let pairs = load_optifine(&root, &mut sprites);
+        let pairs = load_optifine(&ResourceSource::directory(root.clone()), &mut sprites);
         assert_eq!(
             pairs,
             // Blocks first, then tiles.

@@ -73,7 +73,8 @@ struct Shared {
 /// The game's handle. Dropping it stops the thread.
 pub struct Cosmetics {
     shared: Arc<Shared>,
-    worker: Option<Box<dyn FnMut() + Send>>,
+    /// Behind a lock so one client can be shared (`Arc<Cosmetics>` is `Send + Sync`).
+    worker: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 impl Cosmetics {
@@ -81,7 +82,12 @@ impl Cosmetics {
     /// `cache` when given.
     pub fn new(transport: impl Transport, cache: Option<PathBuf>) -> Self {
         let mut c = Self::manual(transport, cache, Arc::new(Instant::now));
-        let mut work = c.worker.take().expect("worker");
+        let mut work = c
+            .worker
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .expect("worker");
         let shared = c.shared.clone();
         let _ = std::thread::Builder::new()
             .name("Cosmetics".into())
@@ -128,7 +134,7 @@ impl Cosmetics {
         });
         Self {
             shared,
-            worker: Some(worker),
+            worker: Mutex::new(Some(worker)),
         }
     }
 
@@ -592,6 +598,7 @@ impl Local {
         for file in files {
             if let Some(item) = std::fs::read(&file).ok().and_then(|b| Item::parse(&b).ok())
                 && !slots.contains(&item.slot)
+                && item.slot != crate::Slot::Emote
                 && file.file_stem().is_some_and(|s| *s == *item.id)
             {
                 slots.push(item.slot);

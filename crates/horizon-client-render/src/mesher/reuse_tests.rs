@@ -2,6 +2,44 @@ use super::*;
 use crate::chunk::Light;
 
 #[test]
+fn padded_steps_match_coordinate_lookup_through_the_border() {
+    // Coordinate lookup is the old addressing path, independent of step_index
+    // and the direction table. Include every cell and the full two-cell halo.
+    let neighbors = [
+        (Direction::Down, [0, -1, 0]),
+        (Direction::Up, [0, 1, 0]),
+        (Direction::North, [0, 0, -1]),
+        (Direction::South, [0, 0, 1]),
+        (Direction::West, [-1, 0, 0]),
+        (Direction::East, [1, 0, 0]),
+    ];
+    for y in 0..16 {
+        for z in 0..16 {
+            for x in 0..16 {
+                let cell = (pi(0, y, z) + x as usize) as isize;
+                assert_eq!(cell as usize, pi(x, y, z));
+                for (face, [dx, dy, dz]) in neighbors {
+                    assert_eq!(
+                        (cell + OFFSETS[face as usize]) as usize,
+                        pi(x + dx, y + dy, z + dz)
+                    );
+                }
+                for dy in -2..=2 {
+                    for dz in -2..=2 {
+                        for dx in -2..=2 {
+                            assert_eq!(
+                                (cell + step_index([dx, dy, dz])) as usize,
+                                pi(x + dx, y + dy, z + dz)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn padded_reuse_resets_missing_neighbors_and_matches_chunk_reads_across_layouts() {
     let mut pad = Padded::default();
     let mut own = Box::new([u32::MAX; 4096]);
@@ -109,7 +147,7 @@ fn padded_fill_reads_every_neighbour_and_its_light_like_chunk_reads() {
 /// With a shader pack lighting the faces, every face of a lone stone block has one colour; the
 /// game's face shading (up 1.0, down 0.5, north/south 0.8, east/west 0.6) is left to the pack.
 #[test]
-#[ignore = "requires prepared 26.3 resources (HORIZON_MESH_TEST_RESOURCES or .local/horizon-client/26.3)"]
+#[ignore = "daily"]
 fn a_shader_pack_lights_the_faces_itself() {
     let root = std::env::var_os("HORIZON_MESH_TEST_RESOURCES")
         .map(std::path::PathBuf::from)
@@ -119,10 +157,17 @@ fn a_shader_pack_lights_the_faces_itself() {
         });
     let assets = Assets::load(&root).unwrap();
     let facts = BlockFacts::load(&root, assets.registry).unwrap();
-    let biomes = Biomes::load(&root).unwrap();
-    let render = assets.reload(&root).unwrap();
+    let biomes = Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(
+        root.to_path_buf(),
+    ))
+    .unwrap();
+    let render = assets
+        .reload(&horizon_assets::resource_source::ResourceRoot::directory(
+            root.to_path_buf(),
+        ))
+        .unwrap();
     let visibility = crate::models::load_visibility(&root, assets.registry).unwrap();
-    let tables = MeshTables::new(&assets, &render, &facts, visibility.clone()).unwrap();
+    let tables = MeshTables::new(&assets, &render, &facts, visibility.clone(), None).unwrap();
     let stone = assets.registry.default_state("minecraft:stone").unwrap().0;
     let mut chunk = Chunk::empty(0, 0);
     chunk.set(8, MIN_Y + 8, 8, stone);
@@ -134,6 +179,7 @@ fn a_shader_pack_lights_the_faces_itself() {
             shader_pack_lighting,
             separate_ao: false,
             shader_pack: false,
+            looks: false,
             assets: &assets,
             render: &render,
             tables: &tables,
@@ -143,8 +189,11 @@ fn a_shader_pack_lights_the_faces_itself() {
             blend_radius: 0,
             smooth_lighting: false,
             cutout_leaves: true,
+            opaque_ice: false,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
+            hidden_states: &[],
+            part_tables: Default::default(),
         };
         let mut colours: Vec<u32> = mesher
             .mesh(&region, 0)
@@ -164,7 +213,7 @@ fn a_shader_pack_lights_the_faces_itself() {
 /// block and of a lava source takes the dimension's up-face brightness, as Iris 1.11.7 gives our
 /// probe pack: 0.9 in the Nether (`CardinalLighting.NETHER`'s up, 229 of 255), 1.0 elsewhere.
 #[test]
-#[ignore = "requires prepared 26.3 resources (HORIZON_MESH_TEST_RESOURCES or .local/horizon-client/26.3)"]
+#[ignore = "daily"]
 fn a_shader_pack_lights_every_nether_face_like_an_up_face() {
     let root = std::env::var_os("HORIZON_MESH_TEST_RESOURCES")
         .map(std::path::PathBuf::from)
@@ -174,10 +223,17 @@ fn a_shader_pack_lights_every_nether_face_like_an_up_face() {
         });
     let assets = Assets::load(&root).unwrap();
     let facts = BlockFacts::load(&root, assets.registry).unwrap();
-    let biomes = Biomes::load(&root).unwrap();
-    let render = assets.reload(&root).unwrap();
+    let biomes = Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(
+        root.to_path_buf(),
+    ))
+    .unwrap();
+    let render = assets
+        .reload(&horizon_assets::resource_source::ResourceRoot::directory(
+            root.to_path_buf(),
+        ))
+        .unwrap();
     let visibility = crate::models::load_visibility(&root, assets.registry).unwrap();
-    let tables = MeshTables::new(&assets, &render, &facts, visibility.clone()).unwrap();
+    let tables = MeshTables::new(&assets, &render, &facts, visibility.clone(), None).unwrap();
     let state = |name| assets.registry.default_state(name).unwrap().0;
     let mut chunk = Chunk::empty(0, 0);
     chunk.set(4, MIN_Y + 8, 4, state("minecraft:netherrack"));
@@ -190,6 +246,7 @@ fn a_shader_pack_lights_every_nether_face_like_an_up_face() {
             shader_pack_lighting: true,
             separate_ao: false,
             shader_pack: false,
+            looks: false,
             assets: &assets,
             render: &render,
             tables: &tables,
@@ -199,8 +256,11 @@ fn a_shader_pack_lights_every_nether_face_like_an_up_face() {
             blend_radius: 0,
             smooth_lighting: false,
             cutout_leaves: true,
+            opaque_ice: false,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
+            hidden_states: &[],
+            part_tables: Default::default(),
         };
         let mesh = mesher.mesh(&region, 0);
         // Both blocks' six faces: 2 × 6 quads of 4 vertices.
@@ -216,7 +276,7 @@ fn a_shader_pack_lights_every_nether_face_like_an_up_face() {
 }
 
 #[test]
-#[ignore = "requires prepared 26.3 resources (HORIZON_MESH_TEST_RESOURCES or .local/horizon-client/26.3)"]
+#[ignore = "daily"]
 fn separate_ao_passes_ao_in_alpha_without_darkening_rgb() {
     let root = std::env::var_os("HORIZON_MESH_TEST_RESOURCES")
         .map(std::path::PathBuf::from)
@@ -226,10 +286,17 @@ fn separate_ao_passes_ao_in_alpha_without_darkening_rgb() {
         });
     let assets = Assets::load(&root).unwrap();
     let facts = BlockFacts::load(&root, assets.registry).unwrap();
-    let biomes = Biomes::load(&root).unwrap();
-    let render = assets.reload(&root).unwrap();
+    let biomes = Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(
+        root.to_path_buf(),
+    ))
+    .unwrap();
+    let render = assets
+        .reload(&horizon_assets::resource_source::ResourceRoot::directory(
+            root.to_path_buf(),
+        ))
+        .unwrap();
     let visibility = crate::models::load_visibility(&root, assets.registry).unwrap();
-    let tables = MeshTables::new(&assets, &render, &facts, visibility.clone()).unwrap();
+    let tables = MeshTables::new(&assets, &render, &facts, visibility.clone(), None).unwrap();
     let stone = assets.registry.default_state("minecraft:stone").unwrap().0;
     let mut chunk = Chunk::empty(0, 0);
     // Place stone with neighbouring blocks to create AO variations.
@@ -242,6 +309,7 @@ fn separate_ao_passes_ao_in_alpha_without_darkening_rgb() {
         shader_pack_lighting: true,
         separate_ao: true,
         shader_pack: false,
+        looks: false,
         assets: &assets,
         render: &render,
         tables: &tables,
@@ -251,8 +319,11 @@ fn separate_ao_passes_ao_in_alpha_without_darkening_rgb() {
         blend_radius: 0,
         smooth_lighting: true,
         cutout_leaves: true,
+        opaque_ice: false,
         translucent_layers: &[],
         leaf_culling: LeafCullingMode::Off,
+        hidden_states: &[],
+        part_tables: Default::default(),
     };
     let mesh = mesher.mesh(&region, 0);
     assert!(!mesh.solid.is_empty());
@@ -265,7 +336,7 @@ fn separate_ao_passes_ao_in_alpha_without_darkening_rgb() {
 }
 
 #[test]
-#[ignore = "requires prepared 26.3 resources (HORIZON_MESH_TEST_RESOURCES or .local/horizon-client/26.3)"]
+#[ignore = "daily"]
 fn reused_mesh_matches_fresh_geometry_across_sections_and_resource_reload() {
     let root = std::env::var_os("HORIZON_MESH_TEST_RESOURCES")
         .map(std::path::PathBuf::from)
@@ -275,7 +346,10 @@ fn reused_mesh_matches_fresh_geometry_across_sections_and_resource_reload() {
         });
     let assets = Assets::load(&root).unwrap();
     let facts = BlockFacts::load(&root, assets.registry).unwrap();
-    let biomes = Biomes::load(&root).unwrap();
+    let biomes = Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(
+        root.to_path_buf(),
+    ))
+    .unwrap();
     let state = |name| assets.registry.default_state(name).unwrap().0;
     let names = [
         "minecraft:stone",
@@ -309,14 +383,19 @@ fn reused_mesh_matches_fresh_geometry_across_sections_and_resource_reload() {
     // The same scratch and output buffers survive a resource reload. They must
     // contain no references into the previous RenderAssets or MeshTables.
     for reload in 0..2 {
-        let render = assets.reload(&root).unwrap();
+        let render = assets
+            .reload(&horizon_assets::resource_source::ResourceRoot::directory(
+                root.to_path_buf(),
+            ))
+            .unwrap();
         let visibility = crate::models::load_visibility(&root, assets.registry).unwrap();
-        let tables = MeshTables::new(&assets, &render, &facts, visibility.clone()).unwrap();
+        let tables = MeshTables::new(&assets, &render, &facts, visibility.clone(), None).unwrap();
         let mut mesher = Mesher {
             nether_shading: false,
             shader_pack_lighting: false,
             separate_ao: false,
             shader_pack: false,
+            looks: false,
             assets: &assets,
             render: &render,
             tables: &tables,
@@ -326,8 +405,11 @@ fn reused_mesh_matches_fresh_geometry_across_sections_and_resource_reload() {
             blend_radius: 2,
             smooth_lighting: reload == 0,
             cutout_leaves: reload == 0,
+            opaque_ice: false,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
+            hidden_states: &[],
+            part_tables: Default::default(),
         };
         for (case, (center, east)) in [
             (&empty, None),
@@ -435,7 +517,7 @@ fn benchmark_padded_reuse() {
 /// north-east to south-west as Iris 1.11.7's do in our probes (`fluid::splits_north_east`);
 /// without one it keeps vanilla's north-west start (`FluidRenderer.tesselate`).
 #[test]
-#[ignore = "requires prepared 26.3 resources (HORIZON_MESH_TEST_RESOURCES or .local/horizon-client/26.3)"]
+#[ignore = "daily"]
 fn a_shader_pack_s_still_water_top_starts_at_its_south_west_corner() {
     let root = std::env::var_os("HORIZON_MESH_TEST_RESOURCES")
         .map(std::path::PathBuf::from)
@@ -445,10 +527,17 @@ fn a_shader_pack_s_still_water_top_starts_at_its_south_west_corner() {
         });
     let assets = Assets::load(&root).unwrap();
     let facts = BlockFacts::load(&root, assets.registry).unwrap();
-    let biomes = Biomes::load(&root).unwrap();
-    let render = assets.reload(&root).unwrap();
+    let biomes = Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(
+        root.to_path_buf(),
+    ))
+    .unwrap();
+    let render = assets
+        .reload(&horizon_assets::resource_source::ResourceRoot::directory(
+            root.to_path_buf(),
+        ))
+        .unwrap();
     let visibility = crate::models::load_visibility(&root, assets.registry).unwrap();
-    let tables = MeshTables::new(&assets, &render, &facts, visibility.clone()).unwrap();
+    let tables = MeshTables::new(&assets, &render, &facts, visibility.clone(), None).unwrap();
     let state = |name| assets.registry.default_state(name).unwrap().0;
     let mut chunk = Chunk::empty(0, 0);
     for x in 7..=9 {
@@ -466,6 +555,7 @@ fn a_shader_pack_s_still_water_top_starts_at_its_south_west_corner() {
             shader_pack_lighting: shader_pack,
             separate_ao: false,
             shader_pack,
+            looks: false,
             assets: &assets,
             render: &render,
             tables: &tables,
@@ -475,8 +565,11 @@ fn a_shader_pack_s_still_water_top_starts_at_its_south_west_corner() {
             blend_radius: 0,
             smooth_lighting: true,
             cutout_leaves: true,
+            opaque_ice: false,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
+            hidden_states: &[],
+            part_tables: Default::default(),
         };
         let mesh = mesher.mesh(&region, 0);
         // The top and its backward face, both from the same first corner.

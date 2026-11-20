@@ -8,15 +8,15 @@ use crate::{
     mobs::spawner::{SpawnDataExt, SpawnerExt},
     section_mask::SectionMask,
 };
+use horizon_core::nbt::{Compound, Tag};
 use horizon_protocol::{
-    buf::{BitSet, Codec, List, Writer, set_bit},
+    buf::{BitSet, Codec, List, Writer, check_network_nbt, set_bit},
     chunk::{
         BIOMES, BLOCKS, BlockEntityInfo, ChunkData, Heightmaps, LightData, Paletted, Strategy,
     },
     packets::play::{ChunkBiomeData, LevelChunkWithLight},
     registry::{Builtin, ceil_log2},
 };
-use horizon_world::nbt::{Compound, Tag};
 use std::{
     collections::HashMap,
     sync::{
@@ -24,6 +24,8 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+
+use super::terrain_view::{self, Neighbours, Rules};
 
 const NON_AIR: u8 = 1;
 const FLUID: u8 = 2;
@@ -35,7 +37,10 @@ pub type ModUpdateTag = fn([i32; 3], &ModBlockEntity) -> Option<Compound>;
 
 /// The vanilla block entity type of a block (BlockEntityType.validBlocks).
 pub fn block_entity_type(name: &str) -> Option<&'static str> {
-    let n = name.strip_prefix("minecraft:")?;
+    if crate::block_entity_types::factory_valid(name) == Some(false) {
+        return None;
+    }
+    let n = crate::block_entity_types::factory_block(name).strip_prefix("minecraft:")?;
     Some(match n {
         "chest" => "minecraft:chest",
         "trapped_chest" => "minecraft:trapped_chest",
@@ -100,17 +105,21 @@ pub struct ChunkEncoder {
     coder: Arc<SectionCoder>,
     /// Block entity type id per state (-1 for none).
     entity_types: Vec<i32>,
-    /// Whether the state is a mod block's: its type is the block's own, and
-    /// it has a block entity only when the mod made one.
-    mod_entities: Vec<bool>,
+    /// Vanilla chest types, separate from other containers stored as `BlockEntity::Chest`.
+    chest_types: [i32; 3],
+    /// A native state's declared type, sent only for a matching instance.
+    mod_entities: Vec<Option<Arc<str>>>,
     /// The mods' update tags (`native_block_entity_update_tag`).
     pub mod_update_tag: Option<ModUpdateTag>,
+    /// The states with `trial_spawner_state=active`, whose trial spawner
+    /// update tag holds `next_mob_spawns_at`.
+    pub trial_active: Vec<u32>,
     /// The block registry id of each state's block, for BlockEvent.
     pub block_ids: Vec<i32>,
     /// The save's tables, for the heightmaps.
     pub tables: Option<Arc<crate::save::SaveTables>>,
     /// Sections already looked at, by address (see `Encoded`).
-    cache: std::sync::Mutex<FxHashMap<usize, Encoded>>,
+    cache: SectionCache,
     /// Each column's heightmaps, with the sections they were made from.
     heights: std::sync::Mutex<HashMap<(i32, i32), Heights>>,
     /// The level's sections among a column's: all of them in the Overworld,
@@ -127,6 +136,9 @@ struct SectionCoder {
     flags: Vec<u8>,
     /// Network biome id per internal biome index.
     biome_ids: Vec<i32>,
+    /// Plains' network id, sent for an index past `biome_ids`: a placeholder for a saved
+    /// biome the world lacks, which plays as plains.
+    biome_fallback: i32,
     biome_bits: u8,
 }
 
@@ -187,6 +199,81 @@ struct Encoded {
     non_air: bool,
     /// LevelChunkSection.write, and its block entity blocks.
     wire: Option<(Arc<[u8]>, Entities)>,
+}
+
+type SectionCache = std::sync::Mutex<FxHashMap<usize, Encoded>>;
+
+/// A section's entry in the locked cache, made with `non_air` when missing.
+fn entry<'a>(
+    coder: &SectionCoder,
+    cache: &'a mut FxHashMap<usize, Encoded>,
+    section: &Arc<Section>,
+) -> &'a mut Encoded {
+    if cache.len() >= CACHE_SWEEP {
+        cache.retain(|_, e| e.section.strong_count() > 0);
+        if cache.len() >= CACHE_SWEEP / 2 {
+            cache.clear();
+        }
+    }
+    cache
+        .entry(Arc::as_ptr(section) as usize)
+        .or_insert_with(|| Encoded {
+            section: Arc::downgrade(section),
+            non_air: coder.non_air(section),
+            wire: None,
+        })
+}
+
+impl SectionCoder {
+    /// LevelChunkSection.hasOnlyAir, negated.
+    fn non_air(&self, section: &Section) -> bool {
+        let non_air = |v: u32| self.flags.get(v as usize).copied().unwrap_or(0) & NON_AIR != 0;
+        // The palette first: most sections are all air, or one block.
+        if !section.blocks.maybe_has(non_air) {
+            false
+        } else if let Some(v) = section.blocks.uniform() {
+            non_air(v)
+        } else {
+            // Stops at the first block, usually near the bottom.
+            (0..BLOCKS).any(|i| non_air(section.blocks.get(i)))
+        }
+    }
+}
+
+fn section_wire(coder: &SectionCoder, cache: &SectionCache, section: &Arc<Section>) -> Warmed {
+    if let Some(wire) = entry(coder, &mut cache.lock().unwrap(), section)
+        .wire
+        .clone()
+    {
+        return wire;
+    }
+    let wire = coder.wire(section);
+    entry(coder, &mut cache.lock().unwrap(), section).wire = Some(wire.clone());
+    wire
+}
+
+fn occupied(
+    coder: &SectionCoder,
+    cache: &SectionCache,
+    sections: &std::ops::Range<usize>,
+    chunk: &Chunk,
+) -> SectionMask {
+    let mut bits = SectionMask::EMPTY;
+    let mut entries = cache.lock().unwrap();
+    for (i, s) in chunk.sections[sections.clone()].iter().enumerate() {
+        let non_air = if s.blocks.bits() == 0 {
+            coder
+                .flags
+                .get(s.blocks.get(0) as usize)
+                .is_some_and(|f| f & NON_AIR != 0)
+        } else {
+            entry(coder, &mut entries, s).non_air
+        };
+        if non_air {
+            bits.insert(i);
+        }
+    }
+    bits
 }
 
 /// A section's blocks that have a block entity type, as (index, state) in
@@ -303,7 +390,7 @@ impl SectionCoder {
             self.biome_ids
                 .get(usize::from(v as u16))
                 .copied()
-                .unwrap_or(0)
+                .unwrap_or(self.biome_fallback)
         };
         if let Some(v) = section.biomes.uniform() {
             return Paletted {
@@ -370,9 +457,247 @@ impl Warm {
 /// Columns below which their bodies are written on the tick's thread alone.
 const BODIES_MIN: usize = 4;
 
-/// A column's body with what reads the level done: its sections' bytes, its
-/// heightmaps and its block entities. What is left, the light layers and the
-/// writing, reads only its own sections, so any thread can finish it.
+/// The immutable inputs a worker needs to project and serialize sections.
+#[derive(Clone)]
+pub(super) struct TerrainEncoder {
+    coder: Arc<SectionCoder>,
+    tables: Option<Arc<crate::save::SaveTables>>,
+    sections: std::ops::Range<usize>,
+    min_y: i32,
+    sky: bool,
+}
+
+/// Each worker keeps a small ordinary section cache. It never takes the network thread's lock.
+#[derive(Default)]
+pub(super) struct TerrainSections {
+    coder: Option<std::sync::Weak<SectionCoder>>,
+    entries: FxHashMap<usize, Encoded>,
+}
+
+impl TerrainSections {
+    fn wire(&mut self, coder: &Arc<SectionCoder>, section: &Arc<Section>) -> Warmed {
+        if self
+            .coder
+            .as_ref()
+            .is_none_or(|old| old.as_ptr() != Arc::as_ptr(coder))
+        {
+            self.entries.clear();
+            self.coder = Some(Arc::downgrade(coder));
+        }
+        if self.entries.len() >= 128 {
+            self.entries.clear();
+        }
+        entry(coder, &mut self.entries, section)
+            .wire
+            .get_or_insert_with(|| coder.wire(section))
+            .clone()
+    }
+}
+
+fn eligible_terrain_section(section: &Section, y: i32, rules: &Rules) -> bool {
+    let uniform = section.blocks.uniform();
+    let palette = uniform
+        .as_ref()
+        .map(std::slice::from_ref)
+        .or_else(|| section.blocks.palette());
+    rules.eligible(y, palette)
+}
+
+impl TerrainEncoder {
+    pub(super) fn encode(
+        &self,
+        chunk: &Chunk,
+        neighbours: &Neighbours,
+        rules: &Rules,
+        faces: &mut terrain_view::Faces,
+    ) -> TerrainWires {
+        let own = (chunk.x, chunk.z);
+        let wires = self
+            .sections
+            .clone()
+            .map(|i| {
+                let section = &chunk.sections[i];
+                let y = chunk.min_y() + 16 * i as i32;
+                if !eligible_terrain_section(section, y, rules) {
+                    return None;
+                }
+                let mut original = [0; 4096];
+                section.unpack(&mut original);
+                let mut values = original;
+                for (index, value) in values.iter_mut().enumerate() {
+                    let x = chunk.x * 16 + (index & 15) as i32;
+                    let z = chunk.z * 16 + (index >> 4 & 15) as i32;
+                    let pos = (x, y + (index >> 8) as i32, z);
+                    let shown = rules.state(pos, *value, |p @ (x, ny, z)| {
+                        if (y..y + 16).contains(&ny) && terrain_view::column(p) == own {
+                            return Some(original[crate::chunk::index(x, ny, z)]);
+                        }
+                        if terrain_view::column(p) == own {
+                            return terrain_view::known(chunk, x, ny, z);
+                        }
+                        let face = terrain_view::adjacent(own)
+                            .position(|key| key == terrain_view::column(p))?;
+                        let state = neighbours[face]
+                            .as_deref()
+                            .and_then(|other| terrain_view::known(other, x, ny, z));
+                        faces.read(face, p, rules.covers(state));
+                        state
+                    });
+                    if shown != *value {
+                        faces.conceal(pos, *value);
+                    }
+                    *value = shown;
+                }
+                if original == values {
+                    return None;
+                }
+                let section = Section {
+                    blocks: Section::from_blocks(&values),
+                    biomes: section.biomes.clone(),
+                    light: Light::Uniform(0),
+                };
+                let (encoded, mut entities) = self.coder.section(&section);
+                // Even a replacement that has the same entity kind must not expose the original tag.
+                entities.retain(|&(i, state)| original[usize::from(i)] == state);
+                let mut writer = Writer::new();
+                encoded.write(&mut writer);
+                Some((writer.data.into(), entities.into()))
+            })
+            .collect();
+        TerrainWires(wires)
+    }
+}
+
+/// The transformed sections of a column. Missing entries use the ordinary section cache.
+#[derive(Default)]
+pub(super) struct TerrainWires(Vec<Option<Warmed>>);
+
+impl TerrainWires {
+    pub(super) fn unchanged(&self) -> bool {
+        self.0.iter().all(Option::is_none)
+    }
+}
+
+/// A complete packet with an empty list at its tag slot. Live tags never enter the cache.
+pub(super) struct TerrainBody {
+    near: Arc<[u8]>,
+    far: Option<Arc<[u8]>>,
+    tag_offset: usize,
+    candidates: Vec<(u16, u16, u32)>,
+}
+
+impl TerrainBody {
+    pub(super) fn bytes(&self) -> usize {
+        self.near.len()
+            + self.far.as_ref().map_or(0, |b| b.len())
+            + self.candidates.capacity() * std::mem::size_of::<(u16, u16, u32)>()
+    }
+
+    pub(super) fn static_body(&self, far: bool) -> &Arc<[u8]> {
+        if far {
+            self.far.as_ref().unwrap_or(&self.near)
+        } else {
+            &self.near
+        }
+    }
+
+    pub(super) fn has_entities(&self) -> bool {
+        !self.candidates.is_empty()
+    }
+}
+
+impl TerrainEncoder {
+    pub(super) fn matches(&self, current: &ChunkEncoder) -> bool {
+        Arc::ptr_eq(&self.coder, &current.coder)
+            && self.sections == current.sections
+            && self.min_y == current.level().0
+            && self.sky == current.sky
+            && match (&self.tables, &current.tables) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    pub(super) fn occupied(&self, chunk: &Chunk) -> SectionMask {
+        chunk.sections[self.sections.clone()]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, section)| self.coder.non_air(section).then_some(i))
+            .collect()
+    }
+
+    pub(super) fn proto_occupied(&self, sections: SectionMask) -> SectionMask {
+        sections
+            .iter()
+            .filter(|i| self.sections.contains(i))
+            .map(|i| i - self.sections.start)
+            .collect()
+    }
+
+    pub(super) fn body(
+        &self,
+        chunk: &Chunk,
+        wires: TerrainWires,
+        around: SectionMask,
+        include_far: bool,
+        sections: &mut TerrainSections,
+    ) -> TerrainBody {
+        let mut candidates = Vec::new();
+        let wires = self
+            .sections
+            .clone()
+            .zip(wires.0)
+            .map(|(index, wire)| {
+                let (bytes, entities) =
+                    wire.unwrap_or_else(|| sections.wire(&self.coder, &chunk.sections[index]));
+                candidates.extend(
+                    entities
+                        .iter()
+                        .map(|&(cell, state)| (index as u16, cell, state)),
+                );
+                bytes
+            })
+            .collect();
+        let heightmaps = self
+            .tables
+            .as_ref()
+            .map(|tables| {
+                Arc::new(crate::save::client_heightmaps_in(
+                    &chunk.sections,
+                    chunk.min_y(),
+                    tables,
+                    self.min_y,
+                    16 * self.sections.len() as i32,
+                ))
+            })
+            .unwrap_or_default();
+        let mut prepared = Prepared {
+            x: chunk.x,
+            z: chunk.z,
+            heightmaps,
+            wires,
+            tags: vec![0],
+            sections: chunk.sections[self.sections.clone()].to_vec(),
+            around,
+            sky: self.sky,
+        };
+        let (near, tag_offset) = prepared.write_with_tag_slot();
+        let far = (include_far && around != SectionMask::ALL).then(|| {
+            prepared.around = SectionMask::ALL;
+            Arc::from(prepared.write())
+        });
+        TerrainBody {
+            near: near.into(),
+            far,
+            tag_offset,
+            candidates,
+        }
+    }
+}
+
+/// A column's body with what reads the level done: its sections' bytes, heightmaps and tags.
+/// The light layers and the final write only read immutable data.
 struct Prepared {
     x: i32,
     z: i32,
@@ -389,6 +714,10 @@ impl Prepared {
     /// The body as `Clientbound::encode` gives it for LevelChunkWithLight,
     /// written once into a buffer of its final size.
     fn write(&self) -> Vec<u8> {
+        self.write_with_tag_slot().0
+    }
+
+    fn write_with_tag_slot(&self) -> (Vec<u8>, usize) {
         let lights = light_sections(&self.sections, self.around, SectionLight::of);
         let buffer: usize = self.wires.iter().map(|w| w.len()).sum();
         // The masks, counts and lengths fit the 64 bytes.
@@ -412,9 +741,10 @@ impl Prepared {
         for wire in &self.wires {
             w.bytes(wire);
         }
+        let tag_offset = w.data.len();
         w.bytes(&self.tags);
         write_light(&lights, self.sky, &mut w);
-        w.data
+        (w.data, tag_offset)
     }
 }
 
@@ -490,7 +820,7 @@ impl WarmPool {
 fn warm_pool() -> Option<&'static WarmPool> {
     static POOL: OnceLock<Option<Arc<WarmPool>>> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = horizon_threads::worker_count() - 1;
+        let threads = horizon_threads::sizing::for_pool(horizon_threads::sizing::Pool::ChunkEncode);
         let pool = Arc::new(WarmPool {
             job: Default::default(),
             ready: Default::default(),
@@ -502,17 +832,37 @@ fn warm_pool() -> Option<&'static WarmPool> {
                     .name(format!("horizon-chunk-encode-{i}"))
                     .spawn(move || {
                         let mut done = 0;
+                        let mut release_seen = horizon_threads::release_seen();
                         loop {
                             let job = {
                                 let mut slot = pool.job.lock().unwrap();
                                 while slot.0 == done {
-                                    slot = pool.ready.wait(slot).unwrap();
+                                    // Between jobs, give back what the server
+                                    // freed into this thread's heap when it
+                                    // asks (`release_everywhere`).
+                                    let (next, wait) = pool
+                                        .ready
+                                        .wait_timeout(slot, horizon_threads::RELEASE_POLL)
+                                        .unwrap();
+                                    slot = next;
+                                    if wait.timed_out()
+                                        && horizon_threads::release_asked(&mut release_seen)
+                                    {
+                                        drop(slot);
+                                        horizon_threads::release_free_memory();
+                                        slot = pool.job.lock().unwrap();
+                                    }
                                 }
                                 done = slot.0;
                                 slot.1.clone()
                             };
                             if let Some(job) = job {
                                 job.run();
+                            }
+                            // Asked while jobs keep coming (no gap for the
+                            // timed check above): give it back between two.
+                            if horizon_threads::release_asked(&mut release_seen) {
+                                horizon_threads::release_free_memory();
                             }
                         }
                     })
@@ -548,6 +898,22 @@ impl ChunkEncoder {
         biome_names: &[String],
         biome_registry: &[String],
     ) -> Self {
+        Self::with_types(
+            states,
+            builtin,
+            biome_names,
+            biome_registry,
+            crate::block_entity_types::current(),
+        )
+    }
+
+    pub(super) fn with_types(
+        states: impl IntoIterator<Item = (Arc<str>, bool, Option<crate::blocks::SignForm>)>,
+        builtin: &Builtin,
+        biome_names: &[String],
+        biome_registry: &[String],
+        declared: Option<&crate::block_entity_types::BlockEntityTypes>,
+    ) -> Self {
         let types = builtin.get("minecraft:block_entity_type");
         let blocks = builtin.get("minecraft:block");
         let mut flags = Vec::new();
@@ -566,23 +932,18 @@ impl ChunkEncoder {
                     f |= FLUID;
                 }
             }
-            // A mod block's block entity type is named after the block
-            // (`mod_content`: registries.json), unless it is one of vanilla's.
-            let vanilla = sign.map(crate::blocks::SignForm::block_entity_type);
-            let modded = !name.starts_with("minecraft:") && vanilla.is_none();
-            let t = if modded {
-                Some(&*name)
-            } else {
-                vanilla.or_else(|| block_entity_type(&name))
-            }
-            .and_then(|t| types.and_then(|ids| ids.id(t)))
-            .unwrap_or(-1);
+            let modded = declared.and_then(|d| d.type_for(&name));
+            let t = modded
+                .or_else(|| sign.map(crate::blocks::SignForm::block_entity_type))
+                .or_else(|| block_entity_type(&name))
+                .and_then(|t| types.and_then(|ids| ids.id(t)))
+                .unwrap_or(-1);
             if t >= 0 {
                 f |= ENTITY;
             }
             flags.push(f);
             entity_types.push(t);
-            mod_entities.push(modded && t >= 0);
+            mod_entities.push(modded.map(Arc::from));
             block_ids.push(blocks.and_then(|b| b.id(&name)).unwrap_or(0));
         }
         let biome_ids = biome_names
@@ -598,11 +959,22 @@ impl ChunkEncoder {
             coder: Arc::new(SectionCoder {
                 flags,
                 biome_ids,
+                biome_fallback: biome_registry
+                    .iter()
+                    .position(|b| b == "minecraft:plains")
+                    .map_or(0, |i| i as i32),
                 biome_bits: ceil_log2(biome_registry.len()),
             }),
             entity_types,
+            chest_types: [
+                "minecraft:chest",
+                "minecraft:trapped_chest",
+                "minecraft:ender_chest",
+            ]
+            .map(|name| types.and_then(|ids| ids.id(name)).unwrap_or(-1)),
             mod_entities,
             mod_update_tag: None,
+            trial_active: Vec::new(),
             block_ids,
             tables: None,
             cache: Default::default(),
@@ -650,55 +1022,63 @@ impl ChunkEncoder {
         )
     }
 
-    /// The cached entry for a section, made with `non_air` when missing.
-    fn cached<T>(&self, section: &Arc<Section>, read: impl FnOnce(&mut Encoded) -> T) -> T {
-        read(self.entry(&mut self.cache.lock().unwrap(), section))
+    /// Drop the encoded sections and heightmaps kept for sending again, with
+    /// their tables' memory: nobody is on to send them to.
+    pub fn forget_cache(&self) {
+        *self.cache.lock().unwrap() = FxHashMap::default();
+        *self.heights.lock().unwrap() = HashMap::new();
     }
 
-    /// A section's entry in the locked cache, made with `non_air` when missing.
+    /// The section entries and the column heightmaps cached, each as (entries, bytes).
+    pub fn cache_census(&self) -> [(usize, usize); 2] {
+        use std::mem::size_of;
+        let (entries, sections, wire) = {
+            let cache = self.cache.lock().unwrap();
+            let wire: usize = cache
+                .values()
+                .filter_map(|e| e.wire.as_ref())
+                .map(|(bytes, entities)| bytes.len() + entities.len() * size_of::<(u16, u32)>())
+                .sum();
+            (
+                cache.len(),
+                cache.capacity() * (size_of::<(usize, Encoded)>() + 1),
+                wire,
+            )
+        };
+        let heights = self.heights.lock().unwrap();
+        let maps: usize = heights
+            .values()
+            .map(|h| {
+                h.sections.capacity() * size_of::<std::sync::Weak<Section>>()
+                    + h.maps
+                        .iter()
+                        .map(|(_, v)| v.capacity() * 8 + 24)
+                        .sum::<usize>()
+            })
+            .sum();
+        [
+            (entries, sections + wire),
+            (
+                heights.len(),
+                maps + heights.capacity() * (size_of::<((i32, i32), Heights)>() + 1),
+            ),
+        ]
+    }
     fn entry<'a>(
         &self,
         cache: &'a mut FxHashMap<usize, Encoded>,
         section: &Arc<Section>,
     ) -> &'a mut Encoded {
-        if cache.len() >= CACHE_SWEEP {
-            cache.retain(|_, e| e.section.strong_count() > 0);
-            if cache.len() >= CACHE_SWEEP / 2 {
-                cache.clear();
-            }
-        }
-        cache
-            .entry(Arc::as_ptr(section) as usize)
-            .or_insert_with(|| Encoded {
-                section: Arc::downgrade(section),
-                non_air: self.non_air(section),
-                wire: None,
-            })
+        entry(&self.coder, cache, section)
     }
 
-    /// LevelChunkSection.hasOnlyAir, negated.
-    fn non_air(&self, section: &Section) -> bool {
-        let non_air =
-            |v: u32| self.coder.flags.get(v as usize).copied().unwrap_or(0) & NON_AIR != 0;
-        // The palette first: most sections are all air, or one block.
-        if !section.blocks.maybe_has(non_air) {
-            false
-        } else if let Some(v) = section.blocks.uniform() {
-            non_air(v)
-        } else {
-            // Stops at the first block, usually near the bottom.
-            (0..BLOCKS).any(|i| non_air(section.blocks.get(i)))
-        }
+    #[cfg(test)]
+    fn cached<T>(&self, section: &Arc<Section>, read: impl FnOnce(&mut Encoded) -> T) -> T {
+        read(self.entry(&mut self.cache.lock().unwrap(), section))
     }
 
-    /// A section on the wire, from the cache or encoded now.
-    fn section_wire(&self, section: &Arc<Section>) -> (Arc<[u8]>, Entities) {
-        if let Some(wire) = self.cached(section, |e| e.wire.clone()) {
-            return wire;
-        }
-        let wire = self.coder.wire(section);
-        self.cached(section, |e| e.wire = Some(wire.clone()));
-        wire
+    fn section_wire(&self, section: &Arc<Section>) -> Warmed {
+        section_wire(&self.coder, &self.cache, section)
     }
     /// Encode for a level of `shape`: its chunks hold `shape.column()`, of
     /// which the level's own sections go on the wire.
@@ -718,15 +1098,77 @@ impl ChunkEncoder {
             .filter(|t| **t >= 0)
             .copied()
     }
+    /// Native entities must match the state's declared type, for chunks and updates alike.
+    pub fn entity_matches(&self, state: u32, entity: Option<&BlockEntity>) -> bool {
+        match self
+            .mod_entities
+            .get(state as usize)
+            .and_then(Option::as_deref)
+        {
+            Some(kind) => matches!(entity, Some(BlockEntity::Mod(m)) if m.id() == kind),
+            None => !matches!(entity, Some(BlockEntity::Mod(_))),
+        }
+    }
+
     /// The update tag of the block entity at `pos` (`getUpdateTag`): a
     /// mod's from its hook, a vanilla one's from [`entity_tag`].
-    pub fn update_tag(&self, pos: (i32, i32, i32), entity: &BlockEntity) -> Option<Tag> {
+    pub fn update_tag(
+        &self,
+        pos: (i32, i32, i32),
+        state: u32,
+        entity: &BlockEntity,
+    ) -> Option<Tag> {
         match entity {
             BlockEntity::Mod(m) => self
                 .mod_update_tag
                 .and_then(|tag| tag([pos.0, pos.1, pos.2], m))
                 .map(Tag::Compound),
-            _ => entity_tag(entity),
+            _ => entity_tag(entity, self.trial_active.contains(&state)),
+        }
+    }
+
+    /// The empty vanilla chest snapshot for a terrain reveal. Chunk records elide
+    /// the empty tag, but a standalone block-entity packet requires a compound.
+    pub(super) fn chest_snapshot_tag(&self, state: u32, entity: &BlockEntity) -> Option<Tag> {
+        (matches!(entity, BlockEntity::Chest(_))
+            && self.chest_types.contains(&self.entity_type(state)?))
+        .then(|| Tag::Compound(Compound::new()))
+    }
+
+    /// The tag of a block change at `pos`: [`Self::update_tag`] with a mod's
+    /// queued one-shot fields taken and put over it. It takes them, so build it
+    /// once, with viewers, and send it to them all; a chunk or a single player's
+    /// resend uses `update_tag`, which leaves them for such a change. Fields that would take the
+    /// tag past what a client reads (`buf::check_network_nbt`) are dropped, and the plain
+    /// `update_tag` goes instead: no viewer is disconnected or misses the change.
+    pub fn change_tag(
+        &self,
+        pos: (i32, i32, i32),
+        state: u32,
+        entity: &BlockEntity,
+    ) -> Option<Tag> {
+        let tag = self.update_tag(pos, state, entity);
+        let BlockEntity::Mod(m) = entity else {
+            return tag;
+        };
+        let Some(fields) = m.take_client_update_fields() else {
+            return tag;
+        };
+        let mut merged = match &tag {
+            Some(Tag::Compound(tag)) => tag.clone(),
+            _ => Compound::new(),
+        };
+        merged.extend(fields);
+        let merged = Tag::Compound(merged);
+        match check_network_nbt(&merged) {
+            Ok(()) => Some(merged),
+            Err(e) => {
+                log::warn!(
+                    "[lan] {} at {pos:?}: one-shot client update fields dropped: {e}",
+                    m.id()
+                );
+                tag
+            }
         }
     }
     /// Whether the state holds a fluid (water, lava, or a waterlogged block).
@@ -745,21 +1187,8 @@ impl ChunkEncoder {
 
     /// The chunk column with its light and block entities.
     /// The non-air sections of a column as bits (LevelChunkSection.hasOnlyAir).
-    fn occupied(&self, chunk: &Chunk) -> SectionMask {
-        let mut bits = SectionMask::EMPTY;
-        // One lock for the column: body_in asks for nine columns' sections.
-        let mut cache = self.cache.lock().unwrap();
-        for (i, s) in chunk.sections[self.sections.clone()].iter().enumerate() {
-            let non_air = if s.blocks.bits() == 0 {
-                !self.is_air(s.blocks.get(0))
-            } else {
-                self.entry(&mut cache, s).non_air
-            };
-            if non_air {
-                bits.insert(i);
-            }
-        }
-        bits
+    pub(super) fn occupied(&self, chunk: &Chunk) -> SectionMask {
+        occupied(&self.coder, &self.cache, &self.sections, chunk)
     }
 
     /// The non-air sections of the column and its neighbours, as bits. A
@@ -814,14 +1243,110 @@ impl ChunkEncoder {
         )
     }
 
+    /// A lit resident far column, with its live block entities and every light layer:
+    /// neighbours outside the loading buffer need not be loaded just to send it.
+    pub(super) fn body_far(&self, chunk: &Chunk, world: &crate::world::World) -> Vec<u8> {
+        self.body(chunk, &world.block_entities, SectionMask::ALL)
+    }
+
+    /// Resident transforms read only the section coder and level range.
+    pub(super) fn terrain_encoder(&self) -> TerrainEncoder {
+        TerrainEncoder {
+            coder: self.coder.clone(),
+            tables: self.tables.clone(),
+            sections: self.sections.clone(),
+            min_y: self.level().0,
+            sky: self.sky,
+        }
+    }
+
+    pub(super) fn terrain_eligible(&self, chunk: &Chunk, rules: &Rules) -> bool {
+        self.sections.clone().any(|i| {
+            eligible_terrain_section(&chunk.sections[i], chunk.min_y() + 16 * i as i32, rules)
+        })
+    }
+
+    pub(super) fn terrain_body(
+        &self,
+        chunk: &Chunk,
+        world: &crate::world::World,
+        body: &TerrainBody,
+        far: bool,
+    ) -> Arc<[u8]> {
+        let packet = body.static_body(far);
+        let mut tags: Vec<_> = body
+            .candidates
+            .iter()
+            .filter_map(|&(s, index, state)| {
+                self.chunk_entity_info(chunk, &world.block_entities, usize::from(s), index, state)
+            })
+            .collect();
+        if tags.is_empty() {
+            return packet.clone();
+        }
+        Self::order_chunk_entities(chunk, &mut tags);
+        let mut writer = Writer::new();
+        List::<BlockEntityInfo>::write(&tags, &mut writer);
+        let mut bytes = Vec::with_capacity(packet.len() - 1 + writer.data.len());
+        bytes.extend_from_slice(&packet[..body.tag_offset]);
+        bytes.extend_from_slice(&writer.data);
+        bytes.extend_from_slice(&packet[body.tag_offset + 1..]);
+        bytes.into()
+    }
+
+    pub(super) fn terrain_body_alone(
+        &self,
+        chunk: &Chunk,
+        neighbours: &Neighbours,
+        rules: &Rules,
+    ) -> (Vec<u8>, terrain_view::Faces) {
+        let mut faces = terrain_view::Faces::saved(neighbours);
+        let wires = self
+            .terrain_encoder()
+            .encode(chunk, neighbours, rules, &mut faces);
+        // The tags a reveal of a concealed block sends, from the same snapshot as the body.
+        for hidden in faces.concealed_mut() {
+            let Some(kind) = self.entity_type(hidden.state) else {
+                continue;
+            };
+            let entity = chunk
+                .block_entities
+                .iter()
+                .find(|(pos, _)| *pos == hidden.pos)
+                .and_then(|(pos, entity)| self.update_tag(*pos, hidden.state, entity));
+            hidden.tag = entity
+                .or_else(|| pot_tag(chunk, hidden.pos))
+                .map(|tag| (kind, tag));
+        }
+        let entities = chunk.block_entities.iter().cloned().collect();
+        let body = self
+            .prepare_view(chunk, &entities, SectionMask::ALL, Some(&wires))
+            .write();
+        self.release_read(chunk);
+        (body, faces)
+    }
+
+    /// Drop what encoding one saved column cached (its sections' wires and its heightmaps): the
+    /// column is dropped once sent, so nothing else will reuse them.
+    fn release_read(&self, chunk: &Chunk) {
+        let mut cache = self.cache.lock().unwrap();
+        for s in &chunk.sections {
+            cache.remove(&(Arc::as_ptr(s) as usize));
+        }
+        drop(cache);
+        self.heights.lock().unwrap().remove(&(chunk.x, chunk.z));
+    }
+
     /// An encoder of the same level with caches of its own, for threads that encode saved chunks no
     /// level holds (`lan::far`).
     pub fn detached(&self) -> Self {
         Self {
             coder: self.coder.clone(),
             entity_types: self.entity_types.clone(),
+            chest_types: self.chest_types,
             mod_entities: self.mod_entities.clone(),
             mod_update_tag: self.mod_update_tag,
+            trial_active: self.trial_active.clone(),
             block_ids: self.block_ids.clone(),
             tables: self.tables.clone(),
             cache: Default::default(),
@@ -837,12 +1362,7 @@ impl ChunkEncoder {
     pub fn body_alone(&self, chunk: &Chunk) -> Vec<u8> {
         let entities: HashMap<_, _> = chunk.block_entities.iter().cloned().collect();
         let body = self.body(chunk, &entities, SectionMask::ALL);
-        let mut cache = self.cache.lock().unwrap();
-        for s in &chunk.sections {
-            cache.remove(&(Arc::as_ptr(s) as usize));
-        }
-        drop(cache);
-        self.heights.lock().unwrap().remove(&(chunk.x, chunk.z));
+        self.release_read(chunk);
         body
     }
 
@@ -950,7 +1470,17 @@ impl ChunkEncoder {
         block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
         around: SectionMask,
     ) -> Prepared {
-        let (wires, entities) = self.blocks(chunk, block_entities);
+        self.prepare_view(chunk, block_entities, around, None)
+    }
+
+    fn prepare_view(
+        &self,
+        chunk: &Chunk,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        around: SectionMask,
+        view: Option<&TerrainWires>,
+    ) -> Prepared {
+        let (wires, entities) = self.blocks(chunk, block_entities, view);
         let heightmaps = self.heightmaps_of(chunk);
         // Before the light: their tags' size is only known once written.
         let mut tags = Writer::new();
@@ -1048,7 +1578,7 @@ impl ChunkEncoder {
         chunk: &Chunk,
         block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
     ) -> LevelChunkWithLight {
-        let (wires, block_entities) = self.blocks(chunk, block_entities);
+        let (wires, block_entities) = self.blocks(chunk, block_entities, None);
         LevelChunkWithLight {
             x: chunk.x,
             z: chunk.z,
@@ -1081,6 +1611,7 @@ impl ChunkEncoder {
         &self,
         chunk: &Chunk,
         block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        view: Option<&TerrainWires>,
     ) -> (Vec<Arc<[u8]>>, Vec<BlockEntityInfo>) {
         let mut wires = Vec::with_capacity(self.sections.len());
         let mut entity_infos = Vec::new();
@@ -1091,40 +1622,50 @@ impl ChunkEncoder {
             .skip(self.sections.start)
             .take(self.sections.len())
         {
-            let (encoded, entities) = self.section_wire(s);
+            let (encoded, entities) = view
+                .and_then(|view| view.0.get(i - self.sections.start)?.clone())
+                .unwrap_or_else(|| self.section_wire(s));
             // The section's block entity blocks, kept with its bytes, in the
             // order a scan of every block would find them.
-            for &(index, state) in entities.iter() {
-                let Some(kind) = self.entity_type(state) else {
-                    continue;
-                };
-                let (x, y, z) = (
-                    i32::from(index & 15),
-                    i32::from(index >> 8),
-                    i32::from(index >> 4 & 15),
-                );
-                let wy = chunk.min_y() + (i as i32) * 16 + y;
-                let pos = (chunk.x * 16 + x, wy, chunk.z * 16 + z);
-                let entity = block_entities.get(&pos);
-                // A mod block whose mod made no block entity has none to send.
-                if self.mod_entities[state as usize] && !matches!(entity, Some(BlockEntity::Mod(_)))
-                {
-                    continue;
-                }
-                entity_infos.push(BlockEntityInfo {
-                    packed_xz: ((x << 4) | z) as i8,
-                    y: wy as i16,
-                    kind,
-                    // BlockEntityInfo.create: an empty update tag is not sent.
-                    tag: entity
-                        .and_then(|e| self.update_tag(pos, e))
-                        .or_else(|| pot_tag(chunk, pos))
-                        .filter(|t| !matches!(t, Tag::Compound(c) if c.is_empty()))
-                        .unwrap_or(Tag::End),
-                });
-            }
+            entity_infos.extend(entities.iter().filter_map(|&(index, state)| {
+                self.chunk_entity_info(chunk, block_entities, i, index, state)
+            }));
             wires.push(encoded);
         }
+        Self::order_chunk_entities(chunk, &mut entity_infos);
+        (wires, entity_infos)
+    }
+
+    fn chunk_entity_info(
+        &self,
+        chunk: &Chunk,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        section: usize,
+        index: u16,
+        state: u32,
+    ) -> Option<BlockEntityInfo> {
+        let kind = self.entity_type(state)?;
+        let x = i32::from(index & 15);
+        let z = i32::from(index >> 4 & 15);
+        let y = chunk.min_y() + section as i32 * 16 + i32::from(index >> 8);
+        let pos = (chunk.x * 16 + x, y, chunk.z * 16 + z);
+        let entity = block_entities.get(&pos);
+        if !self.entity_matches(state, entity) {
+            return None;
+        }
+        Some(BlockEntityInfo {
+            packed_xz: ((x << 4) | z) as i8,
+            y: y as i16,
+            kind,
+            tag: entity
+                .and_then(|e| self.update_tag(pos, state, e))
+                .or_else(|| pot_tag(chunk, pos))
+                .filter(|t| !matches!(t, Tag::Compound(c) if c.is_empty()))
+                .unwrap_or(Tag::End),
+        })
+    }
+
+    fn order_chunk_entities(chunk: &Chunk, entity_infos: &mut Vec<BlockEntityInfo>) {
         // A loaded chunk's block entities enter its maps in the save's order
         // (ChunkAccess.pendingBlockEntities, then LevelChunk.blockEntities):
         // keys that share a bucket keep that order. Others follow in scan order.
@@ -1141,14 +1682,13 @@ impl ChunkEncoder {
             };
             entity_infos.sort_by_key(at);
         }
-        java_hash_order(&mut entity_infos, |e| {
+        java_hash_order(entity_infos, |e| {
             (
                 chunk.x * 16 + i32::from(e.packed_xz as u8 >> 4),
                 i32::from(e.y),
                 chunk.z * 16 + i32::from(e.packed_xz as u8 & 15),
             )
         });
-        (wires, entity_infos)
     }
 
     /// ClientboundLightUpdatePacketData: the light layers of the sections
@@ -1223,7 +1763,9 @@ fn java_hash_order<T>(items: &mut Vec<T>, pos: impl Fn(&T) -> (i32, i32, i32)) {
 }
 
 /// The update tag of a block entity (getUpdateTag) for what the client shows.
-pub fn entity_tag(entity: &BlockEntity) -> Option<Tag> {
+/// `trial_active`: its block state is `trial_spawner_state=active`, which a
+/// trial spawner's tag depends on.
+pub fn entity_tag(entity: &BlockEntity, trial_active: bool) -> Option<Tag> {
     match entity {
         BlockEntity::Sign(sign) => Some(Tag::compound(sign.encode())),
         BlockEntity::Spawner(s) => Some(s.update_tag()),
@@ -1260,20 +1802,25 @@ pub fn entity_tag(entity: &BlockEntity) -> Option<Tag> {
                 entries.push(("patterns", crate::banner::layers_to_nbt(&b.layers)));
             }
             if let Some(name) = &b.name {
-                entries.push(("CustomName", Tag::String(name.as_str().into())));
+                entries.push(("CustomName", name.clone()));
             }
             entries.push(("components", Tag::Compound(b.components.clone())));
             Some(Tag::compound(entries))
         }
         // VaultBlockEntity.getUpdateTag: the shared data, which holds the display item.
         BlockEntity::Vault(v) => Some(v.update_tag()),
-        // TrialSpawnerStateData.getUpdateTag: the spawn data the mob is drawn from.
-        // next_mob_spawns_at (ACTIVE only) is left out: nothing in the client
-        // reads it, and the block state it depends on is not known here.
-        BlockEntity::TrialSpawner(t) => t
-            .next_spawn_data
-            .as_ref()
-            .map(|d| Tag::compound([("spawn_data", d.encode())])),
+        // TrialSpawnerStateData.getUpdateTag: next_mob_spawns_at (ACTIVE only,
+        // 0 included) and the spawn data the mob is drawn from.
+        BlockEntity::TrialSpawner(t) => {
+            let mut entries = Vec::with_capacity(2);
+            if trial_active {
+                entries.push(("next_mob_spawns_at", Tag::Long(t.next_mob_spawns_at)));
+            }
+            if let Some(d) = &t.next_spawn_data {
+                entries.push(("spawn_data", d.encode()));
+            }
+            (!entries.is_empty()).then(|| Tag::compound(entries))
+        }
         // SkullBlockEntity: the profile is the whole reason a head differs.
         BlockEntity::Skull(s) => {
             let mut entries = Vec::new();
@@ -1317,6 +1864,12 @@ pub fn entity_tag(entity: &BlockEntity) -> Option<Tag> {
         BlockEntity::CreakingHeart(h) => Some(Tag::compound(
             h.creaking
                 .map(|(_, uuid)| ("creaking", crate::save::uuid_tag(uuid))),
+        )),
+        // ConduitBlockEntity.getUpdateTag: saveCustomOnly, which for a conduit
+        // is its `Target` alone. The empty tag of a conduit that stopped
+        // hunting still goes out (remote.rs loads it): it clears the target.
+        BlockEntity::Conduit(target) => Some(Tag::compound(
+            target.map(|uuid| ("Target", Tag::IntArray(uuid.to_vec()))),
         )),
         // No getUpdatePacket: these, chests, hives, command blocks and the rest.
         BlockEntity::Jukebox(_) | BlockEntity::Lectern(_) => None,
@@ -1491,8 +2044,8 @@ fn write_light(lights: &[(usize, SectionLight)], sky: bool, w: &mut Writer) {
 mod tests {
     use super::*;
     use crate::chunk::{MIN_Y, SECTIONS};
+    use horizon_core::nbt::JavaString;
     use horizon_protocol::packets::play;
-    use horizon_world::nbt::JavaString;
 
     #[test]
     fn block_entity_blocks_are_recognised() {
@@ -1578,20 +2131,57 @@ mod tests {
         assert_eq!(sent(&chunk), scan(&chunk));
     }
 
-    /// A mod block's block entity goes out with its block's own type and the
-    /// tag its mod gives; a mod block whose mod made none is left out.
+    /// Shared types are resolved per state; undeclared and stale entities stay off the wire.
+
     #[test]
-    fn mod_block_entities_carry_their_blocks_type_and_the_mods_tag() {
+    fn shared_block_entity_types_supply_chunks_updates_and_detached_encoders() {
+        use crate::block_entity_types::BlockEntityTypes;
         let builtin = Builtin::parse(
             r#"{"minecraft:block_entity_type": {"entries": {
                 "minecraft:chest": {"protocol_id": 1},
+                "minecraft:sign": {"protocol_id": 7},
                 "test:machine": {"protocol_id": 49},
                 "test:casing": {"protocol_id": 50}}}}"#,
         )
         .unwrap();
-        let states =
-            ["minecraft:air", "test:machine", "test:casing"].map(|n| (Arc::<str>::from(n), false));
-        let mut encoder = ChunkEncoder::new(states, &builtin, &[], &[]);
+        let types = BlockEntityTypes::new(
+            [
+                ("test:press".into(), "test:machine".into()),
+                ("test:mill".into(), "test:machine".into()),
+            ]
+            .into(),
+            builtin
+                .get("minecraft:block_entity_type")
+                .unwrap()
+                .names
+                .clone(),
+        );
+        let states = [
+            "minecraft:air",
+            "test:press",
+            "test:mill",
+            "test:press",
+            "test:casing",
+        ]
+        .map(|n| {
+            (
+                Arc::<str>::from(n),
+                false,
+                (n == "test:press").then_some(crate::blocks::SignForm {
+                    hanging: false,
+                    wall: false,
+                }),
+            )
+        });
+        let mut encoder = ChunkEncoder::with_types(states, &builtin, &[], &[], Some(&types));
+        for state in [1, 2, 3] {
+            assert_eq!(encoder.entity_type(state), Some(49));
+        }
+        assert_eq!(
+            encoder.entity_type(4),
+            None,
+            "no implicit type=block fallback"
+        );
         encoder.mod_update_tag = Some(|pos, entity| {
             let mut tag = Compound::new();
             tag.insert(
@@ -1603,25 +2193,56 @@ mod tests {
         });
         let mut chunk = Chunk::empty(0, 0);
         chunk.set(1, MIN_Y + 2, 3, 1);
-        chunk.set(5, MIN_Y + 2, 5, 2);
-        let mut machine = ModBlockEntity::new(crate::containers::ModBlockEntityFields {
-            id: "test:machine".into(),
-            ..Default::default()
-        });
+        chunk.set(5, MIN_Y + 2, 5, 4);
+        chunk.set(2, MIN_Y + 2, 3, 2);
+        chunk.set(3, MIN_Y + 2, 3, 3);
+        chunk.set(4, MIN_Y + 2, 3, 1); // declared, but no instance
+        let mut machine = ModBlockEntity::new("test:machine".into(), Default::default());
         machine.nbt.insert("active".into(), Tag::Byte(1));
         machine.nbt.insert("recipe".into(), Tag::Int(7));
-        let block_entities =
-            HashMap::from([((1, MIN_Y + 2, 3), BlockEntity::Mod(Box::new(machine)))]);
+        let mut block_entities = HashMap::from([
+            (
+                (1, MIN_Y + 2, 3),
+                BlockEntity::Mod(Box::new(machine.clone())),
+            ),
+            ((2, MIN_Y + 2, 3), BlockEntity::Mod(Box::new(machine))),
+            (
+                (3, MIN_Y + 2, 3),
+                BlockEntity::Mod(Box::new(ModBlockEntity::new(
+                    "test:wrong".into(),
+                    Default::default(),
+                ))),
+            ),
+        ]);
+        assert!(!encoder.entity_matches(1, None));
+        assert!(!encoder.entity_matches(3, block_entities.get(&(3, MIN_Y + 2, 3))));
         let infos = encoder.encode(&chunk, &block_entities).chunk.block_entities;
-        assert_eq!(infos.len(), 1, "the casing has no block entity");
-        assert_eq!((infos[0].kind, infos[0].y), (49, (MIN_Y + 2) as i16));
-        let mut expected = Compound::new();
-        expected.insert("active".into(), Tag::Byte(1));
-        expected.insert("x".into(), Tag::Int(1));
-        assert_eq!(infos[0].tag, Tag::Compound(expected));
+        assert_eq!(infos.len(), 2, "only the two matching entities are sent");
+        for info in &infos {
+            assert_eq!((info.kind, info.y), (49, (MIN_Y + 2) as i16));
+            let mut expected = Compound::new();
+            expected.insert("active".into(), Tag::Byte(1));
+            expected.insert("x".into(), Tag::Int(i32::from(info.packed_xz as u8 >> 4)));
+            assert_eq!(info.tag, Tag::Compound(expected));
+        }
         // As does an encoder for saved chunks past the view distance (`lan::far`).
         let far = encoder.detached().encode(&chunk, &block_entities);
-        assert_eq!(far.chunk.block_entities[0].tag, infos[0].tag);
+        assert_eq!(far.chunk.block_entities.len(), 2);
+        for info in far.chunk.block_entities {
+            let original = infos
+                .iter()
+                .find(|i| i.packed_xz == info.packed_xz)
+                .unwrap();
+            assert_eq!(info.tag, original.tag);
+        }
+        // The alternate property state of press uses the same type.
+        block_entities.insert(
+            (3, MIN_Y + 2, 3),
+            block_entities[&(1, MIN_Y + 2, 3)].clone(),
+        );
+        let all = encoder.encode(&chunk, &block_entities).chunk.block_entities;
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|e| e.kind == 49));
         // An empty tag is not sent either (BlockEntityInfo.create).
         encoder.mod_update_tag = Some(|_, _| Some(Compound::new()));
         let infos = encoder.encode(&chunk, &block_entities).chunk.block_entities;
@@ -1630,6 +2251,84 @@ mod tests {
         encoder.mod_update_tag = None;
         let infos = encoder.encode(&chunk, &block_entities).chunk.block_entities;
         assert_eq!(infos[0].tag, Tag::End);
+    }
+
+    /// A chunk leaves queued one-shot fields alone; a change's tag takes them, once.
+    #[test]
+    fn only_a_changes_tag_takes_queued_client_update_fields() {
+        use crate::block_entity_types::BlockEntityTypes;
+        let builtin = Builtin::parse(
+            r#"{"minecraft:block_entity_type":{"entries":{"test:machine":{"protocol_id":49}}}}"#,
+        )
+        .unwrap();
+        let types = BlockEntityTypes::new(
+            [("test:machine".into(), "test:machine".into())].into(),
+            builtin
+                .get("minecraft:block_entity_type")
+                .unwrap()
+                .names
+                .clone(),
+        );
+        let states = ["minecraft:air", "test:machine"].map(|n| (Arc::<str>::from(n), false, None));
+        let mut encoder = ChunkEncoder::with_types(states, &builtin, &[], &[], Some(&types));
+        encoder.mod_update_tag =
+            Some(|_, entity| (!entity.nbt.is_empty()).then(|| entity.nbt.clone()));
+        let mut chunk = Chunk::empty(0, 0);
+        let pos = (1, MIN_Y + 2, 3);
+        chunk.set(pos.0, pos.1, pos.2, 1);
+        let progress = (JavaString::from("progress"), Tag::Int(7));
+        let effect = (JavaString::from("effect"), Tag::Int(23));
+        let machine = ModBlockEntity::new(
+            "test:machine".into(),
+            crate::containers::ModBlockEntityFields {
+                nbt: Compound::from([progress.clone()]),
+                ..Default::default()
+            },
+        );
+        machine.set_client_update_fields(Compound::from([effect.clone()]));
+        let entities = HashMap::from([(pos, BlockEntity::Mod(Box::new(machine)))]);
+        let plain = Tag::Compound(Compound::from([progress.clone()]));
+        for _ in 0..2 {
+            let sent = encoder.encode(&chunk, &entities).chunk.block_entities;
+            assert_eq!(sent[0].tag, plain);
+        }
+        assert_eq!(
+            encoder.update_tag(pos, 0, &entities[&pos]),
+            Some(plain.clone())
+        );
+        assert_eq!(
+            encoder.change_tag(pos, 0, &entities[&pos]),
+            Some(Tag::Compound(Compound::from([progress, effect.clone()])))
+        );
+        // Fields a client can't read (one byte past vanilla's 2 MiB network quota, or one tag past
+        // the 262,144 it allows) are dropped: the change still sends the plain tag, nothing waits.
+        let BlockEntity::Mod(queued) = &entities[&pos] else {
+            unreachable!()
+        };
+        for unreadable in [
+            Tag::ByteArray(vec![0; 2_097_153]),
+            Tag::List(vec![Tag::Byte(0); 262_145]),
+        ] {
+            queued.set_client_update_fields(Compound::from([(
+                JavaString::from("effect"),
+                unreadable,
+            )]));
+            assert_eq!(
+                encoder.change_tag(pos, 0, &entities[&pos]),
+                Some(plain.clone())
+            );
+            assert!(!queued.has_client_update_fields());
+        }
+        assert_eq!(encoder.change_tag(pos, 0, &entities[&pos]), Some(plain));
+        // A block entity whose mod sends no tag still sends its fields, alone.
+        let silent = ModBlockEntity::new("test:machine".into(), Default::default());
+        silent.set_client_update_fields(Compound::from([effect.clone()]));
+        let silent = BlockEntity::Mod(Box::new(silent));
+        assert_eq!(
+            encoder.change_tag(pos, 0, &silent),
+            Some(Tag::Compound(Compound::from([effect])))
+        );
+        assert_eq!(encoder.change_tag(pos, 0, &silent), None);
     }
 
     /// A mod's sign is of vanilla's block entity type, as its block is on
@@ -1700,7 +2399,7 @@ mod tests {
         let entity = BlockEntity::Sign(sign);
         assert_eq!(encoder.entity_type(1), Some(7));
         assert_eq!(encoder.entity_type(2), Some(8));
-        let tag = encoder.update_tag(notice, &entity).unwrap();
+        let tag = encoder.update_tag(notice, 1, &entity).unwrap();
         let mut nbt = match tag {
             Tag::Compound(fields) => fields,
             _ => panic!("sign update is not a compound"),
@@ -1721,7 +2420,7 @@ mod tests {
             let sent = encoder.encode(&chunk, &changed).chunk.block_entities;
             assert_eq!(
                 sent.iter().find(|i| i.kind == 7).unwrap().tag,
-                encoder.update_tag(notice, &changed[&notice]).unwrap()
+                encoder.update_tag(notice, 1, &changed[&notice]).unwrap()
             );
         }
     }
@@ -1773,13 +2472,15 @@ mod tests {
                 data: Vec::new()
             }
         );
+        // An index past the table (a placeholder for a saved biome the world lacks) is sent as
+        // plains, network id 1 here, not as whichever biome sorts first.
         section.biomes =
             horizon_core::paletted::PalettedContainer::new(section.biomes.strategy(), 99);
         assert_eq!(
             encoder.coder.biomes(&section),
             Paletted {
                 bits: 0,
-                palette: vec![0],
+                palette: vec![1],
                 data: Vec::new()
             }
         );
@@ -2234,7 +2935,7 @@ mod tests {
         use crate::containers::{Beacon, CreakingHeart, EndGateway};
         // What a client loads from the tag (handleBlockEntityData).
         let load = |id: &str, entity: BlockEntity| {
-            let Some(Tag::Compound(mut tag)) = entity_tag(&entity) else {
+            let Some(Tag::Compound(mut tag)) = entity_tag(&entity, false) else {
                 panic!("no update tag for {id}");
             };
             tag.insert("id".into(), Tag::String(id.into()));
@@ -2251,12 +2952,16 @@ mod tests {
             secondary: Some("minecraft:regeneration".into()),
             ..Default::default()
         };
-        let BlockEntity::Beacon(b) =
-            load("minecraft:beacon", BlockEntity::Beacon(Box::new(beacon)))
-        else {
+        let beacon = BlockEntity::Beacon(Box::new(beacon));
+        // getUpdateTag (saveCustomOnly) carries Levels; loadAdditional never reads them.
+        assert_eq!(
+            entity_tag(&beacon, false).unwrap().get("Levels"),
+            Some(&Tag::Int(4))
+        );
+        let BlockEntity::Beacon(b) = load("minecraft:beacon", beacon) else {
             panic!("not a beacon");
         };
-        assert_eq!(b.levels, 4);
+        assert_eq!(b.levels, 0);
         assert_eq!(b.primary.as_deref(), Some("minecraft:speed"));
         assert_eq!(b.secondary.as_deref(), Some("minecraft:regeneration"));
         let gateway = EndGateway {
@@ -2264,7 +2969,7 @@ mod tests {
             exit_portal: Some([8, 100, 0]),
             exact_teleport: false,
         };
-        let tag = entity_tag(&BlockEntity::EndGateway(gateway.clone())).unwrap();
+        let tag = entity_tag(&BlockEntity::EndGateway(gateway.clone()), false).unwrap();
         assert_eq!(tag.get("ExactTeleport"), None);
         let BlockEntity::EndGateway(g) = load(
             "minecraft:end_gateway",
@@ -2277,7 +2982,7 @@ mod tests {
             exact_teleport: true,
             ..gateway
         };
-        let tag = entity_tag(&BlockEntity::EndGateway(exact.clone())).unwrap();
+        let tag = entity_tag(&BlockEntity::EndGateway(exact.clone()), false).unwrap();
         assert_eq!(tag.get("ExactTeleport"), Some(&Tag::Byte(1)));
         let BlockEntity::EndGateway(g) = load(
             "minecraft:end_gateway",
@@ -2298,10 +3003,48 @@ mod tests {
         };
         assert_eq!(h.creaking, Some((None, [1, 2, 3, 4])));
         // Without a protector the tag is empty.
-        let lone = entity_tag(&BlockEntity::CreakingHeart(Box::default()));
+        let lone = entity_tag(&BlockEntity::CreakingHeart(Box::default()), false);
         assert_eq!(
             lone,
-            Some(Tag::Compound(horizon_world::nbt::Compound::new()))
+            Some(Tag::Compound(horizon_core::nbt::Compound::new()))
         );
+    }
+
+    #[test]
+    fn trial_spawner_update_tag_has_the_countdown_only_when_active() {
+        let spawner = |next_mob_spawns_at| {
+            BlockEntity::TrialSpawner(Box::new(crate::chunk::block_entity::TrialSpawner {
+                next_mob_spawns_at,
+                ..Default::default()
+            }))
+        };
+        let countdown = |tag: Option<Tag>| tag.and_then(|t| t.get("next_mob_spawns_at").cloned());
+        // getUpdateTag(ACTIVE) writes it whatever its value, 0 included.
+        assert_eq!(
+            countdown(entity_tag(&spawner(1234), true)),
+            Some(Tag::Long(1234))
+        );
+        assert_eq!(countdown(entity_tag(&spawner(0), true)), Some(Tag::Long(0)));
+        // Any other state leaves it out: no spawn data either, so no tag.
+        assert_eq!(entity_tag(&spawner(1234), false), None);
+        // The encoder decides from the block state of the spawner.
+        let mut encoder = ChunkEncoder::new(
+            [
+                "minecraft:air",
+                "minecraft:trial_spawner",
+                "minecraft:trial_spawner",
+            ]
+            .map(|n| (Arc::<str>::from(n), false)),
+            &horizon_protocol::registry::Builtin::default(),
+            &[],
+            &[],
+        );
+        encoder.trial_active = vec![2];
+        let at = (0, 64, 0);
+        assert_eq!(
+            countdown(encoder.update_tag(at, 2, &spawner(7))),
+            Some(Tag::Long(7))
+        );
+        assert_eq!(encoder.update_tag(at, 1, &spawner(7)), None);
     }
 }

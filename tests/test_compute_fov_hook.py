@@ -5,16 +5,13 @@ import subprocess
 import tempfile
 import unittest
 
-from test_world_input_capture import method
-
-ROOT = Path(__file__).resolve().parents[1]
+from rust_items import rust_fn
 
 
 class ComputeFovHookTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
     def test_computed_fov_override_and_invalid_fallback(self):
-        source = (ROOT / "crates/horizon-client/src/game/fov.rs").read_text(encoding="utf-8")
-        actual = method(source.replace("pub(super) fn", "fn"), "fov_degrees")
+        actual = rust_fn("fov_degrees", owner="Game")
         fixture = r"""
 struct View;
 impl View {
@@ -25,7 +22,10 @@ impl View {
     }
 }
 struct Settings { fov: f32 }
-struct Game { view: View, settings: Settings, override_fov: Option<f32> }
+struct StudioFreecam { active: bool, fov: f32 }
+struct Studio { freecam: StudioFreecam }
+impl Studio { fn flying(&self) -> bool { self.freecam.active } }
+struct Game { view: View, settings: Settings, override_fov: Option<f32>, studio: Studio }
 impl Game {
     fn fov_effect_scale(&self) -> f32 { 1.0 }
     fn death_time(&self) -> Option<i32> { None }
@@ -42,9 +42,16 @@ fn unchanged_narrow_wide_and_invalid() {
     for (value, expected) in [(None, 35.0), (Some(15.0), 15.0), (Some(120.0), 120.0),
         (Some(1.0), 1.0), (Some(179.0), 179.0), (Some(0.0), 35.0), (Some(180.0), 35.0),
         (Some(-1.0), 35.0), (Some(f32::NAN), 35.0), (Some(f32::INFINITY), 35.0)] {
-        let game = Game { view: View, settings: Settings { fov: 70.0 }, override_fov: value };
+        let game = Game { view: View, settings: Settings { fov: 70.0 }, override_fov: value,
+            studio: Studio { freecam: StudioFreecam { active: false, fov: 70.0 } } };
         assert_eq!(game.fov_degrees(0.25, [1.0, 2.0, 3.0]), expected);
     }
+}
+#[test]
+fn studio_freecam_uses_its_fov() {
+    let game = Game { view: View, settings: Settings { fov: 70.0 }, override_fov: None,
+        studio: Studio { freecam: StudioFreecam { active: true, fov: 42.0 } } };
+    assert_eq!(game.fov_degrees(0.25, [1.0, 2.0, 3.0]), 42.0);
 }
 """.replace("METHOD", actual)
         with tempfile.TemporaryDirectory() as folder:

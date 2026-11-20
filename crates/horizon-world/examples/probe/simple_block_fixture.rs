@@ -3,40 +3,45 @@ use horizon_core::{
     geometry::{Direction, VoxelShape},
     random::{LegacyRandom, RandomSource, XoroshiroRandom},
 };
-use horizon_world::{
-    block_collision::{BlockCollisionRegistry, DynamicCollisionWorld, ShulkerCollisionState},
-    block_placement::BlockPlacementBindings,
-    block_properties::BlockPropertiesRegistry,
-    block_support::{BlockSupportRegistry, SupportType},
-    block_survival::{BlockSurvivalRegistry, SurvivalDefinitions, SurvivalRule, SurvivalWorld},
-    collision::CachedCollisionRegistry,
-    dynamic_support::DynamicSupportWorld,
-    fluid::{FluidKind, FluidState, FluidStateTable},
-    heightmap::HeightmapType,
-    nbt::{self, Limits, Tag},
-    registry::{BlockRegistry, BlockStateId},
-    worldgen::{
-        anchor::WorldGenerationContext,
-        biome::BiomeId,
-        biome_temperature::{BiomeTemperature, BiomeTemperatureSettings, TemperatureModifier},
-        biome_weather::BiomeWeatherBindings,
-        block_feature::FeatureBlockBindings,
-        feature::{FeatureBlocks, FeatureWorld},
-        feature_catalog::FeatureCatalog,
-        feature_graph::{FeatureDefinition, PlacedFeatureDefinition},
-        placement::{PlacementContext, PlacementQueryError},
-        simple_block::SimpleBlockFeature,
-        state_provider::{StateProviderBindings, StateProviderCatalog},
-        tags::TagDefinitions,
-    },
-};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, BufRead, Write},
     path::Path,
     sync::Arc,
+};
+use {
+    horizon_core::{
+        nbt,
+        nbt::{Limits, Tag},
+    },
+    horizon_world::{
+        block_collision::{BlockCollisionRegistry, DynamicCollisionWorld, ShulkerCollisionState},
+        block_placement::BlockPlacementBindings,
+        block_properties::BlockPropertiesRegistry,
+        block_support::{BlockSupportRegistry, SupportType},
+        block_survival::{BlockSurvivalRegistry, SurvivalDefinitions, SurvivalRule, SurvivalWorld},
+        collision::CachedCollisionRegistry,
+        dynamic_support::DynamicSupportWorld,
+        fluid::{FluidKind, FluidState, FluidStateTable},
+        heightmap::HeightmapType,
+        registry::{BlockRegistry, BlockStateId},
+        worldgen::{
+            anchor::WorldGenerationContext,
+            biome::BiomeId,
+            biome_temperature::{BiomeTemperature, BiomeTemperatureSettings, TemperatureModifier},
+            biome_weather::BiomeWeatherBindings,
+            block_feature::FeatureBlockBindings,
+            feature::{FeatureBlocks, FeatureWorld},
+            feature_catalog::FeatureCatalog,
+            feature_graph::{FeatureDefinition, PlacedFeatureDefinition},
+            placement::{PlacementContext, PlacementQueryError},
+            simple_block::SimpleBlockFeature,
+            state_provider::{StateProviderBindings, StateProviderCatalog},
+            tags::TagDefinitions,
+        },
+    },
 };
 struct World<'a, 'r, W, R> {
     out: &'a mut W,
@@ -669,6 +674,9 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         &definitions,
         &tags.tags,
         &fluid_tags.tags,
+        // These probes run with no worldgen hooks installed, so no state's parts answer
+        // and the ground question changes nothing here.
+        BTreeSet::new(),
     )?;
     let facts: Value = serde_json::from_str(&fs::read_to_string(dir.join("facts.json"))?)?;
     let integers: std::collections::BTreeSet<(String, String)> = facts["integers"]

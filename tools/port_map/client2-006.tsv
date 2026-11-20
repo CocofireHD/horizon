@@ -1,9 +1,9 @@
 TextureAtlas.createTexture	inline	crates/horizon-client-render/src/sprites.rs::Sprites::finish	gap: minor: no GPU texture objects or mip views; array size and mip count are set in finish
 TextureAtlas.upload	inline	crates/horizon-client-render/src/sprites.rs::Sprites::finish	gap: minor: no GPU upload or animated UBOs; sprites are inserted before finish
 TextureAtlas.uploadInitialContents	inline	crates/horizon-client-render/src/sprites.rs::Sprites::finish	static frames copied into the array pixels
-TextureAtlas.dumpContents	skip:debug		DEBUG_DUMP_TEXTURE_ATLAS PNG dump
+TextureAtlas.dumpContents	port	crates/horizon-client-render/src/hud.rs::HudAtlas::dump_contents	F3's dump-dynamic-textures shortcut: writes the GUI atlas PNG and its sprite rectangles to screenshots/debug (TextureUtil.getDebugTexturePath), which the chat names
 TextureAtlas.dumpSpriteNames	skip:debug		DEBUG_DUMP_TEXTURE_ATLAS name list
-TextureAtlas.cycleAnimationFrames	port	crates/horizon-client-render/src/gfx/animate.rs::SpriteAnimator::animate	advances every animated layer to the frame for the tick
+TextureAtlas.cycleAnimationFrames	port	crates/horizon-client-render/src/gfx/animate.rs::SpriteAnimator::animate_with	advances every animated layer to the frame for the tick, rewriting only the sprites whose frame or mix changed
 TextureAtlas.uploadAnimationFrames	port	crates/horizon-client-render/src/gfx/animate.rs::mix_level	per mip level frame mix (drawToAtlas)
 TextureAtlas.getSprite	port	crates/horizon-client-render/src/sprites.rs::Sprites::insert	gap: minor: loads a texture on first lookup; vanilla returns the missing sprite for names not in the atlas
 TextureAtlas.clearTextureData	skip:java		frees sprite and UBO memory; Rust ownership
@@ -17,7 +17,7 @@ TextureManager.loadContentsSafe	inline	crates/horizon-client-render/src/sprites.
 TextureManager.register	inline	crates/horizon-client-render/src/sprites.rs::Sprites::insert	adds the layer under its name
 TextureManager.safeClose	skip:java		closes a texture object; Rust ownership
 TextureManager.getTexture	port	crates/horizon-client-render/src/sprites.rs::Sprites::insert	loads on first use, as SimpleTexture does
-TextureManager.tick	port	crates/horizon-client-render/src/gfx/animate.rs::SpriteAnimator::animate	gap: minor: animated layers advance in the per frame animate pass; there is no tickable texture list
+TextureManager.tick	inline	crates/horizon-client-render/src/gfx/animate.rs::SpriteAnimator::animate_with	gap: minor: animated layers advance in the per-frame animate pass; there is no tickable texture list
 TextureManager.release	skip:java		drops one texture object; Rust ownership
 TextureManager.close	skip:java		drops all texture objects; Rust ownership
 TextureManager.reload	port	crates/horizon-client-render/src/assets.rs::Assets::reload	gap: minor: rebuilds every render asset synchronously; no pending futures
@@ -37,7 +37,7 @@ AshParticle.Provider.createParticle	port	crates/horizon-client-render/src/partic
 AttackSweepParticle.tick	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::tick_particle	SweepAttack uses the HugeExplosion behaviour: age, then sprite from age
 AttackSweepParticle.Provider.createParticle	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	SweepAttack arm: size from xAux
 BaseAshSmokeParticle.<init>	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	Smoke, Ash, WhiteAsh and DustPlume arms: motion, GrowIn size, lifetime
-BreakingItemParticle.CobwebProvider.createParticle	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	ItemCobweb arm; the layer comes from item_sprites (game/item_particles.rs)
+BreakingItemParticle.CobwebProvider.createParticle	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	ItemCobweb arm; the layer comes from item_sprites (game/items/item_particles.rs)
 BreakingItemParticle.ItemParticleProvider.getSprite	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	Item arms pick a layer with the engine random; ItemCobweb, ItemSlime and ItemSnowball read item_sprites
 BreakingItemParticle.Provider.createParticle	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	Item arm
 BreakingItemParticle.SlimeProvider.createParticle	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	ItemSlime arm
@@ -87,9 +87,9 @@ DustParticle.Provider.createParticle	port	crates/horizon-client-render/src/parti
 DustParticleBase.randomizeColor	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	Dust and DustColorTransition arms: the randomize closure
 DustParticleBase.getQuadSize	port	crates/horizon-client-render/src/particles.rs::Particle::quad_size	GrowIn size curve
 DustPlumeParticle.Provider.createParticle	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	DustPlume arm, base 1.0
-ElderGuardianParticleGroup.extractRenderState	port	crates/horizon-client/src/game/mob_blocks.rs::Game::elder_apparition_geometry	gap: minor: one apparition timer that a new curse resets, so two curses show one ghost
-ElderGuardianParticleGroup.ElderGuardianParticleRenderState.fromParticle	port	crates/horizon-client/src/game/mob_blocks.rs::Game::elder_apparition_geometry	fade, camera pose and offsets
-ElderGuardianParticleGroup.State.submit	port	crates/horizon-client/src/game/mob_blocks.rs::Game::elder_apparition_geometry	draws the guardian model
+ElderGuardianParticleGroup.extractRenderState	port	crates/horizon-client/src/game/mobs/mob_blocks.rs::Game::elder_apparition_geometry	gap: minor: one apparition timer that a new curse resets, so two curses show one ghost
+ElderGuardianParticleGroup.ElderGuardianParticleRenderState.fromParticle	port	crates/horizon-client/src/game/mobs/mob_blocks.rs::Game::elder_apparition_geometry	fade, camera pose and offsets
+ElderGuardianParticleGroup.State.submit	port	crates/horizon-client/src/game/mobs/mob_blocks.rs::Game::elder_apparition_geometry	draws the guardian model
 EmissiveRisingParticle.getLightCoords	port	crates/horizon-client-render/src/particles.rs::Particle::light_coords	Block15 for sculk soul only (the SculkSoul arm)
 EmissiveRisingParticle.EmissiveProvider.createParticle	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	SculkSoul arm of the Soul arms
 EmissiveRisingParticle.Provider.createParticle	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	Soul arm
@@ -112,8 +112,8 @@ FireworkParticles.FlashProvider.createParticle	port	crates/horizon-client-render
 FireworkParticles.SparkProvider.createParticle	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::make	Firework arm, alpha 0.99
 FireworkParticles.Starter.tick	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::tick_starters	launch sound, a burst every 2 ticks, flash, twinkle sound at the end
 FireworkParticles.Starter.isFarAwayFromCamera	inline	crates/horizon-client-render/src/particles.rs::ParticleEngine::fireworks	gap: minor: the distance is taken when the rocket is launched, not on each tick
-FireworkParticles.Starter.createParticleBall	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::spark_ball	
-FireworkParticles.Starter.createParticleShape	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::spark_shape	
+FireworkParticles.Starter.createParticleBall	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::spark_ball
+FireworkParticles.Starter.createParticleShape	port	crates/horizon-client-render/src/particles.rs::ParticleEngine::spark_shape
 FireworkParticles.Starter.createParticleBurst	inline	crates/horizon-client-render/src/particles.rs::ParticleEngine::tick_starters	Burst shape arm of tick_starters
 FlameParticle.move	port	crates/horizon-client-render/src/particles.rs::Particle::move_by	free_move: moves the box without collision
 FlameParticle.getQuadSize	port	crates/horizon-client-render/src/particles.rs::Particle::quad_size	Flame size curve

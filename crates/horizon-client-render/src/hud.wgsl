@@ -12,6 +12,8 @@ struct Hud {
 @group(0) @binding(3) var glint_tex: texture_2d<f32>;
 @group(0) @binding(4) var glint_sampler: sampler;
 @group(0) @binding(5) var linear_sampler: sampler;
+// enchanted_glint_armor, the armour layers' GlintSampler (entity.wgsl's glint_armor_tex).
+@group(0) @binding(6) var glint_armor_tex: texture_2d<f32>;
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -32,11 +34,16 @@ struct Out {
 }
 @fragment fn fs_main(in: Out) -> @location(0) vec4<f32> {
     // u >= 2: the GLINT_TEXTURING sample over the item, masked by the item's
-    // texture alpha (item.fsh's ALPHA_CUTOUT and GLINT path).
+    // texture alpha (item.fsh's ALPHA_CUTOUT and GLINT path). u >= 4: the same
+    // over a GUI model's armour, from enchanted_glint_armor (ARMOR_ENTITY_GLINT).
     if in.uv.x >= 2.0 {
-        let mask = textureSample(atlas, atlas_sampler, in.uv - vec2(2.0, 0.0)).a;
+        let armor = in.uv.x >= 4.0;
+        let offset = select(2.0, 4.0, armor);
+        let mask = textureSample(atlas, atlas_sampler, in.uv - vec2(offset, 0.0)).a;
+        let item_sample = textureSample(glint_tex, glint_sampler, in.glint_uv);
+        let armor_sample = textureSample(glint_armor_tex, glint_sampler, in.glint_uv);
         if mask < 0.1 { discard; }
-        var glint = hud.size.w * textureSample(glint_tex, glint_sampler, in.glint_uv);
+        var glint = hud.size.w * select(item_sample, armor_sample, armor);
         let tint = hud.end_portal[2].yzw;
         if tint.x >= 0.0 {
             glint = vec4(max(glint.r, max(glint.g, glint.b)) * tint, glint.a);
@@ -58,16 +65,19 @@ struct CitSlot {
 struct CitSlots {
     slots: array<CitSlot, 256>,
 }
+// The glint array is bound twice, once per sampler: naga's GLSL writer pairs each image with one
+// sampler, so one image sampled through both cannot run on OpenGL (#2386).
 @group(1) @binding(0) var cit_tex: texture_2d_array<f32>;
 @group(1) @binding(1) var cit_blur: sampler;
 @group(1) @binding(2) var cit_nearest: sampler;
 @group(1) @binding(3) var<uniform> cit: CitSlots;
+@group(1) @binding(4) var cit_tex_sharp: texture_2d_array<f32>;
 @fragment fn fs_cit_glint(in: Out) -> @location(0) vec4<f32> {
     let mask = textureSample(atlas, atlas_sampler, in.uv).a;
     let index = u32(round(in.color.r * 255.0));
     let slot = cit.slots[index];
     let blurred = textureSampleLevel(cit_tex, cit_blur, in.glint_uv, index, 0.0);
-    let sharp = textureSampleLevel(cit_tex, cit_nearest, in.glint_uv, index, 0.0);
+    let sharp = textureSampleLevel(cit_tex_sharp, cit_nearest, in.glint_uv, index, 0.0);
     if mask < 0.1 { discard; }
     // The layer's colour times its intensity (the glint strength option included) in alpha,
     // cut where vanilla's glint shader cuts, which CIT Resewn draws through.

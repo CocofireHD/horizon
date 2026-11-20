@@ -40,8 +40,10 @@ use horizon_protocol::{
     },
 };
 use serde_json::json;
+mod far;
 use std::{
     collections::{BTreeMap, HashSet},
+    path::PathBuf,
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -55,7 +57,7 @@ horizon-bots: load-test bots for a Minecraft Java Edition 26.3 server (offline m
 
   --server HOST:PORT     default 127.0.0.1:25565
   --bots N               default 10
-  --behaviour B          idle, walk, explore, fight or mixed (60 % walk, 20 % explore, 20 % idle); default mixed.
+  --behaviour B          idle, hotbar, walk, explore, fight or mixed (60 % walk, 20 % explore, 20 % idle); default mixed.
                          fight needs gamemode=survival, force-gamemode=true and allow-flight=true.
                          stand: stays on the ground where the server puts it (/tp), for a survival test.
                          One abusive client, to test a server's limits (run it beside a normal crowd):
@@ -70,6 +72,8 @@ horizon-bots: load-test bots for a Minecraft Java Edition 26.3 server (offline m
                          other one 30 000 characters long), flood-book (100 pages of 1024 characters
                          into a writable book), flood-sign (four 384-character lines on the block
                          below), flood-recipe (recipe book placements)
+  --ack-mode MODE        chunk batch feedback: vanilla (default) or 64 (fixed chunks per tick);
+                         one ACK per completed batch; use explore for a controlled pacing test
   --flood N              packets a tick for the flood behaviours; default 100
   --attack NAME          attack the player NAME twice a second, from wherever the bot is (a reach test),
                          swinging after each attack as vanilla's client does. NAME,NAME...: each of them
@@ -89,9 +93,20 @@ horizon-bots: load-test bots for a Minecraft Java Edition 26.3 server (offline m
   --view-distance N      what the bots ask for; default 10
   --seed N               default 12345
   --explore-speed B      blocks a second an explore bot flies; default 22 (as fast as chunks come)
+  --explore-distance B   stop exploring after B blocks, then hold position; default unlimited
   --pvp B                fight bots also attack each other (true or false); default true
+  --crits                fight bots swing at a sword's full strength (every 13 ticks) and jump into every
+                         other swing, landing it while falling: a critical hit, then a sweep from the
+                         ground (give them swords); for PvP benches (crit and sweep particles)
   --name PREFIX          bot names: PREFIX0, PREFIX1...; default Bot
   --brand B              the client brand sent in configuration (minecraft:brand); default none
+  --far D                ask the server for far terrain out to D chunks, 1024 at most (horizon:lod, needs
+                         --brand horizon and a server with horizon-lod-distance), as a Horizon client with
+                         LOD Distance D does: one pass of its plan, nearest first; the report gives each
+                         bot's tiles, bytes and seconds (src/far.rs), and each second's line how many bots
+                         finished their pass (far_done)
+  --far-after S          start asking S seconds after joining (after a /tp to spread the bots); default 3
+  --far-dump DIR         keep every tile each bot got in DIR/<name>.tiles, to compare servers byte for byte
   --height H             blocks above spawn the bots fly at (walk, explore, idle); default 24
   --ground               claim the ground in every move (with --height 0 on a flat world: walking
                          on it; higher, or over water: a no-fall or jesus cheat, to test an anticheat)
@@ -111,6 +126,7 @@ horizon-bots: load-test bots for a Minecraft Java Edition 26.3 server (offline m
 enum Behaviour {
     Idle,
     Stand,
+    Hotbar,
     Walk,
     Explore,
     Fight,
@@ -131,6 +147,7 @@ impl Behaviour {
         match self {
             Self::Idle => "idle",
             Self::Stand => "stand",
+            Self::Hotbar => "hotbar",
             Self::Walk => "walk",
             Self::Explore => "explore",
             Self::Fight => "fight",
@@ -158,6 +175,7 @@ struct Options {
     view_distance: i8,
     seed: u64,
     explore_speed: f64,
+    explore_distance: f64,
     pvp: bool,
     /// The players or entity UUIDs to attack, how long after joining to start,
     /// and how many rounds.
@@ -165,7 +183,11 @@ struct Options {
     attack_after: f64,
     attack_rounds: u32,
     no_swing: bool,
+    /// --crits: fight bots alternate jumped critical hits and sweeps at a sword's cooldown.
+    crits: bool,
     flood: usize,
+    /// None uses vanilla estimation; --ack-mode 64 requests a fixed rate.
+    ack_rate: Option<f32>,
     no_read: bool,
     no_loaded: bool,
     height: f64,
@@ -184,6 +206,10 @@ struct Options {
     capture: Option<String>,
     /// How many times as fast as vanilla's 20 Hz the bots tick (a timer cheat above 1).
     timer: f64,
+    /// --far: far terrain out to this many chunks (0: none), from this long after joining.
+    far: u32,
+    far_after: f64,
+    far_dump: Option<String>,
 }
 
 fn options() -> Result<Options, String> {
@@ -197,12 +223,15 @@ fn options() -> Result<Options, String> {
         view_distance: 10,
         seed: 12345,
         explore_speed: 22.0,
+        explore_distance: f64::INFINITY,
         pvp: true,
         attack: None,
         attack_after: 5.0,
         attack_rounds: u32::MAX,
         no_swing: false,
+        crits: false,
         flood: 100,
+        ack_rate: None,
         no_read: false,
         no_loaded: false,
         height: 24.0,
@@ -215,6 +244,9 @@ fn options() -> Result<Options, String> {
         capture: None,
         brand: None,
         timer: 1.0,
+        far: 0,
+        far_after: 3.0,
+        far_dump: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -228,6 +260,10 @@ fn options() -> Result<Options, String> {
         }
         if arg == "--no-swing" {
             o.no_swing = true;
+            continue;
+        }
+        if arg == "--crits" {
+            o.crits = true;
             continue;
         }
         if arg == "--no-loaded" {
@@ -255,7 +291,20 @@ fn options() -> Result<Options, String> {
             "--explore-speed" => {
                 o.explore_speed = value.parse().map_err(|_| number("blocks a second"))?;
             }
+            "--explore-distance" => {
+                o.explore_distance = value.parse().map_err(|_| number("positive blocks"))?;
+                if !o.explore_distance.is_finite() || o.explore_distance <= 0.0 {
+                    return Err(number("positive finite blocks"));
+                }
+            }
             "--pvp" => o.pvp = value.parse().map_err(|_| number("true or false"))?,
+            "--ack-mode" => {
+                o.ack_rate = match value.as_str() {
+                    "vanilla" => None,
+                    "64" => Some(64.0),
+                    _ => return Err(format!("--ack-mode {value}: use vanilla or 64")),
+                };
+            }
             "--flood" => o.flood = value.parse().map_err(|_| number("packets a tick"))?,
             "--attack" => o.attack = Some(value),
             "--attack-after" => o.attack_after = value.parse().map_err(|_| number("seconds"))?,
@@ -264,6 +313,16 @@ fn options() -> Result<Options, String> {
             "--report" => o.report = Some(value),
             "--capture" => o.capture = Some(value),
             "--brand" => o.brand = Some(value),
+            "--far" => {
+                o.far = value.parse().map_err(|_| number("chunks"))?;
+                // A server offers at most this far (`lod_net::MAX_DISTANCE`), and the plan's
+                // coverage loop stays far inside an i32 there.
+                if o.far > FAR_MAX {
+                    return Err(format!("--far {value}: at most {FAR_MAX} chunks"));
+                }
+            }
+            "--far-after" => o.far_after = value.parse().map_err(|_| number("seconds"))?,
+            "--far-dump" => o.far_dump = Some(value),
             "--give" => {
                 for part in value.split(',') {
                     let n: Vec<&str> = part.split(':').collect();
@@ -321,13 +380,14 @@ fn options() -> Result<Options, String> {
             _ => return Err(format!("unknown option {arg}; --help lists them")),
         }
     }
-    const BEHAVIOURS: [&str; 16] = [
+    const BEHAVIOURS: [&str; 17] = [
         "idle",
         "walk",
         "explore",
         "fight",
         "mixed",
         "stand",
+        "hotbar",
         "flood-move",
         "flood-acks",
         "flood-packets",
@@ -351,6 +411,8 @@ fn options() -> Result<Options, String> {
 /// What one bot is doing, shared between its reader and its ticks.
 #[derive(Default)]
 struct Bot {
+    explore_complete: AtomicBool,
+    server_time: Mutex<Option<i64>>,
     online: AtomicBool,
     chunks: AtomicU64,
     /// Chunks received while the bot already held them (no ForgetLevelChunk in between).
@@ -380,6 +442,8 @@ struct Bot {
     target: Mutex<Vec<(u128, Option<i32>)>>,
     /// The last SetHealth.
     health: Mutex<Option<f32>>,
+    /// --far: the far terrain it asks for.
+    far: far::Far,
 }
 
 impl Bot {
@@ -441,6 +505,9 @@ impl Random {
 }
 
 /// Vanilla's bare-hand attack speed is 4 a second: a full-strength swing every 20 / 4 ticks.
+/// The farthest `--far`: what a server offers at most (`horizon-lod-distance`, 1024 chunks).
+const FAR_MAX: u32 = 1024;
+
 const ATTACK_COOLDOWN_TICKS: u32 = 5;
 /// How far, in blocks, a fight bot strikes (the survival entity interaction range is 3).
 const ATTACK_REACH: f64 = 2.5;
@@ -532,11 +599,84 @@ fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
+/// A sword's attack speed is 1.6 a second: full strength 20 / 1.6 = 12.5 ticks after a swing.
+const SWORD_COOLDOWN_TICKS: u32 = 13;
+/// `LivingEntity.getJumpPower`: a jump's first upward motion, in blocks a tick.
+const JUMP_POWER: f64 = 0.42;
+
+/// `--crits`: a fight bot that swings at a sword's full strength and jumps into every other swing, so
+/// it lands while falling (`Player.attack`'s critical hit: falling, not on the ground, full strength),
+/// and the next one from the ground (a sweep: on the ground, full strength, a sword).
+#[derive(Default)]
+struct Crits {
+    /// Vertical motion while in the air (`LivingEntity.travel`: minus 0.08 a tick, times 0.98).
+    jump: Option<f64>,
+    ground: f64,
+    /// The next swing is the jumped one.
+    crit_next: bool,
+}
+
+impl Crits {
+    fn airborne(&self) -> bool {
+        self.jump.is_some()
+    }
+
+    /// One tick: walk up to the target and, with a full cooldown, strike; jump ahead of a crit's swing.
+    fn tick(
+        &mut self,
+        pos: &mut [f64; 3],
+        target: (i32, [f64; 3]),
+        since: &mut u32,
+    ) -> Option<i32> {
+        if let Some(v) = self.jump {
+            pos[1] += v;
+            if pos[1] <= self.ground {
+                pos[1] = self.ground;
+                self.jump = None;
+            } else {
+                self.jump = Some((v - 0.08) * 0.98);
+            }
+        } else {
+            self.ground = pos[1];
+            // A jump takes 6 ticks to its top: start it so the cooldown ends on the way down.
+            if self.crit_next && *since + 8 >= SWORD_COOLDOWN_TICKS {
+                self.jump = Some(JUMP_POWER);
+            }
+        }
+        let falling = self.jump.is_some_and(|v| v < 0.0);
+        if self.crit_next && !falling {
+            *since = since.saturating_add(1);
+            fight_step(pos, target.1);
+            return None;
+        }
+        let hit = fight_tick(pos, target, since, SWORD_COOLDOWN_TICKS);
+        if hit.is_some() {
+            self.crit_next = !self.crit_next;
+        }
+        hit
+    }
+}
+
 /// One tick of a fighting bot with a target: walk up to it, and strike once the cooldown is over.
 /// Returns the entity to attack. `since_attack` counts ticks since the last swing.
-fn fight_tick(pos: &mut [f64; 3], target: (i32, [f64; 3]), since_attack: &mut u32) -> Option<i32> {
+fn fight_tick(
+    pos: &mut [f64; 3],
+    target: (i32, [f64; 3]),
+    since_attack: &mut u32,
+    cooldown: u32,
+) -> Option<i32> {
     *since_attack = since_attack.saturating_add(1);
     let (id, at) = target;
+    fight_step(pos, at);
+    if *since_attack >= cooldown && distance(*pos, at) <= ATTACK_REACH {
+        *since_attack = 0;
+        return Some(id);
+    }
+    None
+}
+
+/// Walk toward `at`, stopping `CLOSE_IN` short of it.
+fn fight_step(pos: &mut [f64; 3], at: [f64; 3]) {
     let (dx, dz) = (at[0] - pos[0], at[2] - pos[2]);
     let horizontal = dx.hypot(dz);
     if horizontal > CLOSE_IN {
@@ -544,11 +684,6 @@ fn fight_tick(pos: &mut [f64; 3], target: (i32, [f64; 3]), since_attack: &mut u3
         pos[0] += dx / horizontal * step;
         pos[2] += dz / horizontal * step;
     }
-    if *since_attack >= ATTACK_COOLDOWN_TICKS && distance(*pos, at) <= ATTACK_REACH {
-        *since_attack = 0;
-        return Some(id);
-    }
-    None
 }
 
 /// One tick of walking to random points around the spawn, at sprint speed (5.6 blocks a second).
@@ -616,7 +751,7 @@ fn costly(
         Behaviour::FloodUse => {
             // A block within reach: place stone there, or break what is there.
             let at = [0, 1, 2].map(|k| block[k] + (random.unit() * 7.0) as i32 - 3);
-            if i % 2 == 0 {
+            if i.is_multiple_of(2) {
                 play::Serverbound::UseItemOn(play::UseItemOn {
                     hand: 0,
                     pos: at,
@@ -645,7 +780,7 @@ fn costly(
             carried: None,
         }),
         Behaviour::FloodSuggest => {
-            let text = if i % 2 == 0 {
+            let text = if i.is_multiple_of(2) {
                 "/"
             } else {
                 LONG_COMMAND.as_str()
@@ -755,6 +890,7 @@ fn join(o: &Options, name: &str) -> Result<Connection, String> {
         let (id, body) = c.recv().map_err(err)?;
         let reply = match id {
             cb::SELECT_KNOWN_PACKS
+            | cb::CUSTOM_PAYLOAD
             | cb::KEEP_ALIVE
             | cb::PING
             | cb::CODE_OF_CONDUCT
@@ -762,6 +898,12 @@ fn join(o: &Options, name: &str) -> Result<Connection, String> {
             | cb::DISCONNECT
             | cb::FINISH_CONFIGURATION => {
                 match configuration::Clientbound::decode(id, &body).map_err(err)? {
+                    configuration::Clientbound::CustomPayload(p) => {
+                        let Some(answer) = raw_protocol_answer(o.brand.as_deref(), &p)? else {
+                            continue;
+                        };
+                        configuration::Serverbound::CustomPayload(answer)
+                    }
                     configuration::Clientbound::SelectKnownPacks(p) => {
                         configuration::Serverbound::SelectKnownPacks(p)
                     }
@@ -793,6 +935,24 @@ fn join(o: &Options, name: &str) -> Result<Connection, String> {
             _ => continue,
         };
         c.send(&reply.encode()).map_err(err)?;
+    }
+}
+
+/// Only a bot claiming Horizon support answers the fork's raw-protocol Query.
+fn raw_protocol_answer(
+    brand: Option<&str>,
+    payload: &configuration::CustomPayload,
+) -> Result<Option<configuration::CustomPayload>, String> {
+    use horizon_protocol::payload_negotiation::{CHANNEL, Control, Manifest};
+    if brand != Some("horizon") || payload.channel != CHANNEL {
+        return Ok(None);
+    }
+    match Control::decode(&payload.data).map_err(err)? {
+        Control::Query => Ok(Some(configuration::CustomPayload {
+            channel: CHANNEL.into(),
+            data: Control::Offer(Manifest::default()).encode().map_err(err)?,
+        })),
+        Control::Offer(_) => Ok(None),
     }
 }
 
@@ -872,6 +1032,7 @@ fn read(
     writer: Arc<Mutex<ConnWriter>>,
     bot: Arc<Bot>,
     track: bool,
+    ack_rate: Option<f32>,
     mut capture: Option<Capture>,
 ) {
     use ids::play::clientbound as cb;
@@ -901,6 +1062,16 @@ fn read(
         }
         let mut r = Reader::new(&body);
         let sent = match id {
+            cb::SET_TIME => {
+                *lock(&bot.server_time) = r.i64().ok();
+                Ok(())
+            }
+            cb::CUSTOM_PAYLOAD => {
+                if r.string(32767).is_ok_and(|channel| channel == far::CHANNEL) {
+                    bot.far.reply(&body[body.len() - r.remaining()..]);
+                }
+                Ok(())
+            }
             cb::KEEP_ALIVE => match r.i64() {
                 Ok(v) => send(raw(sb::KEEP_ALIVE, |w| w.i64(v))),
                 Err(_) => Ok(()),
@@ -957,7 +1128,8 @@ fn read(
                 batch.finished(r.varint().unwrap_or(0));
                 send(
                     play::Serverbound::ChunkBatchReceived(play::ChunkBatchReceived {
-                        chunks_per_tick: batch.desired_chunks_per_tick(),
+                        chunks_per_tick: ack_rate
+                            .unwrap_or_else(|| batch.desired_chunks_per_tick()),
                     })
                     .encode(),
                 )
@@ -1061,7 +1233,8 @@ fn run_bot(
         let capture = (index == 0)
             .then(|| o.capture.as_deref().and_then(Capture::create))
             .flatten();
-        thread::spawn(move || read(reader, writer, bot, track, capture));
+        let ack_rate = o.ack_rate;
+        thread::spawn(move || read(reader, writer, bot, track, ack_rate, capture));
     }
     use ids::play::serverbound as sb;
     // Wait for the spawn position.
@@ -1124,8 +1297,11 @@ fn run_bot(
         spawn[1] + o.height
     };
     let mut since_attack = ATTACK_COOLDOWN_TICKS;
+    let mut crits = Crits::default();
     let heading = random.unit() * std::f64::consts::TAU;
+    let mut explored = 0.0_f64;
     let mut target = pos;
+    let (mut hotbar_deadline, mut hotbar_step) = (None, 0usize);
     let mut next = Instant::now();
     let (joined, mut tick) = (Instant::now(), 0u64);
     loop {
@@ -1138,7 +1314,22 @@ fn run_bot(
         }
         let here = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
         // The abusive client doesn't wait for its chunk, as a real client must.
-        if behaviour == Behaviour::Stand {
+        if behaviour == Behaviour::Hotbar {
+            // Server time packets pace requests even during slow startup ticks.
+            if let Some(time) = *lock(&bot.server_time) {
+                let deadline = hotbar_deadline.get_or_insert(time + 40);
+                if time >= *deadline {
+                    *deadline = time + 20;
+                    if hotbar_step == 3 {
+                        bot.explore_complete.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    let slot = [3, 7, 3][hotbar_step];
+                    send(play::Serverbound::SetCarriedItem(play::SetCarriedItem { slot }).encode());
+                    hotbar_step += 1;
+                }
+            }
+        } else if behaviour == Behaviour::Stand {
             // Where the server put it, on the ground.
         } else if behaviour == Behaviour::FloodMove {
             // The last of these moves goes out below, with the tick's end.
@@ -1176,16 +1367,21 @@ fn run_bot(
             pos[1] = (pos[1] + 0.5).min(cruise);
         } else {
             match behaviour {
-                Behaviour::Idle | Behaviour::Stand => {}
+                Behaviour::Idle | Behaviour::Stand | Behaviour::Hotbar => {}
                 Behaviour::Walk => walk_step(&mut pos, &mut target, spawn, cruise, &mut random),
                 Behaviour::Fight => {
                     let near = lock(&bot.entities).nearest(pos, o.pvp, &bots);
                     if let Some(near) = near {
-                        if let Some(victim) = fight_tick(&mut pos, near, &mut since_attack) {
+                        let hit = if o.crits {
+                            crits.tick(&mut pos, near, &mut since_attack)
+                        } else {
+                            fight_tick(&mut pos, near, &mut since_attack, ATTACK_COOLDOWN_TICKS)
+                        };
+                        if let Some(victim) = hit {
                             // The client sends the attack, then swings the arm.
                             let sent = send(
                                 play::Serverbound::Attack(play::Attack { id: victim }).encode(),
-                            ) && send(raw(sb::PUNCH, |w| w.varint(0)));
+                            ) && send(play::Serverbound::Punch(Empty).encode());
                             if sent {
                                 bot.attacks.fetch_add(1, Ordering::Relaxed);
                             }
@@ -1228,9 +1424,12 @@ fn run_bot(
                     }
                     // Flying in creative, by default about 22 blocks a second, which keeps new
                     // chunks coming as fast as the server sends them.
-                    let step = o.explore_speed / 20.0;
+                    let step = (o.explore_speed / 20.0).min(o.explore_distance - explored);
                     pos[0] += heading.cos() * step;
                     pos[2] += heading.sin() * step;
+                    explored += step;
+                    bot.explore_complete
+                        .store(explored >= o.explore_distance, Ordering::Relaxed);
                 }
             }
         }
@@ -1295,14 +1494,29 @@ fn run_bot(
             }
         }
         tick += 1;
+        if o.far > 0 && joined.elapsed().as_secs_f64() >= o.far_after {
+            let dump =
+                (o.far_dump.as_ref()).map(|dir| PathBuf::from(dir).join(format!("{name}.tiles")));
+            bot.far.start(pos, i32::from(o.view_distance), o.far, dump);
+            for data in bot.far.requests() {
+                send(
+                    play::Serverbound::CustomPayload(configuration::CustomPayload {
+                        channel: far::CHANNEL.into(),
+                        data,
+                    })
+                    .encode(),
+                );
+            }
+        }
         let ok = send(
             play::Serverbound::MovePlayerPos(play::MovePlayerPos {
                 x: pos[0],
                 y: pos[1],
                 z: pos[2],
-                // Fight bots stand on the ground; the others fly.
+                // Fight bots stand on the ground (but in a --crits jump); the others fly.
                 flags: u8::from(
-                    matches!(behaviour, Behaviour::Fight | Behaviour::Stand) || o.ground,
+                    (matches!(behaviour, Behaviour::Fight | Behaviour::Stand) && !crits.airborne())
+                        || o.ground,
                 ),
             })
             .encode(),
@@ -1328,6 +1542,7 @@ fn behaviour_of(mode: &str, index: usize) -> Behaviour {
     match mode {
         "idle" => Behaviour::Idle,
         "stand" => Behaviour::Stand,
+        "hotbar" => Behaviour::Hotbar,
         "walk" => Behaviour::Walk,
         "explore" => Behaviour::Explore,
         "fight" => Behaviour::Fight,
@@ -1415,6 +1630,8 @@ fn main() {
                 "pulled_back": total(|b| &b.pulled_back),
                 "waited_ticks": total(|b| &b.waited),
                 "attacks": total(|b| &b.attacks),
+                // Bots whose far plan is done: every tile asked for and answered.
+                "far_done": bots.iter().filter(|b| b.far.is_finished()).count(),
             })
         );
         previous_chunks = chunks;
@@ -1434,6 +1651,7 @@ fn main() {
         "behaviour": o.behaviour,
         "seed": o.seed,
         "explore_speed": o.explore_speed,
+        "ack_mode": o.ack_rate.map_or("vanilla", |_| "64"),
         "pvp": o.pvp,
         "view_distance": o.view_distance,
         "seconds": o.seconds,
@@ -1463,17 +1681,19 @@ fn main() {
             "forgotten": b.forgotten.load(Ordering::Relaxed),
             "pulled_back": b.pulled_back.load(Ordering::Relaxed),
             "waited_ticks": b.waited.load(Ordering::Relaxed),
+            "explore_complete": b.explore_complete.load(Ordering::Relaxed),
             "error": *lock(&b.error),
             "attacks": b.attacks.load(Ordering::Relaxed),
             "health": *lock(&b.health),
+            "far": (o.far > 0).then(|| b.far.report()),
         })).collect::<Vec<_>>(),
     });
     if o.report.as_deref() == Some("-") {
         println!("{summary:#}");
-    } else if let Some(path) = &o.report {
-        if let Err(e) = std::fs::write(path, format!("{summary:#}\n")) {
-            eprintln!("horizon-bots: {path}: {e}");
-        }
+    } else if let Some(path) = &o.report
+        && let Err(e) = std::fs::write(path, format!("{summary:#}\n"))
+    {
+        eprintln!("horizon-bots: {path}: {e}");
     }
     let errors: Vec<String> = bots
         .iter()
@@ -1498,6 +1718,114 @@ mod tests {
     use play::{
         AddEntity, Clientbound, MoveEntity, MoveEntityPos, RemoveEntities, SetEntityData, VecDelta,
     };
+
+    #[test]
+    fn horizon_bot_answers_only_a_marked_query_with_an_empty_offer() {
+        use horizon_protocol::payload_negotiation::CHANNEL;
+        let mut payload = configuration::CustomPayload {
+            channel: CHANNEL.into(),
+            data: vec![0, 1],
+        };
+        let answer = raw_protocol_answer(Some("horizon"), &payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.channel, CHANNEL);
+        assert_eq!(answer.data, [1, 1, 0]);
+        for brand in [None, Some("vanilla")] {
+            assert!(raw_protocol_answer(brand, &payload).unwrap().is_none());
+        }
+        payload.data = vec![1, 1, 0];
+        assert!(
+            raw_protocol_answer(Some("horizon"), &payload)
+                .unwrap()
+                .is_none()
+        );
+        payload.data = vec![0, 2];
+        assert!(raw_protocol_answer(Some("horizon"), &payload).is_err());
+        payload.channel = "other:plugin".into();
+        assert!(
+            raw_protocol_answer(Some("horizon"), &payload)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Exercise the production reader over framed connections. Pings are barriers
+    /// so extra ACKs are observable without sleeps or timing guesses.
+    fn check_chunk_acks(ack_rate: Option<f32>) {
+        use horizon_protocol::connection::Pipe;
+        let (client, server) = Pipe::pair();
+        let (reader, writer) = Connection::local(client).split();
+        let mut server = Connection::local(server);
+        server
+            .reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let bot = Arc::new(Bot::default());
+        bot.online.store(true, Ordering::SeqCst);
+        let handle = thread::spawn(move || {
+            read(
+                reader,
+                Arc::new(Mutex::new(writer)),
+                bot,
+                false,
+                ack_rate,
+                None,
+            )
+        });
+        for (nonce, size) in [0, 1, 5].into_iter().enumerate() {
+            server
+                .send(&raw(ids::play::clientbound::CHUNK_BATCH_START, |_| {}))
+                .unwrap();
+            server
+                .send(&raw(ids::play::clientbound::PING, |w| w.i32(nonce as i32)))
+                .unwrap();
+            let (id, body) = server.recv().unwrap();
+            assert_eq!(
+                id,
+                ids::play::serverbound::PONG,
+                "batch start must not send an ACK"
+            );
+            assert_eq!(Reader::new(&body).i32().unwrap(), nonce as i32);
+            server
+                .send(&raw(ids::play::clientbound::CHUNK_BATCH_FINISHED, |w| {
+                    w.varint(size)
+                }))
+                .unwrap();
+            server
+                .send(&raw(ids::play::clientbound::PING, |w| w.i32(nonce as i32)))
+                .unwrap();
+            let (id, body) = server.recv().unwrap();
+            assert_eq!(id, ids::play::serverbound::CHUNK_BATCH_RECEIVED);
+            let rate = Reader::new(&body).f32().unwrap();
+            if let Some(fixed) = ack_rate {
+                assert_eq!(rate, fixed);
+            } else if size == 0 {
+                assert_eq!(rate, 3.5, "vanilla initial rate must remain the default");
+            } else {
+                assert!(rate.is_finite() && rate > 0.0);
+            }
+            let (id, body) = server.recv().unwrap();
+            assert_eq!(
+                id,
+                ids::play::serverbound::PONG,
+                "exactly one ACK per finished batch"
+            );
+            assert_eq!(Reader::new(&body).i32().unwrap(), nonce as i32);
+        }
+        server.writer.shutdown();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fixed_64_ack_is_sent_once_per_finished_batch() {
+        check_chunk_acks(Some(64.0));
+    }
+
+    #[test]
+    fn vanilla_acks_remain_once_per_finished_batch() {
+        check_chunk_acks(None);
+    }
 
     fn feed(entities: &mut Entities, packet: &Clientbound) {
         let bytes = packet.encode();
@@ -1600,7 +1928,9 @@ mod tests {
         let target = (3, [1.0, 64.0, 0.0]);
         let mut since = ATTACK_COOLDOWN_TICKS;
         let hits: Vec<u32> = (0..40)
-            .filter_map(|tick| fight_tick(&mut pos, target, &mut since).map(|_| tick))
+            .filter_map(|tick| {
+                fight_tick(&mut pos, target, &mut since, ATTACK_COOLDOWN_TICKS).map(|_| tick)
+            })
             .collect();
         assert_eq!(hits[0], 0, "a bot in reach strikes at once");
         assert!(
@@ -1617,7 +1947,7 @@ mod tests {
         let mut since = ATTACK_COOLDOWN_TICKS;
         let mut first = None;
         for tick in 0..100 {
-            if fight_tick(&mut pos, target, &mut since).is_some() {
+            if fight_tick(&mut pos, target, &mut since, ATTACK_COOLDOWN_TICKS).is_some() {
                 first = Some(tick);
                 break;
             }
@@ -1625,6 +1955,43 @@ mod tests {
         assert!(first.is_some_and(|t| t > 30));
         assert!((target.1[0] - pos[0]).abs() <= ATTACK_REACH);
         assert!(pos[0] < 10.0 - CLOSE_IN + 1e-9);
+    }
+
+    #[test]
+    fn crits_alternate_a_falling_swing_and_a_grounded_one() {
+        let mut pos = [0.0, 64.0, 0.0];
+        let target = (3, [1.0, 64.0, 0.0]);
+        let (mut since, mut crits) = (SWORD_COOLDOWN_TICKS, Crits::default());
+        let mut last_y = pos[1];
+        let mut hits = Vec::new();
+        for tick in 0..120u32 {
+            let hit = crits.tick(&mut pos, target, &mut since);
+            if hit.is_some() {
+                hits.push((tick, crits_state(pos[1], last_y)));
+            }
+            last_y = pos[1];
+        }
+        assert!(hits.len() >= 6, "{hits:?}");
+        for (i, w) in hits.windows(2).enumerate() {
+            assert!(
+                w[1].0 - w[0].0 >= SWORD_COOLDOWN_TICKS,
+                "full strength each time: {hits:?}"
+            );
+            assert_ne!(w[0].1, w[1].1, "swing {i} and the next alternate: {hits:?}");
+        }
+        // A crit lands in the air, on the way down; a sweep from the ground.
+        assert!(hits.iter().any(|h| h.1 == "falling") && hits.iter().any(|h| h.1 == "ground"));
+        assert!(pos[1] >= 64.0);
+    }
+
+    fn crits_state(y: f64, before: f64) -> &'static str {
+        if y == 64.0 {
+            "ground"
+        } else if y < before {
+            "falling"
+        } else {
+            "rising"
+        }
     }
 
     #[test]

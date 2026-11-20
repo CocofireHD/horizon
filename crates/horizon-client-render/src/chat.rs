@@ -16,6 +16,45 @@ use crate::{
 #[path = "chat_tests.rs"]
 mod tests;
 
+/// `FilterMask.applyWithFormatting` over a player message's signed content, as
+/// the packet's mask `(type, bit set)`: as it is when passed through, none when
+/// fully filtered, and when partly filtered each masked UTF-16 unit becomes a
+/// `#` in `FILTERED_STYLE` (dark grey, hover "chat.filtered").
+pub fn filtered_message(
+    content: &str,
+    (kind, bits): &(i32, Vec<i64>),
+) -> Option<serde_json::Value> {
+    match kind {
+        1 => return None,
+        2 => {}
+        _ => return Some(serde_json::Value::from(content)),
+    }
+    let masked = |i: usize| {
+        bits.get(i / 64)
+            .is_some_and(|w| (*w as u64 >> (i % 64)) & 1 != 0)
+    };
+    let units: Vec<u16> = content.encode_utf16().collect();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < units.len() {
+        let filtered = masked(start);
+        let end = (start..units.len())
+            .find(|&i| masked(i) != filtered)
+            .unwrap_or(units.len());
+        parts.push(if filtered {
+            serde_json::json!({
+                "text": "#".repeat(end - start),
+                "color": "dark_gray",
+                "hover_event": {"action": "show_text", "value": {"translate": "chat.filtered"}},
+            })
+        } else {
+            serde_json::Value::from(String::from_utf16_lossy(&units[start..end]))
+        });
+        start = end;
+    }
+    Some(serde_json::json!({"text": "", "extra": parts}))
+}
+
 /// `CommandHistory.PERSISTED_COMMANDS_FILE_NAME` and its size cap.
 const COMMAND_HISTORY_FILE: &str = "command_history.txt";
 const MAX_PERSISTED_COMMAND_HISTORY: usize = 50;
@@ -262,7 +301,7 @@ impl Tag {
             text: Text::empty()
                 .append(Text::translate("chat.tag.modified", &[]))
                 .append(Text::literal("\n"))
-                .append(Text::literal(original_content).with_color(text::GRAY)),
+                .append(Text::untrusted(original_content).with_color(text::GRAY)),
         }
     }
 }
@@ -287,6 +326,9 @@ pub struct Chat {
     history_file: Option<std::path::PathBuf>,
     scroll: usize,
     new_since_scroll: bool,
+    /// `ChatComponent`'s delayed queue size (`ChatListener.queueSize`): the
+    /// `chat.queue` row under the messages, while Chat Delay holds some.
+    pub queue: usize,
     pub options: ChatOptions,
     /// The smooth chat extra: a new line slides in from the left while it
     /// fades in, instead of appearing whole.
@@ -311,6 +353,25 @@ pub struct Chat {
     #[cfg(test)]
     clock: Option<(u8, u8)>,
 }
+/// `ChatComponent.QUEUE_EXPAND_ID`: the queue row's click event, handled by
+/// the chat screen itself (`ChatListener.acceptNextDelayedMessage`).
+pub const QUEUE_EXPAND_ID: &str = "minecraft:internal/expand_chat_queue";
+
+/// `ChatComponent`'s queue row: how many messages Chat Delay holds, with the
+/// style that shows the next one (a click, and `chat.queue.tooltip` on hover).
+pub fn queue_line(queued: usize) -> Text {
+    Text::translate("chat.queue", &[Text::literal(queued.to_string())]).with_style(&Style {
+        click: Some(ClickEvent::Custom {
+            id: QUEUE_EXPAND_ID.into(),
+            payload: None,
+        }),
+        hover: Some(std::sync::Arc::new(Text::translate(
+            "chat.queue.tooltip",
+            &[],
+        ))),
+        ..Style::default()
+    })
+}
 impl Chat {
     pub fn lines_per_page(&self, focused: bool) -> usize {
         (self.options.height_px(focused) / self.options.line_height().max(1)) as usize
@@ -321,6 +382,7 @@ impl Chat {
     }
     /// ChatComponent.addMessage: wrap, prepend and trim to 100 lines. A
     /// message the Chat option hides is dropped, unlogged.
+    #[horizon_mod_api_macros::replaceable]
     pub fn add(
         &mut self,
         atlas: &HudAtlas,
@@ -406,6 +468,7 @@ impl Chat {
             focused,
         );
     }
+    #[horizon_mod_api_macros::replaceable]
     fn push_message(&mut self, font: &crate::font::Font, mut message: Message, focused: bool) {
         if !self.abilities.shows(message.source) {
             return;
@@ -452,6 +515,7 @@ impl Chat {
         local_time()
     }
     /// The lines `message` wraps to (none when the chat search hides it), added newest first.
+    #[horizon_mod_api_macros::replaceable]
     fn add_lines(&mut self, font: &crate::font::Font, message: &Message, focused: bool) -> usize {
         // What the chat shows: legacy `§` codes format the text, they aren't part of it.
         let whole = message.content.strip_legacy().plain();
@@ -529,6 +593,8 @@ impl Chat {
     pub fn set_qol(&mut self, atlas: &HudAtlas, qol: ChatQol) {
         if self.qol != qol {
             self.qol = qol;
+            self.scroll = 0;
+            self.new_since_scroll = false;
             self.rewrap(&atlas.font);
         }
     }
@@ -554,20 +620,25 @@ impl Chat {
             .filter(|q| !q.trim().is_empty());
         if self.search != query {
             self.search = query;
+            self.scroll = 0;
+            self.new_since_scroll = false;
             self.rewrap(font);
         }
     }
     pub fn searching(&self) -> bool {
         self.search.is_some()
     }
-    /// Re-wrap after a width or scale change (ChatComponent.rescaleChat),
-    /// keeping only the messages the Chat option shows.
+    /// Re-wrap after a width or scale change (`ChatComponent.rescaleChat`):
+    /// `resetChatScroll`, then the messages the Chat option shows.
     pub fn rescale(&mut self, atlas: &HudAtlas) {
-        self.rewrap(&atlas.font);
-    }
-    fn rewrap(&mut self, font: &crate::font::Font) {
         self.scroll = 0;
         self.new_since_scroll = false;
+        self.rewrap(&atlas.font);
+    }
+    /// `ChatComponent.refreshTrimmedMessages`: the lines are laid out again
+    /// where the reader was (`chatScrollbarPos` survives a filter change);
+    /// `rescale` resets the scroll itself, as `rescaleChat` does.
+    fn rewrap(&mut self, font: &crate::font::Font) {
         self.lines.clear();
         let mut messages = std::mem::take(&mut self.messages);
         for m in messages.iter_mut().rev() {
@@ -670,6 +741,7 @@ impl Chat {
         self.history_file = Some(file);
     }
     /// `ChatComponent.addRecentChat`: a command also goes to the saved history.
+    #[horizon_mod_api_macros::replaceable]
     pub fn add_recent(&mut self, message: &str) {
         if self.recent.last().map(String::as_str) != Some(message) {
             if self.recent.len() >= 100 {
@@ -727,7 +799,7 @@ impl Chat {
         let bottom_to_text =
             (8.0 * (o.line_spacing + 1.0) - 4.0 * o.line_spacing + 0.5).floor() as i32;
         // Vanilla's 200-tick fade reads the whole GUI ticks
-        // (`Gui.getGuiTicks`); only the smooth chat extra eases it per frame.
+        // (`Hud.getGuiTicks`); only the smooth chat extra eases it per frame.
         let fade_ticks = if self.smooth { ticks } else { ticks.floor() };
         let alpha_of = |line: &Line| {
             if focused {
@@ -838,23 +910,99 @@ impl Chat {
                 ));
             }
         }
+        if self.queue > 0 {
+            // ChatComponent: the queue row under the messages, a background
+            // band and the count at half text opacity.
+            out.push(hud_layout::fill(
+                -2,
+                chat_bottom,
+                max_width + 4,
+                chat_bottom + 9,
+                hud_layout::as8(background_opacity) << 24,
+            ));
+            out.push(GuiDraw::Text {
+                text: queue_line(self.queue),
+                x: 0,
+                y: chat_bottom + 1,
+                color: hud_layout::white(0.5 * text_opacity),
+                shadow: true,
+            });
+        }
         out.push(GuiDraw::Pop);
         out
+    }
+    /// `ChatComponent`'s queue row under the cursor while the chat is open: the
+    /// style of its glyph (`queue_line`'s click and hover).
+    pub fn queue_style_at(
+        &self,
+        font: &crate::font::Font,
+        height: i32,
+        x: f64,
+        y: f64,
+    ) -> Option<Style> {
+        if self.queue == 0 || self.lines.is_empty() {
+            return None;
+        }
+        let o = &self.options;
+        let scale = o.scale as f32;
+        let chat_bottom = hud_layout::floor((height - 40) as f32 / scale);
+        let (mouse_x, mouse_y) = (x / f64::from(scale) - 4.0, y / f64::from(scale));
+        if mouse_y < f64::from(chat_bottom + 1) || mouse_y >= f64::from(chat_bottom + 10) {
+            return None;
+        }
+        let line = queue_line(self.queue);
+        let mut x = mouse_x;
+        if x < 0.0 {
+            return None;
+        }
+        for (c, style) in line.resolve_legacy().chars() {
+            x -= f64::from(font.advance(c, style));
+            if x < 0.0 {
+                return Some(style.clone());
+            }
+        }
+        None
     }
     /// Draws [`Chat::layout`] into the HUD batch, and with the chat screen
     /// open the restricted prompt above the lines.
     pub fn draw(&self, batch: &mut HudBatch, atlas: &HudAtlas, ticks: f32, focused: bool) {
-        let draws = self.layout(batch.height as i32, ticks, focused);
-        hud_layout::paint(batch, atlas, &draws);
+        self.draw_at(batch, atlas, ticks, focused, [0.0; 2]);
+    }
+    /// [`Chat::draw`] moved by `offset` GUI pixels (a mod's `CustomizeGuiOverlayEvent.Chat`,
+    /// `Gui.renderChat`'s translate).
+    pub fn draw_at(
+        &self,
+        batch: &mut HudBatch,
+        atlas: &HudAtlas,
+        ticks: f32,
+        focused: bool,
+        offset: [f32; 2],
+    ) {
+        let paint = |batch: &mut HudBatch, draws: Vec<GuiDraw>| {
+            if offset == [0.0; 2] {
+                hud_layout::paint(batch, atlas, &draws);
+            } else {
+                let mut moved = Vec::with_capacity(draws.len() + 2);
+                moved.push(GuiDraw::Push(vec![PoseOp::Translate(offset[0], offset[1])]));
+                moved.extend(draws);
+                moved.push(GuiDraw::Pop);
+                hud_layout::paint(batch, atlas, &moved);
+            }
+        };
+        paint(batch, self.layout(batch.height as i32, ticks, focused));
         let restricted = focused && self.abilities.any_restriction();
         if restricted {
-            let prompt = self.restricted_prompt(&atlas.font, batch.height as i32);
-            hud_layout::paint(batch, atlas, &prompt);
+            paint(
+                batch,
+                self.restricted_prompt(&atlas.font, batch.height as i32),
+            );
         }
         if focused && self.search_prompt {
             let row = if restricted { 2 } else { 1 };
-            let prompt = self.search_prompt(&atlas.font, batch.height as i32, row);
-            hud_layout::paint(batch, atlas, &prompt);
+            paint(
+                batch,
+                self.search_prompt(&atlas.font, batch.height as i32, row),
+            );
         }
     }
     /// `ChatComponent.extractRenderState` for `FOREGROUND_RESTRICTED`: a
@@ -949,7 +1097,9 @@ impl Chat {
     /// The hover text under a GUI-space cursor while chat is focused
     /// (ChatScreen.render's `renderComponentHoverEffect`).
     pub fn hover_at(&self, font: &crate::font::Font, height: i32, x: f64, y: f64) -> Option<Text> {
-        self.style_at(font, height, x, y)?.hover.map(|h| *h)
+        self.style_at(font, height, x, y)?
+            .hover
+            .map(std::sync::Arc::unwrap_or_clone)
     }
     /// The wrapped line under a GUI-space cursor while chat is focused, and
     /// the cursor's x within it (the text starts at 0).
@@ -967,7 +1117,7 @@ impl Chat {
         }
         Some((self.lines.get(self.scroll + row)?, x))
     }
-    /// ChatComponent.getClickedComponentStyleAt.
+    /// ChatComponent.captureClickableText (through `ActiveTextCollector.ClickableStyleFinder`).
     pub fn style_at(
         &self,
         font: &crate::font::Font,
@@ -980,10 +1130,14 @@ impl Chat {
             return None;
         }
         let content = line.content.resolve_legacy();
-        for (c, style) in content.chars() {
-            x -= f64::from(font.advance(c, style));
-            if x < 0.0 {
-                return Some(style.clone());
+        for span in &content.spans {
+            for c in span.text.chars() {
+                x -= f64::from(font.advance(c, &span.style));
+                if x < 0.0 {
+                    let mut style = span.style.clone();
+                    style.click = span.click_event().cloned();
+                    return Some(style);
+                }
             }
         }
         None
@@ -1188,11 +1342,27 @@ impl SuggestLayout {
     };
 }
 
+/// A suggestion accepted by Tab or a click (`SuggestionsList.useSuggestion`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct SuggestionCompletion {
+    /// The suggestion list's original input, also when cycling with Tab.
+    pub original: String,
+    /// The replaced range in `original`, as Java UTF-16 start/end offsets.
+    pub range: (usize, usize),
+    pub text: String,
+    /// The resulting input, after the text field's length limit.
+    pub input: String,
+}
+
 /// The open chat screen: vanilla's `ChatScreen` with its `EditBox` and
 /// `CommandSuggestions` (argument colouring, usage lines, parse errors,
 /// the suggestion list, Tab completion, history).
 pub struct ChatScreen {
     pub input: TextField,
+    /// `ChatScreen.isDraft`: the box opened with the draft saved last time and
+    /// has not been edited since. A draft draws grey italic, and the first
+    /// Backspace clears the whole box instead of one character.
+    is_draft: bool,
     width: i32,
     height: i32,
     history_buffer: String,
@@ -1207,6 +1377,7 @@ pub struct ChatScreen {
     /// the command up to the cursor.
     request: Option<(i32, String)>,
     suggestions: Option<SuggestionList>,
+    completion: Option<SuggestionCompletion>,
     usage: Vec<Text>,
     usage_position: i32,
     usage_width: i32,
@@ -1216,6 +1387,9 @@ pub struct ChatScreen {
     /// `CommandSuggestions.setRestrictions`: what the Chat option allows.
     pub abilities: ChatAbilities,
     pub layout: SuggestLayout,
+    /// `MouseHandler.lastClick`: a click within 250 ms of the last one on
+    /// this screen is a double click.
+    last_click: Option<std::time::Instant>,
 }
 /// Local completions waiting for the server's reply to request `id`.
 struct Awaiting {
@@ -1300,11 +1474,13 @@ fn truncate_utf16(s: &str, max_units: usize) -> String {
     s.to_owned()
 }
 impl ChatScreen {
-    /// `ChatScreen.init`: the input at the bottom, focused, holding `initial`.
+    /// `ChatScreen.init`: the input at the bottom, focused, holding `initial`,
+    /// which is a draft when `is_draft` (`ChatComponent.createScreen`).
     pub fn new(
         m: &Measure,
         c: &Commands,
         initial: &str,
+        is_draft: bool,
         history_len: usize,
         width: i32,
         height: i32,
@@ -1317,6 +1493,7 @@ impl ChatScreen {
         input.set_value(m, initial);
         let mut s = Self {
             input,
+            is_draft,
             width,
             height,
             history_buffer: String::new(),
@@ -1326,6 +1503,7 @@ impl ChatScreen {
             awaiting: None,
             request: None,
             suggestions: None,
+            completion: None,
             usage: Vec::new(),
             usage_position: 0,
             usage_width: 0,
@@ -1334,6 +1512,7 @@ impl ChatScreen {
             auto_suggestions: true,
             abilities,
             layout: SuggestLayout::CHAT,
+            last_click: None,
         };
         s.update_command_info(m, c);
         s
@@ -1353,6 +1532,7 @@ impl ChatScreen {
         input.set_value(m, command);
         let mut s = Self {
             input,
+            is_draft: false,
             width,
             height,
             history_buffer: String::new(),
@@ -1362,6 +1542,7 @@ impl ChatScreen {
             awaiting: None,
             request: None,
             suggestions: None,
+            completion: None,
             usage: Vec::new(),
             usage_position: 0,
             usage_width: 0,
@@ -1370,6 +1551,7 @@ impl ChatScreen {
             auto_suggestions: true,
             abilities: ChatAbilities::new(ChatVisibility::Full),
             layout: SuggestLayout::COMMAND_BLOCK,
+            last_click: None,
         };
         s.update_command_info(m, c);
         s
@@ -1377,12 +1559,18 @@ impl ChatScreen {
     pub fn value(&self) -> &str {
         &self.input.value
     }
+    /// Take the most recently accepted suggestion, at most once. Call after
+    /// each key or click to observe every acceptance, including Tab cycling.
+    pub fn take_suggestion_completion(&mut self) -> Option<SuggestionCompletion> {
+        self.completion.take()
+    }
     /// Replace the input for a suggest-command link and refresh completions.
     pub fn suggest_command(&mut self, m: &Measure, c: &Commands, command: &str) {
         self.input.set_value(m, command);
         self.edited(m, c);
     }
-    /// `ChatScreen.resize`: a new screen with the current text.
+    /// `ChatScreen.resize`: a new screen with the current text, still a draft
+    /// while it has not been edited (`ChatScreen.resize` keeps the field).
     pub fn resize(&mut self, m: &Measure, c: &Commands, width: i32, height: i32) {
         if (width, height) != (self.width, self.height) {
             let value = self.input.value.clone();
@@ -1390,7 +1578,16 @@ impl ChatScreen {
             let abilities = self.abilities;
             let message = std::mem::take(&mut self.input.message);
             *self = if self.layout == SuggestLayout::CHAT {
-                Self::new(m, c, &value, self.history_pos, width, height, abilities)
+                Self::new(
+                    m,
+                    c,
+                    &value,
+                    self.is_draft,
+                    self.history_pos,
+                    width,
+                    height,
+                    abilities,
+                )
             } else {
                 Self::command_block(m, c, &value, width, height)
             };
@@ -1402,6 +1599,7 @@ impl ChatScreen {
     fn edited(&mut self, m: &Measure, c: &Commands) {
         self.allow_suggestions = true;
         self.update_command_info(m, c);
+        self.is_draft = false;
     }
     /// Ctrl+A/C/V/X in the input box.
     pub fn shortcut(
@@ -1414,6 +1612,11 @@ impl ChatScreen {
         if self.input.shortcut(m, shortcut, clipboard) {
             self.edited(m, c);
         }
+    }
+    /// An edit of the input box from outside its own keys: the suggestions follow it.
+    pub fn edit_input(&mut self, m: &Measure, c: &Commands, f: impl FnOnce(&mut TextField)) {
+        f(&mut self.input);
+        self.edited(m, c);
     }
     /// Typed text (`charTyped` per character).
     pub fn type_text(&mut self, m: &Measure, c: &Commands, text: &str) {
@@ -1428,6 +1631,7 @@ impl ChatScreen {
         }
     }
     /// `CommandSuggestions.updateCommandInfo`.
+    #[horizon_mod_api_macros::replaceable]
     fn update_command_info(&mut self, m: &Measure, c: &Commands) {
         let command = self.input.value.clone();
         if self.parse.as_ref().is_some_and(|p| p.input != command) {
@@ -1714,6 +1918,17 @@ impl ChatScreen {
         self.select(l, l.current as isize);
         self.keep_suggestions = false;
         l.tab_cycles = true;
+        let units = |byte: usize| {
+            l.original[..byte.min(l.original.len())]
+                .encode_utf16()
+                .count()
+        };
+        self.completion = Some(SuggestionCompletion {
+            original: l.original.clone(),
+            range: (units(s.range.0), units(s.range.1)),
+            text: s.text,
+            input: self.input.value.clone(),
+        });
     }
     /// `ChatScreen.keyPressed`.
     pub fn key(
@@ -1727,6 +1942,14 @@ impl ChatScreen {
     ) -> ChatAction {
         use winit::keyboard::KeyCode as K;
         if self.suggestions_key(m, c, key, shift) {
+            return ChatAction::None;
+        }
+        // ChatScreen.keyPressed: while the box holds an unedited draft, the
+        // first Backspace clears all of it rather than one character.
+        if self.is_draft && key == K::Backspace {
+            self.input.set_value(m, "");
+            self.is_draft = false;
+            self.edited(m, c);
             return ChatAction::None;
         }
         match key {
@@ -1829,8 +2052,21 @@ impl ChatScreen {
             self.history_pos = new;
         }
     }
-    /// A left click (`ChatScreen.mouseClicked`): a suggestion, else the input.
+    /// A live left click: `MouseHandler` recognizes a double click after a handled click.
     pub fn click(&mut self, m: &Measure, c: &Commands, x: f64, y: f64) -> bool {
+        let now = std::time::Instant::now();
+        let double = self
+            .last_click
+            .is_some_and(|at| now.duration_since(at).as_millis() < 250);
+        let handled = self.click_event(m, c, x, y, double);
+        if handled {
+            self.last_click = Some(now);
+        }
+        handled
+    }
+
+    /// `ChatScreen.mouseClicked`: the caller supplies the event's double-click flag.
+    pub fn click_event(&mut self, m: &Measure, c: &Commands, x: f64, y: f64, double: bool) -> bool {
         if let Some(mut l) = self.suggestions.take() {
             let (xi, yi) = (x as i32, y as i32);
             if l.contains(xi, yi) {
@@ -1845,7 +2081,7 @@ impl ChatScreen {
             self.suggestions = Some(l);
         }
         if self.input.contains(x, y) {
-            self.input.click(m, x, false);
+            self.input.click(m, x, false, double);
             return true;
         }
         false
@@ -1859,11 +2095,20 @@ impl ChatScreen {
             return false;
         }
         let max = l.list.len().saturating_sub(self.layout.line_limit) as i32;
-        l.offset = ((l.offset as f64 - amount.clamp(-1.0, 1.0)) as i32).clamp(0, max) as usize;
+        // Round instead of truncating: touchpad/PixelDelta produces fractional
+        // amounts and truncation drops movement in one direction (#14338).
+        l.offset = (l.offset as f64 - amount.clamp(-1.0, 1.0))
+            .round()
+            .clamp(0.0, max as f64) as usize;
         true
     }
-    /// `CommandSuggestions.formatText`: argument colours over the input.
+    /// `CommandSuggestions.formatText`: argument colours over the input. The
+    /// draft formatter (`ChatScreen.formatChat`) is registered before this one
+    /// and wins while the draft is unedited: the whole text is grey italic.
     fn format(&self, value: &str, offset: usize) -> Text {
+        if self.is_draft {
+            return Text::literal(value).with_color(text::GRAY).italic();
+        }
         let gray = Style::color(text::GRAY);
         let Some(parse) = &self.parse else {
             return Text::literal(value);
@@ -1966,6 +2211,11 @@ impl ChatScreen {
     ) {
         let limit = l.list.len().min(self.layout.line_limit);
         let [rx, ry, rw, rh] = l.rect;
+        // SuggestionsList.extractRenderState: the whole list asks for the
+        // pointing hand while the pointer is inside its rectangle.
+        if mouse.0 >= rx && mouse.0 < rx + rw && mouse.1 >= ry && mouse.1 < ry + rh {
+            crate::widgets::request_cursor(crate::widgets::Cursor::PointingHand);
+        }
         let has_prev = l.offset > 0;
         let has_next = l.list.len() > l.offset + limit;
         let moved = l.last_mouse != mouse;
@@ -1990,6 +2240,11 @@ impl ChatScreen {
         for i in 0..limit {
             let y = ry + 12 * i as i32;
             d::fill(out, rx, y, rx + rw, y + 12, self.layout.fill);
+            // A row for the pad: nothing else can pick a suggestion without Tab.
+            crate::widgets::target_as(
+                [rx as f32, y as f32, rw as f32, 12.0],
+                crate::widgets::Kind::Row,
+            );
             if mouse.0 > rx && mouse.0 < rx + rw && mouse.1 > y && mouse.1 < y + 12 {
                 if moved {
                     self.select(l, (i + l.offset) as isize);

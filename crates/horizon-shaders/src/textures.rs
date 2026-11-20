@@ -202,26 +202,49 @@ fn mcmeta(text: Option<&str>) -> (Option<bool>, Option<bool>) {
     (flag("blur"), flag("clamp"))
 }
 
-/// A PNG as 8-bit RGBA, rows top first.
-pub fn decode_png(bytes: &[u8]) -> Option<Texture> {
+/// Whether a PNG of `file` bytes could hold the `width` x `height` pixels of `bits` each its
+/// header claims. The pixel buffer is sized from the header alone, so a pack file of a few dozen
+/// bytes claiming 60000x60000 would ask for gigabytes; deflate stores at most 1032 bytes in each
+/// byte, so no real PNG is refused.
+fn could_hold(width: u32, height: u32, bits: u64, file: usize) -> bool {
+    let pixel_bytes = u128::from(width) * u128::from(height) * u128::from(bits) / 8;
+    pixel_bytes <= 1032 * file as u128
+}
+
+/// A decoder for `bytes` with its header read, or `None` when the header claims more pixels than
+/// the file could hold ([`could_hold`]). Checked before `read_info`, whose own row-size
+/// arithmetic trusts the header too.
+fn checked_decoder(bytes: &[u8]) -> Option<png::Decoder<std::io::Cursor<&[u8]>>> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     // Packs ship PNGs with wrong chunk checksums (a server's obfuscated pack);
     // the game's other pack textures decode them, as stb_image does.
     decoder.ignore_checksums(true);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().ok()?;
+    let info = decoder.read_header_info().ok()?;
+    let bits = info.color_type.samples() as u64 * info.bit_depth as u64;
+    let (width, height) = (info.width, info.height);
+    could_hold(width, height, bits, bytes.len()).then_some(decoder)
+}
+
+/// A PNG as 8-bit RGBA, rows top first.
+pub fn decode_png(bytes: &[u8]) -> Option<Texture> {
+    let mut reader = checked_decoder(bytes)?.read_info().ok()?;
     let mut buf = vec![0; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
     let pixels = &buf[..info.buffer_size()];
     let rgba: Vec<f32> = match info.color_type {
         png::ColorType::Rgba => pixels.iter().map(|&b| b as f32 / 255.0).collect(),
         png::ColorType::Rgb => pixels
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .map(|b| b as f32 / 255.0)
             .collect(),
         png::ColorType::GrayscaleAlpha => pixels
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .map(|b| b as f32 / 255.0)
             .collect(),
@@ -344,8 +367,24 @@ fn raw(bytes: &[u8], words: &[&str]) -> Result<Texture, String> {
         }
     }
     let texels = match format.kind {
-        Kind::Int => Texels::Int(values.iter().map(|v| v.int()).collect()),
-        Kind::Uint => Texels::Uint(values.iter().map(|v| v.int() as u32).collect()),
+        Kind::Int => {
+            let max = (1i64 << (format.bits - 1)) - 1;
+            Texels::Int(
+                values
+                    .iter()
+                    .map(|v| v.int().clamp(-max - 1, max) as i32)
+                    .collect(),
+            )
+        }
+        Kind::Uint => {
+            let max = (1i64 << format.bits) - 1;
+            Texels::Uint(
+                values
+                    .iter()
+                    .map(|v| v.int().clamp(0, max) as u32)
+                    .collect(),
+            )
+        }
         // Integer data fills normalized and float formats normalized, as GL unpacks it.
         _ => Texels::Float(values.iter().map(|v| v.float(!integer)).collect()),
     };
@@ -378,11 +417,11 @@ impl Value {
         }
     }
 
-    fn int(self) -> i32 {
+    fn int(self) -> i64 {
         match self {
-            Value::U(v, _) => v as i32,
-            Value::I(v, _) => v,
-            Value::F(v) => v as i32,
+            Value::U(v, _) => i64::from(v),
+            Value::I(v, _) => i64::from(v),
+            Value::F(v) => v as i64,
         }
     }
 }
@@ -413,6 +452,47 @@ mod tests {
         let ihdr = encoded.windows(4).position(|w| w == b"IHDR").unwrap();
         encoded[ihdr + 4 + 13] ^= 0xFF;
         assert!(decode_png(&encoded).is_some());
+    }
+
+    fn grey_png(width: u32, height: u32) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        let pixels = [128, 128, 128, 255].repeat(width as usize * height as usize);
+        writer.write_image_data(&pixels).unwrap();
+        writer.finish().unwrap();
+        encoded
+    }
+
+    /// A pack texture of a few dozen bytes whose header claims 4096x4096 pixels is no PNG,
+    /// and is refused from its header before memory for its pixels is reserved.
+    #[test]
+    fn a_png_claiming_more_pixels_than_its_file_holds_is_refused() {
+        let mut crafted = grey_png(1, 1);
+        let ihdr = crafted.windows(4).position(|w| w == b"IHDR").unwrap();
+        crafted[ihdr + 4..ihdr + 8].copy_from_slice(&4096u32.to_be_bytes());
+        crafted[ihdr + 8..ihdr + 12].copy_from_slice(&4096u32.to_be_bytes());
+        // Refused from the header, before `read_info` or any pixel buffer.
+        assert!(checked_decoder(&crafted).is_none());
+        assert!(checked_decoder(&grey_png(1, 1)).is_some());
+        assert!(decode_png(&crafted).is_none());
+    }
+
+    #[test]
+    fn the_bound_is_deflates_largest_ratio() {
+        assert!(could_hold(1032, 1, 8, 1));
+        assert!(!could_hold(1033, 1, 8, 1));
+        assert!(could_hold(1, 1032, 64, 8));
+        assert!(!could_hold(u32::MAX, u32::MAX, 64, 1 << 20));
+    }
+
+    /// One flat colour compresses about as tightly as a PNG can, and still decodes.
+    #[test]
+    fn a_flat_png_still_decodes() {
+        let texture = decode_png(&grey_png(1024, 1024)).unwrap();
+        assert_eq!(texture.size, [1024, 1024, 1]);
     }
 
     #[test]
@@ -475,6 +555,77 @@ mod tests {
             .flat_map(|i| [i as f32 / 255.0, (255 - i) as f32 / 255.0, 7.0 / 255.0, 1.0])
             .collect();
         assert_eq!(clouds.texels, Texels::Float(expected));
+    }
+
+    #[test]
+    fn raw_integer_values_saturate_to_the_internal_format() {
+        // Independent GL integer texture conversion checkpoints, including unsigned data
+        // above i32::MAX: narrowing and changes of signedness clamp rather than wrap.
+        let signed: Vec<u8> = [-32769i32, -129, 0, 128, 32768]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        let unsigned: Vec<u8> = [0u32, 256, 65536, 2147483648, u32::MAX]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        for (format, pixel_type, data, expected) in [
+            (
+                "R8I",
+                "INT",
+                &signed,
+                Texels::Int(vec![-128, -128, 0, 127, 127]),
+            ),
+            (
+                "R16I",
+                "INT",
+                &signed,
+                Texels::Int(vec![-32768, -129, 0, 128, 32767]),
+            ),
+            (
+                "R32I",
+                "UNSIGNED_INT",
+                &unsigned,
+                Texels::Int(vec![0, 256, 65536, 2147483647, 2147483647]),
+            ),
+            (
+                "R8UI",
+                "INT",
+                &signed,
+                Texels::Uint(vec![0, 0, 0, 128, 255]),
+            ),
+            (
+                "R8UI",
+                "UNSIGNED_INT",
+                &unsigned,
+                Texels::Uint(vec![0, 255, 255, 255, 255]),
+            ),
+            (
+                "R16UI",
+                "INT",
+                &signed,
+                Texels::Uint(vec![0, 0, 0, 128, 32768]),
+            ),
+            (
+                "R16UI",
+                "UNSIGNED_INT",
+                &unsigned,
+                Texels::Uint(vec![0, 256, 65535, 65535, 65535]),
+            ),
+            (
+                "R32UI",
+                "UNSIGNED_INT",
+                &unsigned,
+                Texels::Uint(vec![0, 256, 65536, 2147483648, 4294967295]),
+            ),
+        ] {
+            let texture = raw(
+                data,
+                &["TEXTURE_1D", format, "5", "RED_INTEGER", pixel_type],
+            )
+            .unwrap();
+            assert_eq!(texture.texels, expected, "{format} from {pixel_type}");
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Block-state queries shared by the ported behaviour (`BlockStateBase`
 //! accessors and `Block` static helpers).
 use super::{
-    Behaviours, LevelAccess, Sim,
+    Behaviours, LevelAccess, Signals, Sim,
     classes::{Class, Interface},
     data::{BlockSet, state_flags},
     states::{BlockId, PropKey},
@@ -76,7 +76,7 @@ impl Behaviours {
         self.data(state).implements(interface)
     }
     pub(crate) fn fluid_in(&self, kind: FluidKind, mask: u8) -> bool {
-        mask & (1 << kind as u8) != 0
+        mask & kind.mask() != 0
     }
     pub(crate) fn is_water_fluid(&self, kind: FluidKind) -> bool {
         self.fluid_in(kind, self.fluid_tags.water)
@@ -173,8 +173,8 @@ impl crate::block_collision::DynamicCollisionWorld for NoBlockEntities {
 /// Block-entity lookups for dynamic shapes, read from the level itself: a
 /// shulker box's lid state decides whether its support shape is the open plate
 /// or the closed full cube (`ShulkerBoxBlock.getBlockSupportShape`).
-struct LevelBlockEntities<'a, L: LevelAccess + ?Sized>(&'a L);
-impl<L: LevelAccess + ?Sized> crate::dynamic_support::DynamicSupportWorld
+struct LevelBlockEntities<'a, L: super::signal_access::SignalAccess + ?Sized>(&'a L);
+impl<L: super::signal_access::SignalAccess + ?Sized> crate::dynamic_support::DynamicSupportWorld
     for LevelBlockEntities<'_, L>
 {
     type Error = std::convert::Infallible;
@@ -211,37 +211,97 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             None => super::data::ShapeInfo::default(),
         }
     }
+    /// `Block.canSupportRigidBlock(level, below)`.
+    pub fn can_support_rigid_block(&self, pos: BlockPos) -> bool {
+        self.signals().can_support_rigid_block(pos)
+    }
+    /// Rigid support from the neighbour state supplied by a shape update,
+    /// using the live block entity at `pos` through the shared signal queries.
+    pub(super) fn can_support_rigid_block_on(&self, pos: BlockPos, state: BlockStateId) -> bool {
+        self.signals().can_support_rigid_block_on(pos, state)
+    }
+    /// `Block.canSupportCenter(level, pos, direction)`.
+    pub fn can_support_center(&self, pos: BlockPos, direction: Direction) -> bool {
+        self.signals().can_support_center(pos, direction)
+    }
+    pub fn is_empty_block(&self, pos: BlockPos) -> bool {
+        self.signals().is_empty_block(pos)
+    }
+    /// `LevelReader.isWaterAt`: the fluid at `pos` is in the water tag.
+    pub fn is_water_at(&self, pos: BlockPos) -> bool {
+        self.signals().is_water_at(pos)
+    }
+}
+
+/// `Sim` reads these through its [`Signals`], so there is one implementation of each.
+impl<L: LevelAccess + ?Sized> Sim<'_, L> {
+    pub fn sturdy(&self, pos: BlockPos, direction: Direction) -> bool {
+        self.signals().sturdy(pos, direction)
+    }
+    pub fn is_redstone_conductor(&self, state: BlockStateId, _pos: BlockPos) -> bool {
+        self.signals().is_redstone_conductor(state, _pos)
+    }
+    pub(crate) fn above_state(&self, pos: BlockPos) -> BlockStateId {
+        self.signals().above_state(pos)
+    }
+}
+
+impl<L: LevelAccess + ?Sized> Sim<'_, L> {
+    /// `Level.getRawBrightness(pos, darken)`.
+    pub fn raw_brightness(&self, pos: BlockPos, darken: i32) -> i32 {
+        self.signals().raw_brightness(pos, darken)
+    }
+    /// `LevelReader.getMaxLocalRawBrightness(pos)`.
+    pub fn max_local_raw_brightness(&self, pos: BlockPos) -> i32 {
+        self.signals().max_local_raw_brightness(pos)
+    }
+    pub(crate) fn below_state(&self, pos: BlockPos) -> BlockStateId {
+        self.state(below(pos))
+    }
+    pub(crate) fn rel_state(&self, pos: BlockPos, direction: Direction) -> BlockStateId {
+        self.state(rel(pos, direction))
+    }
+    pub(crate) fn is_inside_build_height(&self, y: i32) -> bool {
+        y >= self.level.min_y() && y < self.level.max_y()
+    }
+}
+
+impl<L: super::signal_access::SignalAccess + ?Sized> Signals<'_, L> {
     /// The state whose cached support facts stand in for the block at `pos`.
     /// Vanilla reads a retracting piston's `moving_piston` block through its
     /// block entity, whose collision shape contains the extended base; the
     /// exported facts see no block entity and call every face unsupported,
     /// which made a lever on the piston's back pop off when it retracted.
     pub(super) fn support_state(&self, pos: BlockPos) -> BlockStateId {
-        let state = self.state(pos);
-        if self.b.is_block(state, self.b.named.moving_piston) {
-            if let Some(piston) = self.moving_piston(pos) {
-                // `PistonMovingBlockEntity.getCollisionShape`: only a piston base.
-                if piston.source
-                    && !piston.extending
-                    && (self.b.is_block(piston.moved_state, self.b.named.piston)
-                        || self
-                            .b
-                            .is_block(piston.moved_state, self.b.named.sticky_piston))
-                {
-                    return self
+        self.support_state_for(pos, self.state(pos))
+    }
+    /// [`Self::support_state`] for `state`, which a shape update hands over as
+    /// the neighbour's state, read with the block entity at `pos`.
+    fn support_state_for(&self, pos: BlockPos, state: BlockStateId) -> BlockStateId {
+        if self.b.is_block(state, self.b.named.moving_piston)
+            && let Some(piston) = self.moving_piston(pos)
+        {
+            // `PistonMovingBlockEntity.getCollisionShape`: only a piston base.
+            if piston.source
+                && !piston.extending
+                && (self.b.is_block(piston.moved_state, self.b.named.piston)
+                    || self
                         .b
-                        .table
-                        .set_bool(piston.moved_state, self.b.props.extended, true);
-                }
-                // The same method for any other moving block: its collision shape
-                // is `movedState.getCollisionShape(..).move(dir * extendedProgress)`,
-                // and `getExtendedProgress` is 0 once progress reaches 1.0, so a
-                // finished-but-not-yet-placed block supports like itself (a wall
-                // coral fan keeps its slime block while the column lands). At 0 or
-                // 0.5 progress the shape is shifted off the cell, a face never full.
-                if !piston.source && piston.progress >= 1.0 {
-                    return piston.moved_state;
-                }
+                        .is_block(piston.moved_state, self.b.named.sticky_piston))
+            {
+                return self
+                    .b
+                    .table
+                    .set_bool(piston.moved_state, self.b.props.extended, true);
+            }
+            // The same method for any other moving block: its collision shape
+            // is `movedState.getCollisionShape(..).move(dir * extendedProgress)`,
+            // and `getExtendedProgress` is 0 once progress reaches 1.0, so a
+            // finished-but-not-yet-placed block supports like itself (a wall
+            // coral fan keeps its slime block while the column lands). At 0 or
+            // 0.5 progress the shape is shifted off the cell, a face never full.
+            if !piston.source && piston.progress >= 1.0 {
+                return piston.moved_state;
             }
         }
         state
@@ -256,8 +316,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     /// progress 1, before the block entity finishes, it sits in the cell: a rail
     /// carried by slime finishes on top of a slime block still moving below it
     /// (#8111). None for other cells, and for moved blocks without a fixed shape.
-    fn moving_block_shape(&self, pos: BlockPos) -> Option<VoxelShape> {
-        if !self.b.is_block(self.state(pos), self.b.named.moving_piston) {
+    fn moving_block_shape(&self, pos: BlockPos, state: BlockStateId) -> Option<VoxelShape> {
+        if !self.b.is_block(state, self.b.named.moving_piston) {
             return None;
         }
         let piston = self.moving_piston(pos)?;
@@ -273,10 +333,11 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     fn moving_block_supports(
         &self,
         pos: BlockPos,
+        state: BlockStateId,
         direction: Direction,
         support: SupportType,
     ) -> Option<bool> {
-        let shape = self.moving_block_shape(pos)?;
+        let shape = self.moving_block_shape(pos, state)?;
         Some(support.is_supporting(&shape, direction).unwrap_or(false))
     }
     /// `ShulkerBoxBlock.getBlockSupportShape` at `pos`: vanilla asks the block
@@ -286,10 +347,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     fn shulker_support(
         &self,
         pos: BlockPos,
+        state: BlockStateId,
         direction: Direction,
         support: SupportType,
     ) -> Option<bool> {
-        let state = self.state(pos);
         if !self
             .b
             .tags
@@ -298,7 +359,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         {
             return None;
         }
-        let mut world = LevelBlockEntities(&*self.level);
+        let mut world = LevelBlockEntities(self.level);
         self.b
             .dynamic
             .get(&state)?
@@ -306,24 +367,33 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             .ok()
     }
     pub fn sturdy(&self, pos: BlockPos, direction: Direction) -> bool {
-        if let Some(sturdy) = self.moving_block_supports(pos, direction, SupportType::Full) {
+        let state = self.state(pos);
+        if let Some(sturdy) = self.moving_block_supports(pos, state, direction, SupportType::Full) {
             return sturdy;
         }
-        if let Some(sturdy) = self.shulker_support(pos, direction, SupportType::Full) {
+        if let Some(sturdy) = self.shulker_support(pos, state, direction, SupportType::Full) {
             return sturdy;
         }
         self.b.is_face_sturdy(self.support_state(pos), direction)
     }
     /// `Block.canSupportRigidBlock(level, below)`.
     pub fn can_support_rigid_block(&self, pos: BlockPos) -> bool {
-        if let Some(rigid) = self.moving_block_supports(pos, Direction::Up, SupportType::Rigid) {
+        self.can_support_rigid_block_on(pos, self.state(pos))
+    }
+    /// `state.isFaceSturdy(level, pos, UP, RIGID)`: `state` with the live block
+    /// entity at `pos`, as `DiodeBlock.canSurviveOn` asks of a shape update's
+    /// neighbour. A retracting piston's base is a `moving_piston` here.
+    pub(super) fn can_support_rigid_block_on(&self, pos: BlockPos, state: BlockStateId) -> bool {
+        if let Some(rigid) =
+            self.moving_block_supports(pos, state, Direction::Up, SupportType::Rigid)
+        {
             return rigid;
         }
-        if let Some(rigid) = self.shulker_support(pos, Direction::Up, SupportType::Rigid) {
+        if let Some(rigid) = self.shulker_support(pos, state, Direction::Up, SupportType::Rigid) {
             return rigid;
         }
         self.b
-            .is_face_sturdy_rigid(self.support_state(pos), Direction::Up)
+            .is_face_sturdy_rigid(self.support_state_for(pos, state), Direction::Up)
     }
     /// `Block.canSupportCenter(level, pos, direction)`.
     pub fn can_support_center(&self, pos: BlockPos, direction: Direction) -> bool {
@@ -332,10 +402,11 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         {
             return false;
         }
-        if let Some(center) = self.moving_block_supports(pos, direction, SupportType::Center) {
+        let raw = self.state(pos);
+        if let Some(center) = self.moving_block_supports(pos, raw, direction, SupportType::Center) {
             return center;
         }
-        if let Some(center) = self.shulker_support(pos, direction, SupportType::Center) {
+        if let Some(center) = self.shulker_support(pos, raw, direction, SupportType::Center) {
             return center;
         }
         self.b.is_face_sturdy_center(state, direction)
@@ -345,15 +416,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     }
     /// `LevelReader.isWaterAt`: the fluid at `pos` is in the water tag.
     pub fn is_water_at(&self, pos: BlockPos) -> bool {
-        self.b.is_water_fluid(self.fluid_at(pos).kind())
-    }
-    /// `Level.getRawBrightness(pos, darken)`.
-    pub fn raw_brightness(&self, pos: BlockPos, darken: i32) -> i32 {
-        super::raw_brightness(self.level, pos, darken)
-    }
-    /// `LevelReader.getMaxLocalRawBrightness(pos)`.
-    pub fn max_local_raw_brightness(&self, pos: BlockPos) -> i32 {
-        self.raw_brightness(pos, self.level.sky_darken())
+        self.b.is_water_fluid(self.b.fluid(self.state(pos)).kind())
     }
     pub fn is_redstone_conductor(&self, state: BlockStateId, _pos: BlockPos) -> bool {
         self.b.has_flag(state, state_flags::CONDUCTOR)
@@ -361,13 +424,21 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     pub(crate) fn above_state(&self, pos: BlockPos) -> BlockStateId {
         self.state(above(pos))
     }
-    pub(crate) fn below_state(&self, pos: BlockPos) -> BlockStateId {
-        self.state(below(pos))
+}
+
+impl<L: LevelAccess + ?Sized> Signals<'_, L> {
+    /// `Level.getRawBrightness(pos, darken)`.
+    pub fn raw_brightness(&self, pos: BlockPos, darken: i32) -> i32 {
+        super::raw_brightness(self.level, pos, darken)
     }
-    pub(crate) fn rel_state(&self, pos: BlockPos, direction: Direction) -> BlockStateId {
-        self.state(rel(pos, direction))
-    }
-    pub(crate) fn is_inside_build_height(&self, y: i32) -> bool {
-        y >= self.level.min_y() && y < self.level.max_y()
+    /// `LevelReader.getMaxLocalRawBrightness(pos)`: full daylight outside the
+    /// +-30,000,000 gate, where there is no chunk to ask.
+    pub fn max_local_raw_brightness(&self, pos: BlockPos) -> i32 {
+        if !(-30_000_000..30_000_000).contains(&pos.x)
+            || !(-30_000_000..30_000_000).contains(&pos.z)
+        {
+            return 15;
+        }
+        self.raw_brightness(pos, self.level.sky_darken())
     }
 }

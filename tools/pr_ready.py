@@ -4,7 +4,8 @@
     python3 tools/pr_ready.py                       # on this machine, against origin/main
     python3 tools/pr_ready.py --base upstream/main  # a fork: against the main repository's main
     python3 tools/pr_ready.py --host macmini        # builds and harnesses on a fleet machine (~/fleet/rbuild)
-    python3 tools/pr_ready.py --quick               # without running the vanilla harnesses
+    python3 tools/pr_ready.py --harnesses           # also run the affected vanilla harnesses here
+    python3 tools/pr_ready.py --quick               # never run the vanilla harnesses
 
 From the files the branch changes since its merge base with --base (committed or not) it decides what to run:
 rustfmt, and clippy with warnings denied exactly as CI's verify job runs it (the whole workspace with the game's code
@@ -12,8 +13,10 @@ mods, plus the server build when horizon-client is affected); the tests of the t
 CI's workspace-wide run gives them; the launcher (its own workspace) the same way when CI's launcher job would run
 (tools/ci/rust_changes.py --launcher); crates/horizon-theme/tokens.css against horizon-theme; Cargo.lock changing
 only with a Cargo.toml; the Python tests (always, as in CI) and the public-tree check; and the vanilla harnesses the
-changes can affect, picked as CI's parity job picks them (tools/parity.py --changed). Harnesses run where the
-vanilla data is (a prepared .local/ here, or the Mac mini); elsewhere they are listed for CI.
+changes can affect, picked as CI's parity job picks them (tools/parity.py --changed). As in CI (parity-scope in
+.github/workflows/ci.yml), the harnesses run only when the branch changes a harness, an oracle, a probe or the
+runner; otherwise they are listed and left to parity-main, which runs them on main. --harnesses runs them anyway.
+Harnesses run where the vanilla data is (a prepared .local/ here, or the Mac mini); elsewhere they are listed for CI.
 Tests select library, binary and integration targets explicitly, followed by doc tests, so unrelated example
 executables are not built and linked again.
 
@@ -29,9 +32,12 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -45,11 +51,11 @@ FLEET_SHARED = Path.home() / "code" / "horizon-parity" / "shared-local" / "parit
 if "PARITY_SHARED" not in os.environ and not (ROOT / ".local" / "minecraft").exists() and FLEET_SHARED.is_dir():
     # A fleet worktree without vanilla data still knows each harness's dependencies.
     os.environ["PARITY_SHARED"] = str(FLEET_SHARED)
-from tools import parity, release_train  # noqa: E402
+from tools import parity, process_tree, release_train  # noqa: E402
 from tools.ci import rust_changes  # noqa: E402
 
 RBUILD = Path.home() / "fleet" / "rbuild"
-LINE_LIMIT = 500
+LINE_LIMIT = 3000
 # What rbuild's login shell needs on each fleet machine before cargo (it adds sccache itself). The ThinkPad no
 # longer builds (2026-10-26: it keeps the AI pool and a few services; Linux work goes to playhorizon's runner).
 HOST_SETUP = {
@@ -74,10 +80,38 @@ LAUNCHER_FEATURES = """export features=""
 if [ "$(uname)" = Darwin ] && ! xcrun metal --version > /dev/null 2>&1; then features="--features gpui_platform/runtime_shaders"; fi
 in_shell() { if [ "$(uname)" = Linux ] && ! pkg-config --exists xkbcommon 2>/dev/null && command -v nix-shell > /dev/null; then
   nix-shell shell.nix --run "$1"; else bash -c "$1"; fi; }"""
+# The launcher's tests write where the launcher keeps its data: the native build log, the build lease and the native
+# build cache it trims, versions. As every run (AGENTS.md), they get a scratch home, removed afterwards, never the
+# player's own (#16877). A step that can't make one stops: the tests would use the player's data.
+LAUNCHER_TEST_HOME = (("HORIZON_LAUNCHER_HOME", "launcher"), ("HORIZON_HOME", "game"),
+                      ("HORIZON_LAUNCHER_LOCATION_FILE", "location.json"), ("XDG_DATA_HOME", "data"),
+                      ("XDG_CONFIG_HOME", "config"), ("HORIZON_LAUNCHER_TRASH", "trash"),
+                      ("HORIZON_LAUNCHER_CLIPBOARD", "clipboard"), ("HORIZON_LAUNCHER_DESKTOP", "desktop"))
+LAUNCHER_TEST_SCRATCH = ("scratch=$(mktemp -d) && trap 'rm -rf \"$scratch\"' EXIT && export "
+                         + " ".join(f'{name}="$scratch/{path}"' for name, path in LAUNCHER_TEST_HOME)
+                         + " || { echo 'pr_ready: no scratch home for the launcher tests' >&2; exit 1; }")
+
+
+def launcher_test_base():
+    """Where run_windows makes the launcher tests' scratch home: the temp folder, unless its real path has a space or a
+    letter outside ASCII. The launcher then builds in %ProgramData% instead (backend::build_dir), outside the home
+    and never removed, so the home goes in %ProgramData% itself, as the launcher's own fallback does."""
+    temp = os.path.realpath(tempfile.gettempdir())
+    if temp.isascii() and " " not in temp:
+        return temp
+    public = os.environ.get("ProgramData", "")
+    return public if os.path.isabs(public) and public.isascii() and " " not in public else r"C:\ProgramData"
 
 
 # Build-script inputs outside the crates: catalog-only edits still need to build and test their consumers.
-MOD_API_INPUTS = ("native-hooks.json", "tools/native-hook-fragments/")
+MOD_API_INPUTS = ("crates/horizon-mod-vocab/src/hooks/",)
+# The generated dispatch surface: edits here change what the dispatch tests compile and run. The registry is its
+# own crate with its own suite; a `--manifest-path` run keeps both out of the workspace selection above.
+DISPATCH_TESTS = "crates/horizon-mod-api-gen/dispatch-tests/Cargo.toml"
+DISPATCH_TEST_INPUTS = ("crates/horizon-mod-api-gen/", "crates/horizon-mod-api-macros/",
+                        "crates/horizon-mod-api/",
+                        "crates/horizon-mod-vocab/", *MOD_API_INPUTS)
+MOD_REGISTRY = "crates/horizon-mod-registry/Cargo.toml"
 
 def is_doc(path):
     return path.endswith(".md")
@@ -108,8 +142,8 @@ def touched_crates(paths, packages):
         if "horizon-client-lib" in packages and path.startswith("crates/horizon-client/"):
             relative = path.removeprefix("crates/horizon-client/")
             gameplay = relative in {"Cargo.toml", "build.rs", "windows-segment-heap.manifest",
-                                    "src/lib.rs", "src/main.rs", "src/entry.rs", "src/game.rs", "tests/launch_api.rs"} \
-                or relative.startswith("src/game/")
+                                    "src/lib.rs", "src/main.rs", "src/entry.rs", "src/game.rs"} \
+                or relative.startswith(("src/game/", "tests/it/"))
             crates.add("horizon-client" if gameplay else "horizon-client-lib")
             continue
         owners = [name for name, directory in packages.items() if path.startswith(directory.rstrip("/") + "/")]
@@ -138,7 +172,7 @@ def reviewed(path):
 
 
 def scope_warnings(paths, lines):
-    """lines: the changed lines of the reviewed paths (not documentation or tests)."""
+    """lines: the changed lines of the reviewed paths (not documentation or tests, moved lines or inline tests)."""
     warnings = []
     if lines > LINE_LIMIT:
         warnings.append(f"{lines} lines of code: over {LINE_LIMIT}, split it if it can ship in parts")
@@ -159,6 +193,19 @@ def suggested_label(paths, exporter_paths=frozenset()):
     if any(release_train.player_facing(path, kind, exporter_paths) for path in paths for kind in ("game", "launcher")):
         return "player-facing: `feature` if players get something new, no label for a fix (`release-now` if urgent)"
     return "`skip-release`"
+
+
+# CI's parity-scope (.github/workflows/ci.yml): a pull request runs its harnesses itself only when it changes a
+# harness, an oracle, a probe or the runner. parity-main runs the others on main, a batch of merges at a time.
+PARITY_SCOPE = re.compile(
+    r"^(tools/test_[a-z0-9_]+_parity\.py|tools/(parity[a-z_]*|lab)\.py|tools/parity_hosts\.json|mods/horizon/src/test/"
+    r"|crates/[^/]+/examples/|crates/horizon-client/src/game/[a-z_]*(fixture|harness)\.rs"
+    r"|\.github/workflows/parity[a-z-]*\.yml)")
+
+
+def runs_parity(changed):
+    """Whether CI's parity job would run for a pull request that changes these files."""
+    return any(PARITY_SCOPE.match(path) for path in changed)
 
 
 def harness_names(names):
@@ -189,23 +236,211 @@ def duration(seconds):
 
 
 def git(*arguments):
-    return subprocess.run(["git", *arguments], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    return subprocess.run(["git", *arguments], cwd=ROOT, capture_output=True, check=True).stdout.decode("utf-8")
 
 
 def line_counts(base, changed):
     """Lines added and removed in each changed path since base, untracked files included: {path: (added, removed)}."""
     counts = {}
-    for row in git("diff", "--numstat", base).splitlines():
+    for row in filter(None, git("diff", "--numstat", "--no-renames", "-z", base).split("\0")):
         plus, minus, path = row.split("\t", 2)
         if plus != "-":
             counts[path] = (int(plus), int(minus))
-    for path in git("ls-files", "--others", "--exclude-standard").splitlines():
+    for path in git("ls-files", "--others", "--exclude-standard", "-z").split("\0"):
         if path in changed:
             try:
                 counts[path] = (len((ROOT / path).read_text(encoding="utf-8").splitlines()), 0)
             except (UnicodeDecodeError, OSError):
                 pass
     return counts
+
+
+RAW_STRING = re.compile(r'b?r(#*)"')
+
+
+def mask_rust(text):
+    """text with comments and the insides of string and char literals blanked (newlines kept), so braces can be
+    counted. Good enough for real code, not a parser: a macro that builds unbalanced braces out of tokens can
+    still confuse it."""
+    out = list(text)
+    n, i = len(text), 0
+
+    def blank(start, end):
+        for k in range(start, min(end, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        c = text[i]
+        raw = RAW_STRING.match(text, i) if c in "rb" and not (i and (text[i - 1].isalnum() or text[i - 1] == "_")) \
+            else None
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            blank(i, end)
+            i = end
+        elif text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+        elif raw:
+            end = text.find('"' + raw.group(1), raw.end())
+            end = n if end < 0 else end + 1 + len(raw.group(1))
+            blank(raw.end(), end)
+            i = end
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            blank(i + 1, j)
+            i = j + 1
+        elif c == "'":
+            if text.startswith("'\\", i):
+                end = text.find("'", i + 3)
+                end = n if end < 0 else end + 1
+                blank(i + 1, end - 1)
+                i = end
+            elif i + 2 < n and text[i + 2] == "'":
+                blank(i + 1, i + 2)
+                i += 3
+            else:
+                i += 1  # a lifetime
+        else:
+            i += 1
+    return "".join(out)
+
+
+TEST_MODULE = re.compile(r"#\s*\[\s*cfg\s*\(\s*(?:test|all\s*\(\s*test\b[^\]]*?)\)\s*\]"
+                         r"(?:\s*#\s*\[[^\]]*\])*\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+\w+\s*\{")
+
+
+def test_module_ranges(text):
+    """The (first, last) line numbers, counting from 1, of each inline `#[cfg(test)] mod name { ... }` in Rust
+    source: from the attribute to the closing brace. `#[cfg(all(test, ...))]` counts too. `mod name;` is one line
+    and is not a range."""
+    masked = mask_rust(text)
+    ranges = []
+    for match in TEST_MODULE.finditer(masked):
+        depth, j = 1, match.end()
+        while j < len(masked) and depth:
+            depth += {"{": 1, "}": -1}.get(masked[j], 0)
+            j += 1
+        if depth == 0:
+            ranges.append((masked.count("\n", 0, match.start()) + 1, masked.count("\n", 0, j - 1) + 1))
+    return ranges
+
+
+def diff_segments(diff):
+    """Parse `git diff -U0` text into runs of changed lines: [(path, "-" or "+", [(line number, text), ...])]. Line
+    numbers are the old file's for "-" and the new file's for "+"."""
+    segments, path, old_path, in_hunk, old, new, current = [], None, None, False, 0, 0, None
+    for row in diff.split("\n"):
+        if row.startswith("diff --git "):
+            in_hunk, current = False, None
+        elif not in_hunk and row.startswith("--- "):
+            old_path = row[4:].split("\t")[0].removeprefix("a/")
+        elif not in_hunk and row.startswith("+++ "):
+            path = row[4:].split("\t")[0].removeprefix("b/")
+            path = old_path if path == "/dev/null" else path
+        elif row.startswith("@@"):
+            header = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)", row)
+            in_hunk, old, new, current = True, int(header.group(1)), int(header.group(2)), None
+        elif in_hunk and row[:1] in ("-", "+"):
+            side = row[0]
+            if current is None or current[1] != side:
+                current = (path, side, [])
+                segments.append(current)
+            current[2].append((old if side == "-" else new, row[1:]))
+            old, new = old + (side == "-"), new + (side == "+")
+        elif not in_hunk or row[:1] != "\\":
+            current = None
+    return segments
+
+
+def moved_lines(segments, window=3):
+    """The (segment number, position) of every changed line that was moved: a run of lines removed in one place
+    and added in another with the same text, whitespace ignored, like `git diff --color-moved`. A run counts when
+    it holds at least `window` meaningful lines (three or more characters; braces and blanks move along inside a
+    run but never make one). Each line is matched once. A start that matches more than 20 places is skipped."""
+    sides = {"-": [], "+": []}  # (stripped text, segment number, position) in diff order
+    for number, (_, side, lines) in enumerate(segments):
+        for position, (_, text) in enumerate(lines):
+            sides[side].append(("".join(text.split()), number, position))
+    removed, added = sides["-"], sides["+"]
+    seeds = {}
+    for index in range(len(added) - window + 1):
+        chunk = added[index:index + window]
+        if chunk[0][1] == chunk[-1][1]:
+            seeds.setdefault(tuple(item[0] for item in chunk), []).append(index)
+    marked = {"-": [False] * len(removed), "+": [False] * len(added)}
+
+    def run_length(i, j):
+        k = 0
+        while (i + k < len(removed) and j + k < len(added) and not marked["-"][i + k] and not marked["+"][j + k]
+               and removed[i + k][0] == added[j + k][0] and removed[i + k][1] == removed[i][1]
+               and added[j + k][1] == added[j][1]):
+            k += 1
+        return k
+
+    i = 0
+    while i <= len(removed) - window:
+        candidates = seeds.get(tuple(item[0] for item in removed[i:i + window]), [])
+        runs = [(run_length(i, j), j) for j in candidates] if len(candidates) <= 20 else []
+        length, j = max(runs, default=(0, 0))
+        if sum(len(item[0]) >= 3 for item in removed[i:i + length]) >= window:
+            for k in range(length):
+                marked["-"][i + k] = marked["+"][j + k] = True
+            i += length
+        else:
+            i += 1
+    return {(item[1], item[2]) for side in "-+" for item, flag in zip(sides[side], marked[side]) if flag}
+
+
+def skipped_lines(diff, old_source, new_source):
+    """(moved, inline tests): how many changed lines of the reviewed paths in a `git diff -U0` don't count towards
+    the size. old_source and new_source give a path's text before and after, or None if it did not exist."""
+    segments = [segment for segment in diff_segments(diff) if reviewed(segment[0])]
+    inline = set()
+    for number, (path, side, lines) in enumerate(segments):
+        text = (old_source if side == "-" else new_source)(path) if path.endswith(".rs") else None
+        ranges = test_module_ranges(text) if text and "test" in text else []
+        inline |= {(number, position) for position, (line, _) in enumerate(lines)
+                   if any(first <= line <= last for first, last in ranges)}
+    # Inline test lines are out already, so they are not offered as moves.
+    rest = [(path, side, [line for position, line in enumerate(lines) if (number, position) not in inline])
+            for number, (path, side, lines) in enumerate(segments)]
+    return len(moved_lines(rest)), len(inline)
+
+
+def skipped_in_branch(base, changed):
+    """skipped_lines for the branch: the diff since base, plus untracked files as all-added."""
+    def old_source(path):
+        try:
+            return git("show", f"{base}:{path}")
+        except subprocess.CalledProcessError:
+            return None
+
+    def new_source(path):
+        try:
+            return (ROOT / path).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            return None
+
+    diff = git("-c", "core.quotePath=false", "diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff", base)
+    for path in git("ls-files", "--others", "--exclude-standard", "-z").split("\0"):
+        text = new_source(path) if path in changed else None
+        if text:
+            lines = text.splitlines()
+            diff += f"\ndiff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n"
+            diff += "\n".join("+" + line for line in lines)
+    return skipped_lines(diff, old_source, new_source)
 
 
 def packages():
@@ -244,7 +479,8 @@ def dependent_crates(crates, dependencies):
 
 def prepare_key():
     """tools/ci/vanilla-data.sh's preparation key, for a copy without Git history."""
-    listing = git("ls-files", "-s", "crates/horizon-prepare", "mods/horizon/src/test/java", "research-lock.json")
+    listing = git("ls-files", "-s", "crates/horizon-prepare", "mods/horizon/src/test/java", "research-lock.json",
+                  "tools/ci/vanilla-data.sh", "tools/ci/seed_prepared_extras.py", "tools/prepare_output.py")
     return hashlib.sha256(listing.encode()).hexdigest()[:16]
 
 
@@ -261,9 +497,9 @@ def tests_passed(output):
 
 
 def unittest_passed(output):
-    failed = re.search(r"^(FAILED \(.*\))$", output, re.M)
+    outcome = re.search(r"^((?:OK|FAILED) \(.*\))$", output, re.M)
     ran = re.search(r"^Ran (\d+) tests?", output, re.M)
-    return f"{ran.group(1) if ran else '?'} run, {failed.group(1)}" if failed else f"{ran.group(1)} passed" if ran else ""
+    return f"{ran.group(1) if ran else '?'} run, {outcome.group(1)}" if outcome else f"{ran.group(1)} passed" if ran else ""
 
 
 def parity_summary(output):
@@ -285,10 +521,9 @@ def parity_summary(output):
     return text
 
 
-# CI's verify job (.github/workflows/ci.yml): clippy over the whole workspace, and over the server build (the game
-# without sound or controllers).
-CI_CLIPPY = "cargo clippy --workspace --all-targets --locked -- -D warnings"
-CI_CLIPPY_SERVER = "cargo clippy -p horizon-client --all-targets --locked --no-default-features -- -D warnings"
+# CI's lint (.github/workflows/ci.yml verify): collect warnings across the whole graph before rejecting them.
+CI_CLIPPY = "python3 tools/ci/check_warnings.py cargo clippy --keep-going --workspace --all-targets --locked"
+CI_CLIPPY_SERVER = "python3 tools/ci/check_warnings.py cargo clippy --keep-going -p horizon-client -p horizon-game -p horizon-mod-host --all-targets --locked --no-default-features"
 
 
 # CI installs the current stable each run (rustup toolchain install stable), and Rust ships one every six weeks
@@ -335,15 +570,19 @@ def mark_old_rust(steps, warning):
 
 def mod_features(crates):
     """The features CI's workspace-wide test run gives these crates. Cargo unifies features over the packages it
-    builds, so a crate tested alone needs the ones the workspace would have turned on for it: horizon-mods' index."""
-    return " --features horizon-mods/index" if crates is not None and "horizon-mods" in crates else ""
+    builds, so a crate tested alone needs the ones the workspace would have turned on for it: horizon-mod-package' index."""
+    return " --features horizon-mod-package/index" if crates is not None and "horizon-mod-package" in crates else ""
 
 
 # What horizon-client's full content-root tests load (mod_content_tests.rs). They take minutes on prepared data, so
 # they are #[ignore]d and run here only when one of these changes.
 CONTENT_ROOT = ("crates/horizon-client/src/mod_content", "crates/horizon-client-render/src/assets.rs", "crates/horizon-items/",
-                "crates/horizon-mods/", "crates/horizon-assets/")
+                "crates/horizon-mod-package/", "crates/horizon-assets/")
 CONTENT_ROOT_TESTS = "cargo test --locked -p horizon-client-lib --lib mod_content::tests:: -- --ignored"
+
+# holder::tests spawns target/<profile>/examples/holder_actor beside its test binary.
+# --tests does not build that executable; use the same explicit prerequisite as CI.
+HOLDER_ACTOR = "cargo build --locked -p horizon-mod-package --features runtime-process --example holder_actor"
 
 
 def plan(args, base, changed, crates_of, libraries, dependencies):
@@ -362,7 +601,7 @@ def plan(args, base, changed, crates_of, libraries, dependencies):
     clippy_crates = dependent_crates(crates, dependencies)
     clippy = CI_CLIPPY
     if clippy_crates is None or "horizon-client" in clippy_crates:
-        clippy += f" && {CI_CLIPPY_SERVER}"
+        clippy = f'status=0\n{CI_CLIPPY} || status=$?\n{CI_CLIPPY_SERVER} || status=$?\nexit "$status"'
     test_skip = None if crates is None or crates else "no crate touched"
     doc_crates = sorted(libraries if crates is None else libraries.intersection(crates))
     doc_selection = "--workspace" if crates is None else " ".join(f"-p {shlex.quote(c)}" for c in doc_crates)
@@ -370,10 +609,22 @@ def plan(args, base, changed, crates_of, libraries, dependencies):
     steps = [
         Step("Cargo.lock", where="git"),
         Step("Public tree", "python3 tools/check_public_tree.py", where="here"),
+        Step("Repository hygiene", "python3 tools/ci/check_repository_hygiene.py", where="here"),
+        # docs/layers.md: a crate depends only on its own layer or a lower one, and the exceptions only shrink.
+        Step("Layers", f"python3 tools/check_layers.py --base {shlex.quote(base)}", where="here"),
+        Step("Addresses", f"python3 tools/check_addresses.py --base {shlex.quote(base)}", where="here"),
+        # tools/hotspots/README.md: export brace lists stay at 12 names or under; longer ones only shrink.
+        Step("Export lists", "python3 tools/hotspots/check_lists.py", where="here"),
+        # tools/hotspots/check_stand_ins.py: test stand-ins keep up with the hooks and traits they mirror.
+        Step("Test stand-ins", "python3 tools/hotspots/check_stand_ins.py", where="here"),
         # Always, as in CI: some read the crates, the roadmap or the workflows.
         Step("Python tests", "python3 -m unittest discover -s tests", where="here", summary=unittest_passed),
-        Step("rustfmt", "cargo fmt --all -- --check", skip=None if rust else no_rust),
+        # CI's own scan (tools/ci/format_scan.py): cargo fmt, then the files no `mod` line reaches, by path.
+        Step("rustfmt", "python3 tools/ci/format_scan.py", skip=None if rust else no_rust),
         Step("clippy", clippy, skip=None if rust else no_rust),
+        Step("holder actor", HOLDER_ACTOR,
+             skip=None if crates is None or "horizon-mod-package" in crates or launcher
+             else "holder tests untouched"),
         Step("tests" + (": workspace" if crates is None else f": {', '.join(crates)}" if crates else ""),
              f"cargo test --locked {selection}{mod_features(crates)} --tests",
              skip=test_skip, summary=tests_passed),
@@ -386,16 +637,42 @@ def plan(args, base, changed, crates_of, libraries, dependencies):
              skip=None if any(p.startswith(("crates/horizon-theme/", "xtask/")) for p in changed)
              else "theme untouched"),
     ]
+    dispatch_skip = None if any(path.startswith(DISPATCH_TEST_INPUTS) for path in changed) \
+        else "dispatch surface untouched"
+    registry_skip = None if any(path.startswith("crates/horizon-mod-registry/") for path in changed) \
+        else "mod registry untouched"
+    for name, manifest, skip in (("dispatch tests", DISPATCH_TESTS, dispatch_skip),
+                                 ("mod registry tests", MOD_REGISTRY, registry_skip)):
+        steps.extend([
+            Step(f"{name} clippy",
+                 f"CARGO_BUILD_JOBS=${{CARGO_BUILD_JOBS:-4}} python3 tools/ci/check_warnings.py cargo clippy --keep-going --manifest-path {manifest}"
+                 " --all-targets --locked", skip=skip),
+            Step(f"{name} tests",
+                 f"CARGO_BUILD_JOBS=${{CARGO_BUILD_JOBS:-4}} cargo test --manifest-path {manifest}"
+                 " --locked -- --test-threads=4", skip=skip, summary=tests_passed),
+        ])
     launcher_skip = None if launcher else "launcher untouched"
     for name, command in [("launcher rustfmt", "cargo fmt --check"),
-                          ("launcher clippy", "cargo clippy --all-targets --locked $features -- -D warnings"),
+                          ("launcher clippy", "python3 ../tools/ci/check_warnings.py cargo clippy --keep-going --all-targets --locked $features"),
                           ("launcher tests", "cargo test --locked --lib --bins $features")]:
-        steps.append(Step(name, f"cd launcher && {LAUNCHER_FEATURES}\nin_shell {shlex.quote(command)}", skip=launcher_skip,
-                          summary=tests_passed if name == "launcher tests" else None))
+        home = f"\n{LAUNCHER_TEST_SCRATCH}" if name == "launcher tests" else ""
+        steps.append(Step(name, f"cd launcher && {LAUNCHER_FEATURES}{home}\nin_shell {shlex.quote(command)}",
+                          skip=launcher_skip, summary=tests_passed if name == "launcher tests" else None))
     harness = Step("Parity", summary=parity_summary)
     affected = affected_here(changed)
     local_data = (ROOT / ".local" / "minecraft").exists() and (ROOT / ".local" / "horizon-client").exists()
-    if args.quick or (args.host == "local" and not local_data) or (args.host != "local" and args.host not in HARNESS_SETUP):
+    in_scope = args.harnesses or runs_parity(changed)
+    if not args.quick and not in_scope:
+        # What CI does with this pull request: nothing here, parity-main on main.
+        harness.status = "list"
+        why = "no harness, oracle, probe or runner change; --harnesses runs them here"
+        if affected is None:
+            harness.detail = f"not run ({why}): parity-main checks this on main"
+        elif not affected:
+            harness.detail = "no harness affected"
+        else:
+            harness.detail = f"{len(affected)} affected, left to parity-main on main ({why}): {short_list(affected)}"
+    elif args.quick or (args.host == "local" and not local_data) or (args.host != "local" and args.host not in HARNESS_SETUP):
         harness.status = "list"
         why = "--quick" if args.quick else "no vanilla data here"
         if affected is None:
@@ -416,19 +693,42 @@ cat > "$RUNNER_TEMP/changed" <<'PR_READY_CHANGED'
 {listing}
 PR_READY_CHANGED
 PARITY_HOSTS= python3 tools/parity.py --changed-files "$RUNNER_TEMP/changed" --timeout 1500"""
+    datafix = getattr(args, 'datafix', False)
+    harness.datafix_selected = datafix
+    if not datafix:
+        print('datafix parity not run: opt in with --datafix and a private HORIZON_DATAFIX_ROOT (default checkout .local/datafix).', file=sys.stderr)
+        if harness.command:
+            harness.command += ' --exclude datafix'
     steps.append(harness)
     return steps
+
+
+CLIPPY_CACHE_HINT = (
+    "pr_ready: the first clippy run builds the whole workspace once (cold, can take 20+ min); later runs are warm. "
+    "Set RUSTC_WRAPPER=sccache with CARGO_INCREMENTAL=0 to reuse dependency builds across branches and checkouts."
+)
 
 
 def run_script(steps, host, verbose):
     """Runs the steps in one shell on host (here for "local"), each between markers, reading results as they come."""
     if not steps:
         return
+    # Explicit local opt-in can select datafix even with unknown dependencies.
+    # Preserve the validated absolute path across the subprocess cwd change.
+    environment = os.environ.copy()
+    if host == 'local' and any(step.name == 'Parity' and getattr(step, 'datafix_selected', False) for step in steps):
+        from tools.datafix_paths import VARIABLE, writable_root
+        environment[VARIABLE] = str(writable_root())
     if host == "local" and os.name == "nt":
-        run_windows(steps, verbose)
+        run_windows(steps, verbose, environment)
         return
     parts = [HOST_SETUP.get(host, ""), "set +e"]
+    first_clippy = True
     for index, step in enumerate(steps):
+        if step.name.endswith("clippy") and first_clippy:
+            first_clippy = False
+            parts.append('case "${RUSTC_WRAPPER:-}" in sccache|*/sccache|sccache.exe|*/sccache.exe) ;; '
+                         f'*) printf \'%s\\n\' {shlex.quote("@@pr_ready:hint:" + CLIPPY_CACHE_HINT)} ;; esac')
         parts.append(f"echo '@@pr_ready:begin:{index}'; started=$(date +%s)\n( {step.command}\n) 2>&1 < /dev/null\n"
                      f"status=$?; echo; echo \"@@pr_ready:end:{index}:$status:$(( $(date +%s) - started ))\"")
     script = "\n".join(parts)
@@ -437,7 +737,7 @@ def run_script(steps, host, verbose):
     else:
         command = [str(RBUILD), host, "--", "bash", "-c", script]
     current = None
-    with subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    with subprocess.Popen(command, cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                           errors="replace") as process:
         for line in process.stdout:
             marker = re.match(r"@@pr_ready:(begin|end):(\d+)(?::(\d+):(\d+))?$", line.strip())
@@ -450,6 +750,8 @@ def run_script(steps, host, verbose):
                 step.seconds = int(marker.group(4))
                 finish(step, verbose)
                 current = None
+            elif line.startswith("@@pr_ready:hint:"):
+                print(line.removeprefix("@@pr_ready:hint:"), end="", file=sys.stderr, flush=True)
             elif current is not None:
                 current.output += line
                 if verbose:
@@ -462,21 +764,35 @@ def run_script(steps, host, verbose):
             finish(step, verbose)
 
 
-def run_windows(steps, verbose):
-    """Run local checks directly on Windows without requiring a Unix shell."""
+def run_windows(steps, verbose, environment=None):
+    """Run local checks directly on Windows without requiring a Unix shell. Each runs in its own job
+    (tools/process_tree.py): what a check starts, a harness's game say, ends with it, or with this process."""
+    first_clippy = True
     for step in steps:
         command = shlex.split(step.command)
         cwd = ROOT
-        env = os.environ.copy()
+        env = (os.environ if environment is None else environment).copy()
         env["PYTHONUTF8"] = "1"
+        if command and command[0].startswith("CARGO_BUILD_JOBS="):  # the shell form, with no shell to read it
+            command.pop(0)
+            env.setdefault("CARGO_BUILD_JOBS", "4")
+        scratch = None
         if step.name == "Public tree":
             command = [sys.executable, "tools/check_public_tree.py"]
+        elif step.name == "Layers":
+            command = [sys.executable, "tools/check_layers.py", *command[2:]]
+        elif step.name == "Addresses":
+            command = [sys.executable, "tools/check_addresses.py", *command[2:]]
+        elif step.name == "Export lists":
+            command = [sys.executable, "tools/hotspots/check_lists.py"]
+        elif step.name == "Test stand-ins":
+            command = [sys.executable, "tools/hotspots/check_stand_ins.py"]
         elif step.name == "Python tests":
             command = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
         elif step.name == "rustfmt":
-            command = ["cargo", "fmt", "--all", "--", "--check"]
+            command = [sys.executable, "tools/ci/format_scan.py"]
         elif step.name == "clippy":
-            command = shlex.split(CI_CLIPPY)  # the server build's clippy runs in CI (Linux)
+            command = [sys.executable, *shlex.split(CI_CLIPPY)[1:]]  # server clippy runs in CI (Linux)
         elif step.name.startswith("tests"):
             command = shlex.split(step.command)
         elif step.name == "tokens.css up to date":
@@ -485,11 +801,14 @@ def run_windows(steps, verbose):
             command = ["cargo", "fmt", "--check"]
             cwd = ROOT / "launcher"
         elif step.name == "launcher clippy":
-            command = ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"]
+            command = [sys.executable, "../tools/ci/check_warnings.py", "cargo", "clippy", "--keep-going",
+                       "--all-targets", "--locked"]
             cwd = ROOT / "launcher"
         elif step.name == "launcher tests":
-            command = ["cargo", "test", "--locked", "--lib"]
+            command = ["cargo", "test", "--locked", "--lib", "--bins"]
             cwd = ROOT / "launcher"
+            scratch = tempfile.mkdtemp(prefix="horizon-launcher-tests-", dir=launcher_test_base())
+            env.update({name: os.path.join(scratch, path) for name, path in LAUNCHER_TEST_HOME})
         elif step.name == "Parity":
             command = shlex.split(step.command)
             if command and command[0] == "PARITY_HOSTS=":
@@ -500,19 +819,34 @@ def run_windows(steps, verbose):
         elif command and command[0] == "python3":
             command[0] = sys.executable
 
+        if step.name.endswith("clippy") and first_clippy:
+            first_clippy = False
+            if Path(env.get("RUSTC_WRAPPER", "")).name not in ("sccache", "sccache.exe"):
+                print(CLIPPY_CACHE_HINT, file=sys.stderr, flush=True)
         print(f"  {step.name}...", file=sys.stderr, flush=True)
         started = time.monotonic()
         try:
-            with subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT, text=True, errors="replace") as process:
+            with process_tree.popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, errors="replace") as process:
+                def release(process):
+                    # The check's exit ends what it left running, which would otherwise hold the output open.
+                    process.wait()
+                    process_tree.ended(process)
+                # A daemon: interrupted, this process exits at once, and its jobs end the checks with it.
+                reaper = threading.Thread(target=release, args=(process,), daemon=True)
+                reaper.start()
                 for line in process.stdout:
                     step.output += line
                     if verbose:
                         print("    " + line, end="", file=sys.stderr)
-                status = process.wait()
+                reaper.join()
+                status = process.returncode
             step.status = "pass" if status == 0 else "fail"
         except OSError as error:
             step.status, step.detail = "fail", str(error)
+        finally:
+            if scratch:
+                shutil.rmtree(scratch, ignore_errors=True)
         step.seconds = int(time.monotonic() - started)
         finish(step, verbose)
 
@@ -556,20 +890,59 @@ def finish(step, verbose):
 MARK = {"pass": "✅", "fail": "❌", "skip": "➖", "list": "➖", "warn": "⚠️"}
 
 
-def block(args, base, merge_base, changed, counts, steps, label, elapsed):
+def revision_state():
+    """Snapshot before selection and after checks; ignored build output is excluded."""
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z").split("\0")[:-1]
+    metadata = []
+    for path in untracked:
+        # Never open untracked content: symlinks can dangle or name directories,
+        # and FIFOs/devices must not be read. Dirty starts are uncertified anyway.
+        try:
+            info = (ROOT / path).lstat()
+            link = os.readlink(ROOT / path) if stat.S_ISLNK(info.st_mode) else None
+            metadata.append((path, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns, link))
+        except OSError:
+            metadata.append((path, "unavailable"))
+    return (git("rev-parse", "HEAD").strip(),
+            git("status", "--porcelain=v1", "--untracked-files=all"),
+            git("diff", "HEAD", "--binary") + repr(metadata))
+
+
+def block(args, base, merge_base, changed, counts, steps, label, elapsed, revision, changed_during_run=False,
+          skipped=(0, 0)):
     where = socket.gethostname().split(".")[0] if args.host == "local" else args.host
-    flags = "".join(f" --{flag}" for flag in ("quick",) if getattr(args, flag)) + \
+    head, status, _ = revision
+    dirty = bool(status)
+    flags = "".join(f" --{flag}" for flag in ("quick", "harnesses") if getattr(args, flag)) + \
         ("" if args.host == "local" else f" --host {args.host}") + ("" if base == "origin/main" else f" --base {base}")
     added, removed = (sum(count[i] for count in counts.values()) for i in (0, 1))
-    warnings = scope_warnings(changed, sum(sum(count) for path, count in counts.items() if reviewed(path)))
-    lines = [f"**pr_ready** (`tools/pr_ready.py{flags}` on {where}, against {base} at {merge_base[:9]}, "
+    moved, inline = skipped
+    counted = sum(sum(count) for path, count in counts.items() if reviewed(path)) - moved - inline
+    warnings = scope_warnings(changed, counted)
+    not_counted = " and ".join(f"{number:,} {what}" for number, what in ((moved, "moved lines"), (inline, "inline-test lines"))
+                               if number)
+    lines = [f"**pr_ready** (`tools/pr_ready.py{flags}`, commit `{head}`{' dirty' if dirty else ''}, "
+             f"{'changed during run; checks do not certify the ending worktree, ' if changed_during_run else ''}"
+             f"host `{where}`, against {base} at {merge_base[:9]}, "
              f"{duration(elapsed)})", "", "| Check | Result |", "| --- | --- |",
              f"| Scope | {'⚠️' if warnings else '✅'} {len(changed)} files, +{added} −{removed}"
+             + (f" (not counted: {not_counted})" if not_counted else "")
              + "".join(f"; {warning}" for warning in warnings) + " |"]
     for step in steps:
         took = f" ({duration(step.seconds)})" if step.seconds else ""
         detail = f" {step.detail}" if step.detail else ""
         lines.append(f"| {step.name} | {MARK[step.status]}{detail}{took} |")
+    content = next((step for step in steps if step.name == "content root tests"), None)
+    resource_override = os.environ.get("HORIZON_TEST_RESOURCES")
+    resource_roots = [Path(resource_override)] if resource_override is not None else [
+        ROOT / ".local/horizon-client/26.3", ROOT.parent.parent / ".local/horizon-client/26.3"]
+    if args.host == "local" and not any((root / "gameplay-facts.json").is_file() for root in resource_roots):
+        data_tests = "data-backed tests not run: no prepared data here"
+    elif content and content.status in {"pass", "fail"}:
+        data_tests = f"data-backed tests: horizon-client-lib mod_content::tests:: (--ignored): {content.detail or content.status}"
+    else:
+        data_tests = "data-backed tests not run: content root untouched"
+    lines.append(f"| Data-backed cargo tests | {data_tests} |")
     lines.append(f"| Label | {label} |")
     return "\n".join(lines)
 
@@ -580,16 +953,21 @@ def main():
     parser.add_argument("--host", default="local", choices=sorted(HOST_SETUP),
                         help="where builds, tests and harnesses run: local, or a fleet machine through ~/fleet/rbuild")
     parser.add_argument("--quick", action="store_true", help="list the affected harnesses instead of running them")
+    parser.add_argument("--harnesses", action="store_true",
+                        help="run the affected harnesses even when the branch changes no harness, oracle, probe or runner")
     parser.add_argument("--verbose", action="store_true", help="show every check's output")
+    parser.add_argument('--datafix', action='store_true', help='opt in to datafix parity downloads in a private HORIZON_DATAFIX_ROOT')
     args = parser.parse_args()
     if args.host != "local" and not RBUILD.exists():
         parser.error(f"--host {args.host} needs {RBUILD}; without the fleet, run it here (no --host)")
     started = time.monotonic()
+    revision = revision_state()
     changed = parity.changed_files(args.base)
     if changed is None:
         parser.error(f"no merge base with {args.base} (git fetch?)")
     merge_base = git("merge-base", "HEAD", args.base).strip()
     counts = line_counts(merge_base, changed)
+    skipped = skipped_in_branch(merge_base, changed)
     crates_of, libraries, dependencies = packages() if any(workspace_rust(p) for p in changed) else ({}, set(), {})
     steps = plan(args, args.base, changed, crates_of, libraries, dependencies)
     print(f"pr_ready: {len(changed)} files changed since {args.base}; checks on {args.host}", file=sys.stderr, flush=True)
@@ -606,7 +984,7 @@ def main():
 
     label = suggested_label(changed, release_train.exporters())
     print(block(args, args.base, merge_base, sorted(changed), counts, steps, label,
-                time.monotonic() - started))
+                time.monotonic() - started, revision, revision_state() != revision, skipped))
     return 1 if any(step.status == "fail" for step in steps) else 0
 
 

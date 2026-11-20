@@ -77,6 +77,22 @@ def mobs(ox, oz):
     return out
 
 
+def mob_ai(ox, oz):
+    """500 active AI mobs with obstacle walls: tests mob tick, pathfinding, and AI goals."""
+    out, i = [], 0
+    for col in (-8, -4, 0, 4, 8):
+        out.append(f"fill {ox + col} {FLOOR_Y + 1} {oz + 10} {ox + col} {FLOOR_Y + 3} {oz + 22} stone")
+    for layer in range(2):
+        for row in range(10):
+            for col in range(25):
+                kind = MOBS[i % len(MOBS)]
+                x, y, z = ox + 0.5 - 12.0 + 1.0 * col, FLOOR_Y + 1 + 2.5 * layer, oz + 8 + 1.8 * row
+                out.append(f"summon {kind} {num(x)} {num(y)} {num(z)} "
+                           "{PersistenceRequired:1b,Silent:1b}")
+                i += 1
+    return out
+
+
 def markings(ox, oz):
     """1000 horses with markings and slimes (translucent layers): the mobs scene's grid."""
     out, i = [], 0
@@ -180,8 +196,7 @@ def armor_stands(ox, oz):
 
 
 def avatars(ox, oz):
-    """300 mannequins, the player model (20 x 15, 1.5 blocks apart): what cosmetics cost on many players
-    (docs/cosmetics.md: `HORIZON_COSMETICS=1 HORIZON_COSMETICS_LOCAL=<items>` dresses every mannequin)."""
+    """300 mannequins, the player model (20 x 15, 1.5 blocks apart): a crowd of players for stress runs."""
     return [f"summon mannequin {num(ox + 0.5 - 14.25 + 1.5 * col)} {FLOOR_Y + 1} {num(oz + 6 + 1.5 * row)} "
             "{NoGravity:1b,Silent:1b,Rotation:[180f,0f]}"
             for row in range(15) for col in range(20)]
@@ -237,6 +252,7 @@ def particles(ox, oz):
 STRESS = [
     ("stress_empty", empty),
     ("stress_mobs", mobs),
+    ("stress_mob_ai", mob_ai),
     ("stress_items", items),
     ("stress_frames", frames),
     ("stress_armor_stands", armor_stands),

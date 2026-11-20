@@ -1,15 +1,22 @@
 // Reuse the concrete attribute fixture's arena, supplier and observer binding.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "this fixture shares another one's source and uses part of it"
+)]
 mod integration {
     include!("stored_effect_attributes_fixture.rs");
 
-    use horizon_world::{
-        active_effects::{ActiveEffects, EffectHooks},
-        effect_notifications::{self as notify, EffectPacket, NotificationWorld},
-        java_hash_map::JavaKey,
-        object_open_set::ObjectOpenSet,
-        status_effect::{Details, EffectInstance},
-        stored_effect_attributes::{self as stored, AttributeAccess},
+    use {
+        horizon_core::java_hash_map::JavaKey,
+        horizon_world::{
+            active_effects::{ActiveEffects, EffectHooks},
+            effect_notifications as notify,
+            effect_notifications::{EffectPacket, NotificationWorld},
+            object_open_set::ObjectOpenSet,
+            status_effect::{Details, EffectInstance},
+            stored_effect_attributes as stored,
+            stored_effect_attributes::AttributeAccess,
+        },
     };
     impl AttributeAccess<Key, Handle> for World {
         type Error = Stop;

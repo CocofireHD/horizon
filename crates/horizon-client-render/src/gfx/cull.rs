@@ -10,8 +10,8 @@
 //! second pass, draws the sections whose box was seen; the others' draws have
 //! an instance count of 0.
 //!
-//! The picture stays the one without culling: the boxes (grown by a block,
-//! the farthest a block model reaches out of its cell) are drawn front faces
+//! The picture stays the one without culling: the boxes around the mesh's
+//! geometry (padded by a block) are drawn front faces
 //! only, so a fragment is the box's nearest point on its pixel, and the
 //! fragment shader runs only where the depth test passes (forced early), so a
 //! section is left out only where all of its fragments would fail the depth
@@ -27,15 +27,19 @@
 //! as many draws as without culling: drivers that unroll an indirect
 //! multi-draw on the CPU (Mesa's on Intel Gen9) pay per entry. Phase 2's
 //! counts come from the GPU, which reads them from the draws themselves:
-//! Vulkan's native multi-draw, and Metal's, which wgpu replays as one
-//! indirect draw per entry. Translucent draws are not culled.
+//! Vulkan's native multi-draw, DirectX 12's `ExecuteIndirect`, and Metal's,
+//! which wgpu replays as one indirect draw per entry. Translucent draws are
+//! not culled.
 //!
 //! Metal cannot force the depth test before a fragment shader that writes
-//! storage (naga writes no `[[early_fragment_tests]]`), so there the boxes
+//! storage (naga writes no `[[early_fragment_tests]]`), nor can DirectX 12
+//! (`[earlydepthstencil]`, which wgpu doesn't offer there), so there the boxes
 //! are drawn in a pass of their own between the phases, which reads phase
 //! 1's depth as a texture and makes the same comparison in the shader: the
 //! fragment's depth against the stored one, greater or equal passing. The
-//! same fragments pass, so the same sections are seen.
+//! same fragments pass, so the same sections are seen. Adreno's Vulkan driver
+//! takes that path too: with the early test it now and then leaves sections
+//! out for a frame.
 use std::num::NonZeroU64;
 use std::sync::{
     Arc,
@@ -45,6 +49,15 @@ use std::sync::{
 const WORDS: u64 = 5 * 4;
 /// A tested section's box, around its origin: its cell grown by a block.
 pub const SECTION_BOX: [[f32; 3]; 2] = [[-1.0; 3], [17.0; 3]];
+/// Mesh bounds already contain `BOUNDS_PAD`; grow them to a block of padding
+/// in total, keeping the box's faces off the geometry. Without mesh bounds,
+/// keep the section cell grown by a block, as before.
+pub fn section_box(bounds: Option<[glam::Vec3; 2]>) -> [[f32; 3]; 2] {
+    bounds.map_or(SECTION_BOX, |[low, high]| {
+        let pad = glam::Vec3::splat(1.0 - crate::mesher::SectionMesh::BOUNDS_PAD);
+        [(low - pad).to_array(), (high + pad).to_array()]
+    })
+}
 /// The bit that marks a far tile's slot (`Renderer::tile_cull_slot`): tiles
 /// count their slots apart from the sections' resident ones.
 pub const TILE: u32 = 1 << 31;
@@ -209,25 +222,68 @@ const RESULTS_USAGE: wgpu::BufferUsages =
 const READBACK_USAGE: wgpu::BufferUsages =
     wgpu::BufferUsages::MAP_READ.union(wgpu::BufferUsages::COPY_DST);
 
+/// The first `n` values of a packed lookup in WGSL `source` (`fn name`, as cull.wgsl's
+/// `box_triangle_corner`): four bits each, eight a word, its words in the order of its cases.
+#[cfg(test)]
+pub(super) fn packed_lookup(source: &str, name: &str, n: usize) -> Vec<u32> {
+    let body = &source[source.find(&format!("fn {name}(")).expect("the lookup")..];
+    let body = &body[..body.find("return").expect("its return")];
+    let words: Vec<u32> = body
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter_map(|t| t.strip_prefix("0x")?.strip_suffix('u'))
+        .map(|hex| u32::from_str_radix(hex, 16).expect("a hex word"))
+        .collect();
+    (0..n)
+        .map(|v| (words[v / 8] >> (v % 8 * 4)) & 0xf)
+        .collect()
+}
+
+/// Qualcomm's PCI vendor id, which wgpu reports for Adreno GPUs.
+const ADRENO: u32 = 0x5143;
+
+/// Mesa's open-source Nouveau driver on OpenGL (NVC0/Fermi through Pascal):
+/// its Gallium driver (`nvc0`) suffers from kernel pushbuf rejections and
+/// channel kills when fragment shaders write to storage buffers alongside early
+/// depth tests and indirect execution (#15633).
+pub(crate) fn is_nouveau(info: &wgpu::AdapterInfo) -> bool {
+    info.backend == wgpu::Backend::Gl
+        && (info.driver_info.contains("Mesa") || info.driver.contains("Mesa"))
+        && (info.name.starts_with("NV")
+            || info.name.to_lowercase().contains("nouveau")
+            || info.driver.to_lowercase().contains("nouveau"))
+}
+
 impl Cull {
     /// The device feature culling needs, where the adapter has it.
     pub fn features(adapter: &wgpu::Adapter) -> wgpu::Features {
         adapter.features() & wgpu::Features::SHADER_EARLY_DEPTH_TEST
     }
     /// Where the device can run the test, if it can: Vulkan with early
-    /// depth tests, or Metal, both drawing an indirect multi-draw's entries
-    /// with the instance counts the GPU wrote, with fragment shaders that
-    /// write storage.
+    /// depth tests (Adreno's in the shader), or Metal and DirectX 12 with the
+    /// test in the shader, all drawing an indirect multi-draw's entries with
+    /// the instance counts the GPU wrote, with fragment shaders that write
+    /// storage.
     pub fn supported(adapter: &wgpu::Adapter, device: &wgpu::Device) -> Option<DepthTest> {
-        let depth_test = match adapter.get_info().backend {
-            wgpu::Backend::Vulkan
+        let info = adapter.get_info();
+        let depth_test = match info.backend {
+            // Adreno's Vulkan driver (the AYANEO Pocket DS's Adreno 740, build 0676.41) now and
+            // then leaves sections out with the early test, the world flashing black or
+            // see-through as a block breaks; the test in the shader, as on Metal, holds.
+            wgpu::Backend::Vulkan if info.vendor == ADRENO => DepthTest::InShader,
+            // Mesa's Nouveau OpenGL driver crashes with kernel pushbuf rejections and SIGSEGV
+            // when fragment shaders write to storage buffers with early depth tests and indirect
+            // execution (#15633).
+            wgpu::Backend::Gl if is_nouveau(&info) => return None,
+            wgpu::Backend::Vulkan | wgpu::Backend::Gl
                 if device
                     .features()
                     .contains(wgpu::Features::SHADER_EARLY_DEPTH_TEST) =>
             {
                 DepthTest::Early
             }
-            wgpu::Backend::Metal => DepthTest::InShader,
+            // DirectX 12 has no forced early depth test in wgpu either: the test runs in the
+            // shader there too.
+            wgpu::Backend::Metal | wgpu::Backend::Dx12 => DepthTest::InShader,
             _ => return None,
         };
         (device
@@ -244,8 +300,18 @@ impl Cull {
     pub fn early(&self) -> bool {
         self.depth_test == DepthTest::Early
     }
-    /// `color` is the world pass's colour format.
-    pub fn new(device: &wgpu::Device, color: wgpu::TextureFormat, depth_test: DepthTest) -> Self {
+    /// `color` is the world pass's colour format. `None` where the device will not
+    /// make the pass, the error caught rather than raised (a raised error is
+    /// fatal): a driver can refuse it while `wgpu::Limits` promise the storage
+    /// blocks it binds, as Mesa's r600 OpenGL driver reports no vertex shader
+    /// storage blocks at all (#17994).
+    pub fn new(
+        device: &wgpu::Device,
+        color: wgpu::TextureFormat,
+        depth_test: DepthTest,
+    ) -> Option<Self> {
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
         let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry {
             binding,
             visibility,
@@ -287,7 +353,7 @@ impl Cull {
                     0,
                     fragment,
                     wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -346,7 +412,12 @@ impl Cull {
             multiview_mask: None,
             cache: None,
         });
-        Self {
+        let internal = pollster::block_on(internal.pop());
+        if let Some(e) = internal.or(pollster::block_on(validation.pop())) {
+            log::warn!("Horizon renderer: occlusion culling unavailable ({e})");
+            return None;
+        }
+        Some(Self {
             pipeline,
             layout,
             group: None,
@@ -388,7 +459,7 @@ impl Cull {
             hidden: ([0; 2], 1.0),
             always: false,
             min_sections: 0,
-        }
+        })
     }
 
     /// Start a frame: take in the results that came back, and tell whether
@@ -730,6 +801,15 @@ fn source(depth_test: DepthTest) -> String {
     }
 }
 
+/// Whether the renderer should initialize its occlusion culling pass (`cull`).
+///
+/// Software adapters spend more time running the culling pass than drawing
+/// the sections it removes. Keep the pass available for explicit A/B checks,
+/// while leaving hardware adapters on the existing default.
+pub(super) fn occlusion_culling_requested(info: &wgpu::AdapterInfo, env: Option<&str>) -> bool {
+    env != Some("0") && (env.is_some() || info.device_type != wgpu::DeviceType::Cpu)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +838,116 @@ mod tests {
                 .validate(&module)
                 .unwrap_or_else(|e| panic!("{depth_test:?}: {e:?}"));
         }
+    }
+
+    /// The box's 12 triangles, as cull.wgsl and gpu_occlusion.wgsl draw them: two per face,
+    /// counter-clockwise seen from outside, corners by bit (x 1, y 2, z 4).
+    #[test]
+    fn the_packed_box_corners_are_the_box_triangles() {
+        let triangles = [
+            0, 6, 2, 0, 4, 6, 1, 3, 7, 1, 7, 5, 0, 1, 5, 0, 5, 4, 2, 7, 3, 2, 6, 7, 0, 3, 1, 0, 2,
+            3, 4, 5, 7, 4, 7, 6,
+        ];
+        for source in [
+            include_str!("cull.wgsl"),
+            include_str!("gpu_occlusion.wgsl"),
+        ] {
+            assert_eq!(packed_lookup(source, "box_triangle_corner", 36), triangles);
+        }
+    }
+
+    #[test]
+    fn nouveau_is_detected_on_opengl_and_other_adapters_kept() {
+        let mut info = wgpu::AdapterInfo {
+            name: "NVC3".into(),
+            vendor: 0,
+            device: 0,
+            device_type: wgpu::DeviceType::Other,
+            device_pci_bus_id: String::new(),
+            driver: "4.3 (Core Profile)".into(),
+            driver_info: "Mesa 26.2.3-arch1.1".into(),
+            backend: wgpu::Backend::Gl,
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: None,
+            limit_bucket: None,
+        };
+        assert!(is_nouveau(&info));
+
+        // Other Nouveau chipsets (Fermi, Kepler, Maxwell, Pascal)
+        for name in ["NVC0", "NVD9", "NVE4", "NV117", "NV130"] {
+            info.name = name.into();
+            assert!(is_nouveau(&info));
+        }
+
+        // Intel on Mesa OpenGL is kept (crocus / iris)
+        info.name = "Mesa Intel(R) HD Graphics 4400 (HSW GT2)".into();
+        assert!(!is_nouveau(&info));
+
+        // AMD on Mesa OpenGL is kept (radeonsi)
+        info.name = "AMD Radeon RX 580 (radeonsi, ...)".into();
+        assert!(!is_nouveau(&info));
+
+        // Proprietary NVIDIA on OpenGL does not have Mesa in driver_info
+        info.name = "NVIDIA GeForce RTX 3060".into();
+        info.driver_info = "NVIDIA 550.54.14".into();
+        assert!(!is_nouveau(&info));
+
+        // Vulkan is not OpenGL
+        info.name = "NVC3".into();
+        info.driver_info = "Mesa 26.2.3-arch1.1".into();
+        info.backend = wgpu::Backend::Vulkan;
+        assert!(!is_nouveau(&info));
+    }
+
+    /// A device whose storage buffers cannot hold the pass's bindings gets no pass
+    /// rather than a panic (#17994). What it proves is the caught refusal and the
+    /// `None`, not the way r600 refused: the driver there links no pipeline at all
+    /// while its limits promise the bindings, which only a driver that refuses
+    /// reproduces.
+    #[test]
+    fn a_device_short_of_storage_buffers_gets_no_culling_pass() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(adapter) = crate::gfx::test_gpu::adapter() else {
+            return;
+        };
+        // Where the device has the storage buffers the pass is made, so the
+        // refusal below is the shortfall and not something else on this machine.
+        // An adapter that refuses the pass with its own limits (the r600 case)
+        // leaves that half unproven instead of failing the test.
+        let (device, _queue) = crate::gfx::test_gpu::device(&adapter);
+        if Cull::new(
+            &device,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            DepthTest::InShader,
+        )
+        .is_none()
+        {
+            eprintln!("skipped: the adapter does not make the pass with its own limits");
+            return;
+        }
+        drop(device);
+        // The device is asked for two storage buffers per stage: the pass binds
+        // three to its fragment stage and two to its vertex stage, so its layout
+        // cannot be made.
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 2,
+            ..Default::default()
+        };
+        let (device, _queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                required_limits: limits,
+                ..Default::default()
+            }))
+            .expect("the device with two storage buffers per stage");
+        assert!(
+            Cull::new(
+                &device,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                DepthTest::InShader
+            )
+            .is_none(),
+            "the pass is sidelined where the device is short of storage buffers"
+        );
     }
 }

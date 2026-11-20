@@ -2,8 +2,8 @@
 //! and `secondaryBlockOutline` under a high contrast one): an outline its fragment shader colours
 //! or animates. Without one the outline draws natively (`vs_line` in terrain.wgsl).
 
+use crate::core_shader::{CoreProgram, Glue};
 use glam::Mat4;
-use horizon_shaders::{CoreProgram, Glue};
 
 /// The outline's edges (`pack_lines::layout`: start, end, ARGB colour and width per instance) as
 /// vanilla's lines: four vertices an edge, the start twice and the end twice, the side
@@ -421,11 +421,12 @@ mod tests {
 
     #[test]
     fn a_pack_fragment_shader_colours_the_outline() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             eprintln!("no GPU: skipping");
             return;
         };
-        let program = horizon_shaders::translate_core(LINES_VSH, RGB_FSH, &[], &include, &GLUE)
+        let program = crate::core_shader::translate_core(LINES_VSH, RGB_FSH, &[], &include, &GLUE)
             .expect("the shaders translate");
         assert_pack_coloured(&draw_edge(&device, &queue, &program));
     }
@@ -434,6 +435,7 @@ mod tests {
     /// is not used, and the outline draws natively, rather than failing at the draw.
     #[test]
     fn a_pack_block_bigger_than_vanillas_falls_back() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, _)) = device() else {
             return;
         };
@@ -441,7 +443,7 @@ mod tests {
             include(id)
                 .map(|text| text.replace("vec3 ModelOffset;", "vec3 ModelOffset;\n    vec4 More;"))
         };
-        let program = horizon_shaders::translate_core(LINES_VSH, RGB_FSH, &[], &bigger, &GLUE)
+        let program = crate::core_shader::translate_core(LINES_VSH, RGB_FSH, &[], &bigger, &GLUE)
             .expect("the shaders translate");
         assert!(CoreLines::new(&device, wgpu::TextureFormat::Rgba8Unorm, &program).is_none());
     }
@@ -450,6 +452,7 @@ mod tests {
     /// fragment shader.
     #[test]
     fn vanillas_lines_vertex_shader_takes_a_packs_fragment_shader() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let root = std::env::var_os("HORIZON_RESOURCES")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -470,11 +473,11 @@ mod tests {
             let (namespace, path) = id.split_once(':')?;
             std::fs::read_to_string(root.join(format!("assets/{namespace}/{path}"))).ok()
         };
-        let program = horizon_shaders::translate_core(&vertex, RGB_FSH, &[], &include, &GLUE)
+        let program = crate::core_shader::translate_core(&vertex, RGB_FSH, &[], &include, &GLUE)
             .expect("vanilla's vertex shader translates");
         // A pack that replaces only the vertex shader runs vanilla's fragment shader.
         let fragment = include("minecraft:shaders/core/rendertype_lines.fsh").unwrap();
-        let vanilla = horizon_shaders::translate_core(&vertex, &fragment, &[], &include, &GLUE)
+        let vanilla = crate::core_shader::translate_core(&vertex, &fragment, &[], &include, &GLUE)
             .expect("vanilla's fragment shader translates");
         let Some((device, queue)) = device() else {
             eprintln!("no GPU: skipping the draw");

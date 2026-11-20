@@ -28,12 +28,29 @@ pub const EULA_URL: &str = "https://aka.ms/MinecraftEULA";
 
 // ----- The list of servers -----------------------------------------------------------------------
 
-/// One server the launcher knows: its name and its folder.
+/// One server the launcher knows: its name and its folder, on this computer or on `host`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
     pub name: String,
     pub dir: PathBuf,
+    /// The other computer it runs on, reached over SSH (`user@host`, or a `Host` from `~/.ssh/config`);
+    /// `dir` is then the folder there ([`remote`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
+
+impl Entry {
+    /// `horizon-server --dir <dir> <args>`, here or over SSH on the entry's computer.
+    pub fn command(&self, args: &[&str]) -> Result<Command, String> {
+        match &self.host {
+            Some(host) => remote::command(host, &self.dir.to_string_lossy(), args),
+            None => command(&self.dir, args),
+        }
+    }
+}
+
+#[path = "servers/remote.rs"]
+pub mod remote;
 
 /// The game mode a server's `server.toml` sets (`[world] game_mode`), read from the file
 /// without asking `horizon-server`: the Servers page's list says it for each stopped server.
@@ -51,13 +68,16 @@ fn list_file() -> PathBuf {
     backend::data_dir().join("servers.json")
 }
 
-/// The servers, in the order they were added; folders that are gone are left out.
+/// The servers, in the order they were added; folders on this computer that are gone are left out.
 pub fn list() -> Vec<Entry> {
     let entries: Vec<Entry> = fs::read_to_string(list_file())
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
-    entries.into_iter().filter(|e| e.dir.is_dir()).collect()
+    entries
+        .into_iter()
+        .filter(|e| e.host.is_some() || e.dir.is_dir())
+        .collect()
 }
 
 fn save_list(entries: &[Entry]) -> Result<(), String> {
@@ -79,15 +99,22 @@ fn save_list(entries: &[Entry]) -> Result<(), String> {
 /// Adds a server folder to the list (once).
 pub fn add(entry: Entry) -> Result<(), String> {
     let mut all = list();
-    all.retain(|e| e.dir != entry.dir);
+    all.retain(|e| (&e.host, &e.dir) != (&entry.host, &entry.dir));
     all.push(entry);
     save_list(&all)
 }
 
-/// Takes a server off the list; its folder stays.
+/// Takes a server on this computer off the list; its folder stays.
 pub fn forget(dir: &Path) -> Result<(), String> {
     let mut all = list();
-    all.retain(|e| e.dir != dir);
+    all.retain(|e| e.host.is_some() || e.dir != dir);
+    save_list(&all)
+}
+
+/// Takes a server on another computer off the list; nothing there changes.
+pub fn forget_remote(host: &str, dir: &Path) -> Result<(), String> {
+    let mut all = list();
+    all.retain(|e| e.host.as_deref() != Some(host) || e.dir != dir);
     save_list(&all)
 }
 
@@ -205,7 +232,7 @@ pub fn can_host(tag: &str) -> Result<(), String> {
             "Horizon {tag} has no server program. Install a newer version on the Versions page."
         ));
     }
-    if !backend::is_prepared(tag) {
+    if !backend::check_prepared(tag) {
         return Err(format!(
             "Horizon {tag} isn't prepared yet: press Prepare on the Play page (it uses your own Minecraft {})",
             backend::game_version(tag)
@@ -251,6 +278,10 @@ pub fn set_up_in(root: &Path, version: &Path, tag: &str, game_version: &str) -> 
         }
         point(&root.join("current"), &release).map_err(|e| e.to_string())?;
     }
+    // The game leases the folder it is started from and opens its completion marker there. A copy
+    // of a release is an installation, as install.sh lays one out, so it needs the marker too.
+    let running = fs::canonicalize(root.join("current")).unwrap_or(release);
+    complete(&running)?;
     // The game files: a copy (preparing again rewrites files in place), swapped in whole.
     let from = version.join(".local/horizon-client").join(game_version);
     let to = game_files(root, game_version);
@@ -265,6 +296,14 @@ pub fn set_up_in(root: &Path, version: &Path, tag: &str, game_version: &str) -> 
     fs::rename(&fresh, &to).map_err(|e| e.to_string())?;
     let _ = fs::remove_dir_all(&old);
     Ok(())
+}
+
+/// The completion marker the game opens in the folder it runs from: an empty ordinary file, as the
+/// launcher's installs have. The copy of a release is an installation, as install.sh lays one out,
+/// and without the marker the engine exits before loading a world.
+fn complete(release: &Path) -> Result<(), String> {
+    horizon_platform::mod_package::runtime_leases::write_completion(release)
+        .map_err(|e| format!("{}: {e}", release.join(backend::COMPLETE).display()))
 }
 
 /// A release folder without the launcher's own files (its prepared copy, install marker and the
@@ -358,27 +397,92 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String, Problem> {
 
 /// Runs a long `horizon-server` command, passing each line it prints to `line`.
 pub fn run_streamed(dir: &Path, args: &[&str], line: &dyn Fn(String)) -> Result<(), Problem> {
+    stream(dir, command(dir, args).map_err(Problem::plain)?, line)
+}
+
+/// Launcher-managed Start/Restart: prepare data using the supervisor's own command description.
+/// The standalone supervisor still has no jar downloader or consent policy.
+pub fn run_managed(
+    dir: &Path,
+    args: &[&str],
+    line: &dyn Fn(String),
+    permission: crate::jars::Permission<'_>,
+) -> Result<(), Problem> {
+    let supervisor = command(dir, args).map_err(Problem::plain)?;
+    let mut engine =
+        horizon_server_launch::engine_command(Path::new(supervisor.get_program()), dir).map_err(
+            |error| {
+                let mut problem = Problem::plain(error.to_string());
+                if matches!(
+                    error,
+                    horizon_server_launch::EngineCommandError::Resources(_)
+                ) {
+                    problem.fix = Some(Fix::Prepare);
+                }
+                problem
+            },
+        )?;
+    crate::jars::prepare_launch(&mut engine, &crate::launch::Launch::default(), permission)
+        .map_err(|error| Problem::plain(error.to_string()))?;
+    // Windows has no holder for a supervisor-hosted engine: the game only leases units that are
+    // already registered, so the launcher registers and holds the ones it computes, after the
+    // release folder is published and before the supervisor starts the engine. The supervisor does
+    // the same before every start, which covers a release an update switches to.
+    #[cfg(windows)]
+    let _leases = lease_engine(&engine, &backend::data_dir())?;
+    stream(dir, supervisor, line)
+}
+
+/// Marks the engine's own folder complete and holds the leases of every unit the game it runs
+/// computes at start. The claims live until [`run_managed`] returns.
+#[cfg(windows)]
+fn lease_engine(engine: &Command, data: &Path) -> Result<Vec<crate::run_leases::Claim>, Problem> {
+    let program = Path::new(engine.get_program());
+    let folder = program.parent().unwrap_or_else(|| Path::new("."));
+    let release = fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
+    let data = fs::canonicalize(data).unwrap_or_else(|_| data.to_path_buf());
+    // `[engine] engine.path` and the PATH can name an engine that is not the launcher's copy, and a
+    // version the cleanup invalidated keeps its marker missing: only the launcher's own runtime is
+    // ours to complete and to hold.
+    if !release.starts_with(data.join("server-runtime")) {
+        return Ok(Vec::new());
+    }
+    complete(&release).map_err(Problem::plain)?;
+    crate::run_leases::game_units_in(engine, program, &data)
+        .map_err(|error| Problem::plain(crate::native_mods::cache_error(error)))
+}
+
+fn stream(dir: &Path, mut command: Command, line: &dyn Fn(String)) -> Result<(), Problem> {
     use std::io::{BufRead, BufReader, Read};
     let since = log_length(dir);
-    let mut child = command(dir, args)
-        .map_err(Problem::plain)?
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| Problem::plain(format!("Couldn't run horizon-server: {e}")))?;
+    let (tx_err, rx_err) = std::sync::mpsc::channel();
     let mut err = child.stderr.take();
-    let errors = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut text = String::new();
         if let Some(e) = &mut err {
             let _ = e.read_to_string(&mut text);
         }
-        text
+        let _ = tx_err.send(text);
     });
-    let mut out = String::new();
+    let (tx_line, rx_line) = std::sync::mpsc::channel();
     if let Some(stdout) = child.stdout.take() {
-        // `start` prints a dot every half second on one line: those aren't lines worth showing.
-        for l in BufReader::new(stdout).lines().map_while(Result::ok) {
+        std::thread::spawn(move || {
+            for l in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx_line.send(l).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let mut out = String::new();
+    let status = loop {
+        while let Ok(l) = rx_line.try_recv() {
             let shown = l
                 .trim_start_matches(['.', ' '])
                 .trim_start_matches("Starting");
@@ -389,9 +493,29 @@ pub fn run_streamed(dir: &Path, args: &[&str], line: &dyn Fn(String)) -> Result<
             out.push_str(&l);
             out.push('\n');
         }
-    }
-    let status = child.wait().map_err(|e| Problem::plain(e.to_string()))?;
-    let err = errors.join().unwrap_or_default();
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| Problem::plain(e.to_string()))?
+        {
+            std::thread::sleep(Duration::from_millis(100));
+            while let Ok(l) = rx_line.try_recv() {
+                let shown = l
+                    .trim_start_matches(['.', ' '])
+                    .trim_start_matches("Starting");
+                let shown = shown.trim_start_matches('.').trim();
+                if !shown.is_empty() {
+                    line(shown.to_string());
+                }
+                out.push_str(&l);
+                out.push('\n');
+            }
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let err = rx_err
+        .recv_timeout(Duration::from_millis(200))
+        .unwrap_or_default();
     if status.success() {
         Ok(())
     } else {
@@ -708,7 +832,11 @@ pub fn create(spec: &NewServer, tag: Option<&str>, log: &dyn Fn(String)) -> Resu
         &settings.iter().map(String::as_str).collect::<Vec<_>>(),
     )
     .map_err(undo)?;
-    let entry = Entry { name, dir };
+    let entry = Entry {
+        name,
+        dir,
+        host: None,
+    };
     add(entry.clone()).map_err(Problem::plain)?;
     Ok(entry)
 }

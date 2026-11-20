@@ -41,6 +41,11 @@ impl Copies {
     pub(super) fn section(&mut self, key: SectionKey, mesh: &SectionMesh) {
         self.sections.insert(key, copy(mesh));
     }
+    /// The copy of section `key`'s mesh as it was handed over.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn held(&self, key: SectionKey) -> Option<&SectionMesh> {
+        self.sections.get(&key)
+    }
     /// Columns unloaded (`Renderer::remove_columns`).
     pub(super) fn remove_columns(&mut self, columns: &[(i32, i32)]) {
         if columns.is_empty() {
@@ -64,10 +69,15 @@ impl Copies {
 fn copy(mesh: &SectionMesh) -> SectionMesh {
     SectionMesh {
         solid: mesh.solid.clone(),
+        solid_sources: mesh.solid_sources.clone(),
         sides: mesh.sides,
         translucent: mesh.translucent.clone(),
+        translucent_sources: mesh.translucent_sources.clone(),
         packed: mesh.packed.clone(),
+        packed_far: mesh.packed_far,
         solid_tints: Vec::new(),
+        solid_looks: mesh.solid_looks.clone(),
+        translucent_looks: mesh.translucent_looks.clone(),
         visibility: mesh.visibility,
         block_entities: mesh.block_entities.clone(),
         lights: mesh.lights.clone(),
@@ -199,6 +209,8 @@ pub struct FrameInputs {
     pub skybox: bool,
     pub end_sky: bool,
     pub end_sky_sprite: Option<[f32; 4]>,
+    #[serde(default)]
+    pub boss_world_fog: bool,
     pub environment_fog: Option<(f32, f32)>,
     pub water_fog: [f32; 3],
     pub fog: Option<FogData>,
@@ -391,7 +403,7 @@ impl Renderer {
                 fullbright: self.fullbright,
                 improved_transparency: self.improved_transparency,
                 animated_textures: self.animated_textures,
-                shader_pack: self.pack_post.is_some() || self.native.is_some(),
+                shader_pack: self.pack_post.is_some() || self.executor.is_some(),
             },
             frame: FrameInputs {
                 camera: frame.camera.to_array(),
@@ -414,6 +426,7 @@ impl Renderer {
                 skybox: frame.skybox,
                 end_sky: frame.end_sky,
                 end_sky_sprite: frame.end_sky_sprite,
+                boss_world_fog: frame.boss_world_fog,
                 environment_fog: frame.environment_fog,
                 water_fog: frame.water_fog,
                 fog: frame.fog,
@@ -510,6 +523,7 @@ impl Scene {
             skybox: f.skybox,
             end_sky: f.end_sky,
             end_sky_sprite: f.end_sky_sprite,
+            boss_world_fog: f.boss_world_fog,
             environment_fog: f.environment_fog,
             water_fog: f.water_fog,
             fog: f.fog,
@@ -530,6 +544,7 @@ impl Scene {
             visible_static_block_entity_sections: &[],
             static_block_entity_stats: Default::default(),
             entity_motion: &[],
+            entity_motion_posed: &[],
             entity_spans: &[],
             skin: None,
             glowing: &[],

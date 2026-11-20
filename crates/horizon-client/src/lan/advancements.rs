@@ -8,13 +8,14 @@ use crate::{
     advancements::{Progress, Tree},
     recipe_book::{Category, RecipeIndex, Settings, crafting_category, crafting_station},
 };
-use horizon_protocol::buf::Writer;
+use horizon_protocol::buf::{Codec, Writer};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
 };
 
+#[derive(Clone)]
 pub struct ServerAdvancements {
     tree: std::sync::Arc<Tree>,
     kids: Vec<Vec<usize>>,
@@ -39,6 +40,7 @@ pub struct FirstTick {
 }
 
 /// A criterion `CriteriaTriggers.TICK` newly granted, for the game to tell the mods.
+#[derive(Clone)]
 pub struct CriterionGrant {
     pub advancement: String,
     pub criterion: String,
@@ -54,14 +56,104 @@ impl ServerAdvancements {
         let tree = Tree::shared(&resources.join("data"), overlay);
         let kids = tree.children();
         let layout = tree.layout();
+        let displays = RecipeIndex::from_serialized(&recipes);
         Self {
             tree,
             kids,
             layout,
             recipes,
-            displays: RecipeIndex::load(resources, overlay),
+            displays,
             groups,
         }
+    }
+
+    /// The loaded definition whose criteria and requirements the player's progress uses.
+    pub fn definition(&self, id: &str) -> Option<&crate::advancements::Advancement> {
+        self.tree.get(id)
+    }
+
+    /// The unconditional tick criteria in tree order. A caller grants these one
+    /// at a time so it can notify mods before applying each completion's rewards.
+    pub fn tick_candidates(&self, progress: &Progress) -> Vec<CriterionGrant> {
+        let mut candidates = Vec::new();
+        for advancement in &self.tree.list {
+            if progress.done(advancement) {
+                continue;
+            }
+            for criterion in &advancement.criteria {
+                if criterion.trigger == "minecraft:tick"
+                    && criterion.conditions.is_null()
+                    && !progress.has(&advancement.id, &criterion.name)
+                {
+                    candidates.push(CriterionGrant {
+                        advancement: advancement.id.clone(),
+                        criterion: criterion.name.clone(),
+                    });
+                }
+            }
+        }
+        candidates
+    }
+
+    /// Grant one candidate, returning whether its advancement was already complete.
+    /// Recheck against the live tree and progress: a preceding hook may have changed either.
+    pub fn grant_tick(
+        &self,
+        progress: &mut Progress,
+        grant: &CriterionGrant,
+        now_millis: i64,
+    ) -> Option<bool> {
+        let advancement = self.tree.list.iter().find(|a| a.id == grant.advancement)?;
+        if progress.done(advancement)
+            || !advancement.criteria.iter().any(|c| {
+                c.name == grant.criterion && c.trigger == "minecraft:tick" && c.conditions.is_null()
+            })
+        {
+            return None;
+        }
+        let was_done = progress.done(advancement);
+        let date = crate::advancements::date_text(now_millis.div_euclid(1000));
+        progress
+            .grant(&advancement.id, &grant.criterion, &date)
+            .then_some(was_done)
+    }
+
+    /// Complete the grant after the listener returns, if it still completes the advancement.
+    pub fn reward_tick(
+        &self,
+        sync: &SyncData,
+        progress: &Progress,
+        book: &mut Settings,
+        grant: &CriterionGrant,
+        was_done: bool,
+    ) -> Option<Vec<u8>> {
+        let advancement = self.tree.list.iter().find(|a| a.id == grant.advancement)?;
+        if was_done || !progress.done(advancement) {
+            return None;
+        }
+        book.add_recipes(&self.displays, &advancement.rewards.recipes);
+        let entries = advancement
+            .rewards
+            .recipes
+            .iter()
+            .flat_map(|id| self.book_entries(id, sync, NOTIFY_AND_HIGHLIGHT))
+            .collect::<Vec<_>>();
+        (!entries.is_empty()).then(|| book_add(entries, false))
+    }
+
+    /// Drop progress for advancements or criteria absent from the reloaded tree.
+    pub fn prune_progress(&self, progress: &mut Progress) {
+        let by_id: HashMap<&str, &crate::advancements::Advancement> =
+            self.tree.list.iter().map(|a| (a.id.as_str(), a)).collect();
+        progress
+            .criteria
+            .retain(|id, got| match by_id.get(id.as_str()) {
+                Some(a) => {
+                    got.retain(|name, _| a.criteria.iter().any(|c| &c.name == name));
+                    true
+                }
+                None => false,
+            });
     }
 
     /// The first tick of a player without advancements: the criteria
@@ -165,17 +257,7 @@ impl ServerAdvancements {
         book: &mut Settings,
         granted: &mut Vec<CriterionGrant>,
     ) -> Option<Vec<u8>> {
-        let by_id: HashMap<&str, &crate::advancements::Advancement> =
-            self.tree.list.iter().map(|a| (a.id.as_str(), a)).collect();
-        progress
-            .criteria
-            .retain(|id, got| match by_id.get(id.as_str()) {
-                Some(a) => {
-                    got.retain(|name, _| a.criteria.iter().any(|c| &c.name == name));
-                    true
-                }
-                None => false,
-            });
+        self.prune_progress(progress);
         let date = crate::advancements::date_text(now_millis.div_euclid(1000));
         let mut entries = Vec::new();
         for a in &self.tree.list {
@@ -277,6 +359,44 @@ impl ServerAdvancements {
             .map(|a| a.parent.is_none() && a.display.is_some())
     }
 
+    /// Initial reset after staged first-tick grants. Fresh criteria keep the
+    /// millisecond timestamp from the tick; older progress keeps its saved date.
+    pub fn first_snapshot(
+        &self,
+        sync: &SyncData,
+        progress: &Progress,
+        fresh: &[CriterionGrant],
+        now_millis: i64,
+    ) -> (Vec<u8>, Vec<bool>) {
+        let visible = self.visibility(progress);
+        let shown: Vec<_> = (0..self.tree.list.len()).filter(|&i| visible[i]).collect();
+        let mut w = Writer::new();
+        w.bool(true);
+        w.varint(shown.len() as i32);
+        for &i in &shown {
+            self.write_advancement(&mut w, i, sync);
+        }
+        w.varint(0);
+        w.varint(shown.len() as i32);
+        for &i in &shown {
+            let id = &self.tree.list[i].id;
+            self.write_progress(&mut w, i, |criterion| {
+                let date = progress.criteria.get(id)?.get(criterion)?;
+                if fresh
+                    .iter()
+                    .any(|g| &g.advancement == id && g.criterion == criterion)
+                    && *date == crate::advancements::date_text(now_millis.div_euclid(1000))
+                {
+                    Some(now_millis)
+                } else {
+                    Some(crate::advancements::date_millis(date).unwrap_or(0))
+                }
+            });
+        }
+        w.bool(true);
+        (w.data, visible)
+    }
+
     /// Which advancements a player with `progress` may see.
     pub fn visibility(&self, progress: &Progress) -> Vec<bool> {
         self.tree
@@ -295,10 +415,12 @@ impl ServerAdvancements {
         if let Some(d) = &a.display {
             w.nbt(&json_to_nbt(&d.title));
             w.nbt(&json_to_nbt(&d.description));
-            w.varint(sync.id("minecraft:item", &d.icon).unwrap_or(0));
-            w.varint(1);
-            w.varint(0);
-            w.varint(0);
+            let icon = super::guest::network_stack(
+                &|name| sync.id("minecraft:item", name).unwrap_or(0),
+                &|registry, name| sync.id(registry, name),
+                &d.icon,
+            );
+            horizon_protocol::item::Template::write(&icon, w);
             w.varint(match d.frame {
                 crate::advancements::Frame::Task => 0,
                 crate::advancements::Frame::Challenge => 1,
@@ -378,6 +500,11 @@ impl ServerAdvancements {
         id: &str,
         sync: &SyncData,
     ) -> Option<horizon_protocol::packets::recipes::RecipeDisplay> {
+        // A recipe with several displays has no ghost here (PlaceRecipe is
+        // not this change's): only a single-display recipe's entry is used.
+        if self.displays.display_ids(id).len() != 1 {
+            return None;
+        }
         let bytes = self.book_entries(id, sync, 0).into_iter().next()?;
         let mut r = horizon_protocol::buf::Reader::new(&bytes);
         horizon_protocol::packets::recipes::RecipeBookEntry::read(&mut r)
@@ -389,10 +516,6 @@ impl ServerAdvancements {
     /// highlighted, and with a notification unless the recipe turns it off.
     fn book_entries(&self, id: &str, sync: &SyncData, flags: i8) -> Vec<Vec<u8>> {
         let ids = self.displays.display_ids(id);
-        if ids.len() != 1 {
-            // Special recipes have no display; transmutations aren't unlocked on joining.
-            return Vec::new();
-        }
         let Some(r) = self
             .recipes
             .get(id)
@@ -401,6 +524,15 @@ impl ServerAdvancements {
             return Vec::new();
         };
         let r = &r;
+        if r["type"].as_str() == Some("minecraft:crafting_transmute") {
+            return self
+                .transmute_entries(r, ids, sync, flags)
+                .unwrap_or_default();
+        }
+        if ids.len() != 1 {
+            // Special recipes have no display.
+            return Vec::new();
+        }
         let kind = r["type"].as_str().unwrap_or("");
         let item = |n: &str| sync.id("minecraft:item", n);
         let slot = |n: &str| sync.id("minecraft:slot_display", n).unwrap_or(0);
@@ -493,9 +625,87 @@ impl ServerAdvancements {
                 w.f32(r["experience"].as_f64().unwrap_or(0.0) as f32);
                 (cooking_category(kind, r), vec![&r["ingredient"]])
             }
+            // DyeRecipe.display: the target, then the dyes kept to those with
+            // the DYE component, shown as the demo of dyeing that target.
+            // Its placement is the target and the dye.
+            "minecraft:crafting_dye" => {
+                let Some(dye_component) = sync.id("minecraft:data_component_type", "minecraft:dye")
+                else {
+                    return Vec::new();
+                };
+                let (target, dye) = (&r["target"], &r["dye"]);
+                w.varint(
+                    sync.id("minecraft:recipe_display", "minecraft:crafting_shapeless")
+                        .unwrap_or(0),
+                );
+                w.varint(2);
+                w.varint(slot("minecraft:tag"));
+                holder_set(&mut w, target, &item);
+                w.varint(slot("minecraft:only_with_component"));
+                w.varint(slot("minecraft:tag"));
+                holder_set(&mut w, dye, &item);
+                w.varint(dye_component);
+                w.varint(slot("minecraft:dyed"));
+                w.varint(slot("minecraft:only_with_component"));
+                w.varint(slot("minecraft:tag"));
+                holder_set(&mut w, dye, &item);
+                w.varint(dye_component);
+                w.varint(slot("minecraft:tag"));
+                holder_set(&mut w, target, &item);
+                station(&mut w, "minecraft:crafting_table");
+                (
+                    crafting_category(r["category"].as_str().unwrap_or("")).name(),
+                    vec![target, dye],
+                )
+            }
+            // ImbueRecipe.display: four materials, the source kept to any
+            // potion, four materials again, and the potion-wrapped result.
+            // Its placement names the source in the middle cell.
+            "minecraft:crafting_imbue" => {
+                let (source, material) = (&r["source"], &r["material"]);
+                w.varint(
+                    sync.id("minecraft:recipe_display", "minecraft:crafting_shaped")
+                        .unwrap_or(0),
+                );
+                w.varint(3);
+                w.varint(3);
+                w.varint(9);
+                for cell in 0..9 {
+                    if cell == 4 {
+                        w.varint(slot("minecraft:with_any_potion"));
+                    }
+                    w.varint(slot("minecraft:tag"));
+                    holder_set(&mut w, if cell == 4 { source } else { material }, &item);
+                }
+                w.varint(slot("minecraft:with_any_potion"));
+                result(&mut w);
+                station(&mut w, "minecraft:crafting_table");
+                (
+                    crafting_category(r["category"].as_str().unwrap_or("")).name(),
+                    vec![
+                        material, material, material, material, source, material, material,
+                        material, material,
+                    ],
+                )
+            }
             _ => return Vec::new(),
         };
-        // The group, the recipe book category and the placement's ingredients.
+        self.entry_tail(&mut w, r, sync, category, &placed, flags);
+        vec![w.data]
+    }
+
+    /// An entry's end: the group, the recipe book category, the placement's
+    /// ingredients and the flags.
+    fn entry_tail(
+        &self,
+        w: &mut Writer,
+        r: &Value,
+        sync: &SyncData,
+        category: &str,
+        placed: &[&Value],
+        flags: i8,
+    ) {
+        let item = |n: &str| sync.id("minecraft:item", n);
         match r["group"].as_str().and_then(|g| self.groups.get(g)) {
             Some(g) => w.varint(g + 1),
             None => w.varint(0),
@@ -508,12 +718,113 @@ impl ServerAdvancements {
         w.bool(true);
         w.varint(placed.len() as i32);
         for v in placed {
-            holder_set(&mut w, v, &item);
+            holder_set(w, v, &item);
         }
         // The notification only where the recipe shows one.
         let notify = r["show_notification"].as_bool().unwrap_or(true);
         w.i8(if notify { flags } else { flags & !1 });
-        vec![w.data]
+    }
+
+    /// `TransmuteRecipe.display`: one `ShapelessCraftingRecipeDisplay` per
+    /// material count from the recipe's minimum to its maximum, the input
+    /// then that many materials, its `resultDisplay`, the crafting table; the
+    /// placement (`placementInfo`) is the input and the most materials. All
+    /// or nothing: a form this cannot write, or a count that is not the
+    /// recipe's display ids, gives no entry at all.
+    fn transmute_entries(
+        &self,
+        r: &Value,
+        ids: std::ops::Range<i32>,
+        sync: &SyncData,
+        flags: i8,
+    ) -> Option<Vec<Vec<u8>>> {
+        let (min, max) = crate::crafting::transmute_material_bounds(r.get("material_count"));
+        if (max + 1).checked_sub(min)? != ids.len() {
+            return None;
+        }
+        let item = |n: &str| sync.id("minecraft:item", n);
+        let slot = |n: &str| sync.id("minecraft:slot_display", n);
+        let (input, material) = (&r["input"], &r["material"]);
+        let holder = |v: &Value| matches!(v, Value::String(_));
+        if !holder(input) || !holder(material) {
+            return None;
+        }
+        // TransmuteResult: an item (or none: the input's own items), a count
+        // (1) and components, which this does not write.
+        let result = &r["result"];
+        if result
+            .get("components")
+            .is_some_and(|c| !c.as_object().is_some_and(|o| o.is_empty()))
+        {
+            return None;
+        }
+        let base = result["count"].as_i64().unwrap_or(1) as i32;
+        let add = r["add_material_count_to_result"].as_bool().unwrap_or(false);
+        let result_items: Vec<i32> = match result["id"].as_str() {
+            Some(id) => vec![item(id)?],
+            // Composite over the input's items, in the order clients get the tag.
+            None => match input.as_str()? {
+                tag if tag.starts_with('#') => {
+                    let name = &tag[1..];
+                    sync.tags
+                        .registries
+                        .iter()
+                        .find(|t| t.registry == "minecraft:item")?
+                        .tags
+                        .iter()
+                        .find(|t| t.name == name)?
+                        .ids
+                        .clone()
+                }
+                one => vec![item(one)?],
+            },
+        };
+        let (shapeless, tag, empty_stack) = (
+            sync.id("minecraft:recipe_display", "minecraft:crafting_shapeless")?,
+            slot("minecraft:tag")?,
+            slot("minecraft:item_stack")?,
+        );
+        let (composite, item_slot) = (slot("minecraft:composite")?, slot("minecraft:item")?);
+        let table = item("minecraft:crafting_table")?;
+        let category = crafting_category(r["category"].as_str().unwrap_or("")).name();
+        let placed: Vec<&Value> = std::iter::once(input)
+            .chain(std::iter::repeat_n(material, max))
+            .collect();
+        let mut entries = Vec::with_capacity(ids.len());
+        for (n, id) in (min..=max).zip(ids) {
+            let mut w = Writer::new();
+            w.varint(id);
+            w.varint(shapeless);
+            w.varint(n as i32 + 1);
+            for v in std::iter::once(input).chain(std::iter::repeat_n(material, n)) {
+                w.varint(tag);
+                holder_set(&mut w, v, &item);
+            }
+            // computeResultSize: the materials added to the count, or not.
+            let count = if add { n as i32 + base } else { base };
+            let stack = |w: &mut Writer, id: i32| {
+                w.varint(empty_stack);
+                w.varint(id);
+                w.varint(count);
+                w.varint(0);
+                w.varint(0);
+            };
+            match result["id"].as_str() {
+                Some(_) => stack(&mut w, result_items[0]),
+                None => {
+                    w.varint(composite);
+                    w.varint(result_items.len() as i32);
+                    for &id in &result_items {
+                        stack(&mut w, id);
+                    }
+                }
+            }
+            w.varint(item_slot);
+            w.varint(table);
+            self.entry_tail(&mut w, r, sync, category, &placed, flags);
+            entries.push(w.data);
+        }
+        Some(entries)
     }
 }
 
@@ -629,7 +940,15 @@ mod tests {
         "minecraft:redstone_ore": {"protocol_id": 2},
         "minecraft:redstone": {"protocol_id": 3},
         "minecraft:furnace": {"protocol_id": 4},
-        "minecraft:blast_furnace": {"protocol_id": 5}
+        "minecraft:blast_furnace": {"protocol_id": 5},
+        "minecraft:leather_helmet": {"protocol_id": 6},
+        "minecraft:crafting_table": {"protocol_id": 7},
+        "minecraft:arrow": {"protocol_id": 8},
+        "minecraft:lingering_potion": {"protocol_id": 9},
+        "minecraft:tipped_arrow": {"protocol_id": 10}
+      }},
+      "minecraft:data_component_type": {"entries": {
+        "minecraft:dye": {"protocol_id": 46}
       }},
       "minecraft:slot_display": {"entries": {
         "minecraft:empty": {"protocol_id": 0},
@@ -680,13 +999,28 @@ mod tests {
         for (id, json) in recipes {
             std::fs::write(dir.join(format!("{id}.json")), json).unwrap();
         }
+        // The recipes name `#minecraft:dyes`; an ingredient whose tag is missing is no recipe.
+        let tags = root.join("data/minecraft/tags/item");
+        std::fs::create_dir_all(&tags).unwrap();
+        std::fs::write(
+            tags.join("dyes.json"),
+            r#"{"values":["minecraft:redstone"]}"#,
+        )
+        .unwrap();
         root
     }
 
     /// The server's sync over `root`, and the one entry of `id` read back as
     /// the client's `RecipeBookEntry::read` reads it.
     fn entry(root: &std::path::Path, id: &str) -> (SyncData, RecipeBookEntry) {
-        let sync = SyncData::load(root, &horizon_world::loot::PackOverlay::NONE).unwrap();
+        let defaults = horizon_world::item_defaults::read(root).unwrap();
+        let sync = SyncData::load(
+            root,
+            &horizon_world::loot::PackOverlay::NONE,
+            &defaults,
+            &crate::test_resources::server_sources(root, &horizon_world::loot::PackOverlay::NONE),
+        )
+        .unwrap();
         let entries = sync
             .advancements
             .book_entries(id, &sync, NOTIFY_AND_HIGHLIGHT);
@@ -695,6 +1029,198 @@ mod tests {
         let entry = RecipeBookEntry::read(&mut r).unwrap();
         assert_eq!(r.remaining(), 0, "the entry ends with its flags");
         (sync, entry)
+    }
+
+    #[test]
+    fn advancement_icons_roundtrip_count_damage_and_opposite_glint_overrides() {
+        use horizon_protocol::{
+            item::{Component, component},
+            packets::play::UpdateAdvancements,
+            registry::Ids,
+        };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../horizon-client/tests/fixtures/advancement-icons/data");
+        let tree = Tree::load(&root);
+        let mut sync = SyncData::empty();
+        sync.advancements.kids = tree.children();
+        sync.advancements.layout = tree.layout();
+        sync.advancements.tree = std::sync::Arc::new(tree);
+        sync.builtin.registries.insert(
+            "minecraft:item".into(),
+            Ids::from_names(vec![
+                "minecraft:air".into(),
+                "minecraft:wooden_pickaxe".into(),
+            ]),
+        );
+        let mut types: Vec<_> = (0..=component::ENCHANTMENT_GLINT_OVERRIDE)
+            .map(|i| format!("test:unused_{i}"))
+            .collect();
+        types[component::DAMAGE as usize] = "minecraft:damage".into();
+        types[component::ENCHANTMENT_GLINT_OVERRIDE as usize] =
+            "minecraft:enchantment_glint_override".into();
+        sync.builtin.registries.insert(
+            "minecraft:data_component_type".into(),
+            Ids::from_names(types),
+        );
+        let mut progress = Progress::default();
+        for id in ["horizon_test:glint", "horizon_test:plain"] {
+            progress.grant(id, "done", "2026-01-01 00:00:00 +0000");
+        }
+        let (bytes, _) = sync.advancements.first_snapshot(&sync, &progress, &[], 0);
+        let mut reader = Reader::new(&bytes);
+        let packet = UpdateAdvancements::read(&mut reader).unwrap();
+        assert_eq!(reader.remaining(), 0);
+        assert_eq!(packet.added.len(), 2);
+        for (id, foil) in [("horizon_test:glint", true), ("horizon_test:plain", false)] {
+            let wire = &packet
+                .added
+                .iter()
+                .find(|a| a.id == id)
+                .unwrap()
+                .display
+                .as_ref()
+                .unwrap()
+                .icon;
+            assert_eq!((wire.item, wire.count, wire.damage()), (1, 3, 7));
+            assert_eq!(
+                wire.component(component::ENCHANTMENT_GLINT_OVERRIDE),
+                Some(&Component::Bool(foil)),
+            );
+            let icon = crate::item_sync::from_network(wire, &sync.builtin, &sync.dynamic);
+            assert_eq!(
+                (&*icon.item, icon.count, icon.damage),
+                ("minecraft:wooden_pickaxe", 3, 7)
+            );
+            assert_eq!(icon.has_foil(None), foil);
+            assert_eq!(
+                icon,
+                sync.advancements
+                    .definition(id)
+                    .unwrap()
+                    .display
+                    .as_ref()
+                    .unwrap()
+                    .icon
+            );
+        }
+        // Only the override changes: same advancement id, item, title, count and damage.
+        let tree = std::sync::Arc::get_mut(&mut sync.advancements.tree).unwrap();
+        let i = tree.by_id["horizon_test:glint"];
+        tree.list[i]
+            .display
+            .as_mut()
+            .unwrap()
+            .icon
+            .data_mut()
+            .set_other(
+                "minecraft:enchantment_glint_override",
+                Some(horizon_core::nbt::Tag::Byte(0)),
+            );
+        let (without_glint, _) = sync.advancements.first_snapshot(&sync, &progress, &[], 0);
+        assert_ne!(bytes, without_glint);
+    }
+
+    #[test]
+    fn tick_grants_wait_for_listener_before_reward_and_recheck_progress() {
+        use crate::advancements::{Advancement, Criterion, Display, Frame, Rewards};
+        let mut tree = Tree::default();
+        tree.list.push(Advancement {
+            id: "test:tick".into(),
+            parent: None,
+            display: Some(Display {
+                icon: crate::items::ItemStack::new("minecraft:air", 1),
+                title: serde_json::json!("Title"),
+                description: serde_json::json!("Description"),
+                frame: Frame::Task,
+                background: None,
+                show_toast: true,
+                announce: false,
+                hidden: false,
+            }),
+            criteria: ["first", "second"]
+                .into_iter()
+                .map(|name| Criterion {
+                    name: name.into(),
+                    trigger: "minecraft:tick".into(),
+                    conditions: Value::Null.into(),
+                })
+                .collect(),
+            requirements: vec![vec!["first".into()], vec!["second".into()]],
+            rewards: Rewards {
+                recipes: vec!["test:reward".into()],
+                ..Default::default()
+            },
+        });
+        let mut sync = SyncData::empty();
+        sync.advancements.kids = tree.children();
+        sync.advancements.layout = tree.layout();
+        sync.advancements.tree = std::sync::Arc::new(tree);
+        // A reward names a recipe the server knows: an unknown id is never added to the book.
+        sync.advancements.displays =
+            crate::recipe_book::RecipeIndex::from_serialized(&BTreeMap::from([(
+                "test:reward".to_owned(),
+                r#"{"type":"minecraft:crafting_shapeless"}"#.into(),
+            )]));
+        let advancement = &sync.advancements;
+        let mut progress = Progress::default();
+        let mut book = Settings::default();
+        let candidates = advancement.tick_candidates(&progress);
+        assert_eq!(candidates.len(), 2);
+        let was_done = advancement
+            .grant_tick(&mut progress, &candidates[0], 12_345)
+            .unwrap();
+        assert!(progress.has("test:tick", "first"));
+        assert!(!book.knows("test:reward"));
+        advancement.reward_tick(&sync, &progress, &mut book, &candidates[0], was_done);
+        assert!(!book.knows("test:reward"));
+        let was_done = advancement
+            .grant_tick(&mut progress, &candidates[1], 12_345)
+            .unwrap();
+        assert!(progress.has("test:tick", "second"));
+        // This is where the Game invokes the mod listener: the criterion is
+        // visible, and the completion reward is still absent.
+        assert!(!book.knows("test:reward"));
+        advancement.reward_tick(&sync, &progress, &mut book, &candidates[1], was_done);
+        assert!(book.knows("test:reward"));
+        assert!(
+            advancement
+                .grant_tick(&mut progress, &candidates[1], 12_345)
+                .is_none()
+        );
+        assert!(advancement.tick_candidates(&progress).is_empty());
+        let (staged, _) = advancement.first_snapshot(&sync, &progress, &candidates, 12_345);
+        let original = advancement.first_tick(
+            &sync,
+            12_345,
+            &mut Progress::default(),
+            &mut Settings::default(),
+        );
+        assert_eq!(
+            staged, original.update_advancements,
+            "the staged first packet keeps the vanilla timestamp"
+        );
+    }
+
+    #[test]
+    fn content_recipe_unlock_sends_a_display() {
+        let root = resources("content_display", &[]);
+        std::fs::write(
+            root.join(horizon_items::content_namespaces::MARKER),
+            br#"["example"]"#,
+        )
+        .unwrap();
+        let dir = root.join("data/example/recipe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("test.json"), r#"{"type":"minecraft:crafting_shaped","pattern":["X"],"key":{"X":"minecraft:raw_copper"},"result":{"id":"minecraft:copper_ingot"}}"#).unwrap();
+        let (sync, display) = entry(&root, "example:test");
+        assert_eq!(display.id, 0);
+        assert_eq!(
+            display.requirements,
+            Some(vec![HolderSet::Items(vec![
+                sync.id("minecraft:item", "minecraft:raw_copper").unwrap()
+            ])])
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A shaped recipe whose key uses one of NeoForge's ingredient shapes
@@ -751,14 +1277,27 @@ mod tests {
             )]
         });
         let overlay = match &packs {
-            Some(p) => horizon_world::loot::PackOverlay { files: p },
+            Some(p) => horizon_world::loot::PackOverlay::new(p),
             None => horizon_world::loot::PackOverlay::NONE,
         };
-        let sync = SyncData::load(&root, &overlay).unwrap();
+        let defaults = horizon_world::item_defaults::read(&root).unwrap();
+        let sync = SyncData::load(
+            &root,
+            &overlay,
+            &defaults,
+            &crate::test_resources::server_sources(&root, &overlay),
+        )
+        .unwrap();
         // What the craft hands the book: find_with over the crafting
         // copy, the way award_crafted calls it.
-        let items = crate::items::Items::catalog(&root, &overlay).unwrap();
-        let recipes = crate::crafting::Recipes::load(&root, &items, &overlay).unwrap();
+        let items = crate::items::Items::catalog(&root, &overlay, &defaults).unwrap();
+        let recipes = crate::crafting::Recipes::load(
+            &root,
+            &items,
+            &overlay,
+            &crate::test_resources::server_load(),
+        )
+        .unwrap();
         let grid = vec![Some(horizon_items::items::ItemStack {
             item: "minecraft:raw_copper".into(),
             count: 1,
@@ -766,7 +1305,12 @@ mod tests {
             extra: None,
         })];
         let (found, _) = recipes
-            .find_with(&grid, 1, &|_| None)
+            .find_with(
+                crate::test_resources::server_loop_context(),
+                &grid,
+                1,
+                &|_| None,
+            )
             .unwrap_or_else(|| panic!("{name}: the recipe matches a grid"));
         assert_eq!(
             found, name,
@@ -805,6 +1349,135 @@ mod tests {
     }
 
     #[test]
+    fn an_owned_content_recipe_reaches_the_client_book() {
+        let recipe = r#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:raw_copper"],"result":{"id":"minecraft:copper_ingot","count":2}}"#;
+        let root = resources("content_namespace", &[("control", recipe)]);
+        let dir = root.join("data/recipe_pilot/recipe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("press.json"), recipe).unwrap();
+        std::fs::write(
+            root.join(horizon_items::content_namespaces::MARKER),
+            br#"["recipe_pilot"]"#,
+        )
+        .unwrap();
+        let (sync, e) = entry(&root, "recipe_pilot:press");
+        assert_eq!(
+            e.id,
+            sync.advancements
+                .displays
+                .first_display("recipe_pilot:press")
+                .unwrap()
+        );
+        match e.display {
+            RecipeDisplay::Shapeless { result, .. } => {
+                assert_eq!(result, SlotDisplay::ItemStack(Stack::new(1, 2)));
+            }
+            other => panic!("not a shapeless content recipe: {other:?}"),
+        }
+        let _ = entry(&root, "minecraft:control");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// DyeRecipe.display: the target, then the dyes kept to what carries the
+    /// DYE component, the demo of dyeing the target with one, a crafting
+    /// table; its placement is the target and the dye.
+    #[test]
+    fn a_dye_recipe_reaches_the_book_as_its_dyed_demo() {
+        let root = resources(
+            "dye_recipe",
+            &[(
+                "leather_helmet_dyed",
+                r##"{"type":"minecraft:crafting_dye","dye":"#minecraft:dyes",
+                "group":"dyed_armor","result":{"id":"minecraft:leather_helmet"},
+                "target":"minecraft:leather_helmet"}"##,
+            )],
+        );
+        let (sync, e) = entry(&root, "minecraft:leather_helmet_dyed");
+        let item = |n: &str| sync.id("minecraft:item", n).unwrap();
+        let leather = item("minecraft:leather_helmet");
+        let dye = SlotDisplay::OnlyWithComponent(
+            Box::new(SlotDisplay::Tag(HolderSet::Tag("minecraft:dyes".into()))),
+            sync.id("minecraft:data_component_type", "minecraft:dye")
+                .unwrap(),
+        );
+        assert_eq!(
+            e.display,
+            RecipeDisplay::Shapeless {
+                ingredients: vec![
+                    SlotDisplay::Tag(HolderSet::Items(vec![leather])),
+                    dye.clone(),
+                ],
+                result: SlotDisplay::Dyed {
+                    dye: Box::new(dye),
+                    target: Box::new(SlotDisplay::Tag(HolderSet::Items(vec![leather]))),
+                },
+                station: SlotDisplay::Item(item("minecraft:crafting_table")),
+            }
+        );
+        assert_eq!(
+            e.requirements,
+            Some(vec![
+                HolderSet::Items(vec![leather]),
+                HolderSet::Tag("minecraft:dyes".into()),
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ImbueRecipe.display: a 3×3 of four materials, the source kept to any
+    /// potion, four materials again; the result is potion-wrapped, and the
+    /// source sits in the middle of the placement.
+    #[test]
+    fn an_imbue_recipe_reaches_the_book_with_any_potion() {
+        let root = resources(
+            "imbue_recipe",
+            &[(
+                "tipped_arrow",
+                r#"{"type":"minecraft:crafting_imbue","material":"minecraft:arrow",
+                "result":{"count":8,"id":"minecraft:tipped_arrow"},
+                "source":"minecraft:lingering_potion"}"#,
+            )],
+        );
+        let (sync, e) = entry(&root, "minecraft:tipped_arrow");
+        let item = |n: &str| sync.id("minecraft:item", n).unwrap();
+        let material = SlotDisplay::Tag(HolderSet::Items(vec![item("minecraft:arrow")]));
+        let source = SlotDisplay::Tag(HolderSet::Items(vec![item("minecraft:lingering_potion")]));
+        let mut cells = vec![material.clone(); 4];
+        cells.push(SlotDisplay::WithAnyPotion(Box::new(source.clone())));
+        cells.extend(std::iter::repeat_n(material, 4));
+        assert_eq!(
+            e.display,
+            RecipeDisplay::Shaped {
+                width: 3,
+                height: 3,
+                ingredients: cells,
+                result: SlotDisplay::WithAnyPotion(Box::new(SlotDisplay::ItemStack(Stack::new(
+                    item("minecraft:tipped_arrow"),
+                    8,
+                )))),
+                station: SlotDisplay::Item(item("minecraft:crafting_table")),
+            }
+        );
+        let arrow = HolderSet::Items(vec![item("minecraft:arrow")]);
+        let potion = HolderSet::Items(vec![item("minecraft:lingering_potion")]);
+        assert_eq!(
+            e.requirements,
+            Some(vec![
+                arrow.clone(),
+                arrow.clone(),
+                arrow.clone(),
+                arrow.clone(),
+                potion,
+                arrow.clone(),
+                arrow.clone(),
+                arrow.clone(),
+                arrow,
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_recipe_with_an_unknown_ingredient_kind_stays_out_of_the_book() {
         let root = resources(
             "mymod_kind",
@@ -816,7 +1489,14 @@ mod tests {
                 "result":{"id":"minecraft:copper_ingot"}}"#,
             )],
         );
-        let sync = SyncData::load(&root, &horizon_world::loot::PackOverlay::NONE).unwrap();
+        let defaults = horizon_world::item_defaults::read(&root).unwrap();
+        let sync = SyncData::load(
+            &root,
+            &horizon_world::loot::PackOverlay::NONE,
+            &defaults,
+            &crate::test_resources::server_sources(&root, &horizon_world::loot::PackOverlay::NONE),
+        )
+        .unwrap();
         assert!(
             !sync
                 .advancements
@@ -853,7 +1533,14 @@ mod tests {
                 ),
             ],
         );
-        let sync = SyncData::load(&root, &horizon_world::loot::PackOverlay::NONE).unwrap();
+        let defaults = horizon_world::item_defaults::read(&root).unwrap();
+        let sync = SyncData::load(
+            &root,
+            &horizon_world::loot::PackOverlay::NONE,
+            &defaults,
+            &crate::test_resources::server_sources(&root, &horizon_world::loot::PackOverlay::NONE),
+        )
+        .unwrap();
         let item = |n: &str| sync.id("minecraft:item", n).unwrap();
         let raw = item("minecraft:raw_copper");
         let redstone = item("minecraft:redstone");
@@ -901,8 +1588,15 @@ mod tests {
             "recipe/pack:a_cut".to_owned(),
             vec![cut("minecraft:redstone").into_bytes()],
         )];
-        let sync =
-            SyncData::load(&root, &horizon_world::loot::PackOverlay { files: &packs }).unwrap();
+        let overlay = horizon_world::loot::PackOverlay::new(&packs);
+        let defaults = horizon_world::item_defaults::read(&root).unwrap();
+        let sync = SyncData::load(
+            &root,
+            &overlay,
+            &defaults,
+            &crate::test_resources::server_sources(&root, &overlay),
+        )
+        .unwrap();
         let item = |n: &str| sync.id("minecraft:item", n).unwrap();
         let mut r = Reader::new(&sync.recipes);
         for _ in 0..r.varint().unwrap() {
@@ -931,6 +1625,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A world's own load over the data its packs gave (`SyncData::load_over`, which keeps
+    /// that data's recipes) sends what a full read of the same packs sends: their recipes too.
+    #[test]
+    fn a_world_load_over_its_packs_data_sends_what_a_full_read_does() {
+        let cut = |input: &str| {
+            format!(
+                r#"{{"type":"minecraft:stonecutting","ingredient":"{input}",
+                "result":{{"id":"minecraft:copper_ingot"}}}}"#
+            )
+        };
+        let vanilla_cut = cut("minecraft:raw_copper");
+        let root = resources("load_over", &[("z_cut", vanilla_cut.as_str())]);
+        let packs = [(
+            "recipe/pack:a_cut".to_owned(),
+            vec![cut("minecraft:redstone").into_bytes()],
+        )];
+        let overlay = horizon_world::loot::PackOverlay::new(&packs);
+        let vanilla = SyncData::load(
+            &root,
+            &horizon_world::loot::PackOverlay::NONE,
+            &horizon_world::item_defaults::read(&root).unwrap(),
+            &crate::test_resources::server_sources(&root, &horizon_world::loot::PackOverlay::NONE),
+        )
+        .unwrap();
+        let packed = SyncData::load(
+            &root,
+            &overlay,
+            &horizon_world::item_defaults::read(&root).unwrap(),
+            &crate::test_resources::server_sources(&root, &overlay),
+        )
+        .unwrap();
+        let over = SyncData::load_over(
+            &root,
+            &overlay,
+            None,
+            &packed,
+            &horizon_world::item_defaults::read(&root).unwrap(),
+            &crate::test_resources::server_sources(&root, &overlay),
+        )
+        .unwrap();
+        let full = SyncData::load_with_kept(
+            &root,
+            &overlay,
+            None,
+            Some(&packed),
+            &horizon_world::item_defaults::read(&root).unwrap(),
+            &crate::test_resources::server_sources(&root, &overlay),
+        )
+        .unwrap();
+        assert_ne!(full.recipes, vanilla.recipes, "the pack's recipe is sent");
+        assert_eq!(over.recipes, full.recipes);
+        assert_eq!(over.advancements.recipes, full.advancements.recipes);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `RecipeManager.getRecipeFromDisplay`, which
     /// `handleRecipeBookSeenRecipePacket` asks: the display ids are numbered
     /// over the recipes in id order, so display 0 is the first recipe and the
@@ -954,7 +1703,14 @@ mod tests {
                 ),
             ],
         );
-        let sync = SyncData::load(&root, &horizon_world::loot::PackOverlay::NONE).unwrap();
+        let defaults = horizon_world::item_defaults::read(&root).unwrap();
+        let sync = SyncData::load(
+            &root,
+            &horizon_world::loot::PackOverlay::NONE,
+            &defaults,
+            &crate::test_resources::server_sources(&root, &horizon_world::loot::PackOverlay::NONE),
+        )
+        .unwrap();
         assert_eq!(
             sync.advancements.recipe_of_display(0),
             Some("minecraft:aaa_shaped")
@@ -1046,8 +1802,15 @@ mod tests {
                     .to_vec(),
             ],
         )];
-        let overlay = horizon_world::loot::PackOverlay { files: &packs };
-        let sync = SyncData::load(&root, &overlay).unwrap();
+        let overlay = horizon_world::loot::PackOverlay::new(&packs);
+        let defaults = horizon_world::item_defaults::read(&root).unwrap();
+        let sync = SyncData::load(
+            &root,
+            &overlay,
+            &defaults,
+            &crate::test_resources::server_sources(&root, &overlay),
+        )
+        .unwrap();
         let entries = sync.advancements.book_entries(
             "minecraft:copper_ingot_from_smelting_raw_copper",
             &sync,
@@ -1114,5 +1877,94 @@ mod tests {
         assert_eq!(duration, 200);
         assert_eq!(experience, 0.7);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every recipe the game has, as a Horizon server sends it to a Horizon
+    /// client: the client's own book keeps its entries, none is taken from the
+    /// packet (a regression of parity with Horizon on both sides otherwise).
+    /// Needs the prepared resources (`HORIZON_TEST_RESOURCES`, or the checkout's
+    /// `.local`); passes without them.
+    #[test]
+    fn a_horizon_server_of_the_real_recipes_leaves_the_clients_book_as_it_is() {
+        use crate::{
+            crafting::Recipes,
+            items::Items,
+            recipe_book::{Book, PacketNames, RecipeIndex},
+        };
+        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client")
+                    .join(horizon_core::VANILLA_VERSION)
+            });
+        if !root.join("registries.json").exists() {
+            return;
+        }
+        let none = &horizon_world::loot::PackOverlay::NONE;
+        let sync = SyncData::load(
+            &root,
+            none,
+            &horizon_world::item_defaults::read(&root).unwrap(),
+            &crate::test_resources::server_sources(&root, none),
+        )
+        .unwrap();
+        let items = Items::catalog(
+            &root,
+            none,
+            &horizon_world::item_defaults::read(&root).unwrap(),
+        )
+        .unwrap();
+        let recipes =
+            Recipes::load(&root, &items, none, &crate::test_resources::server_load()).unwrap();
+        let mut book = Book::build(&recipes, &items);
+        book.set_display_ids(&RecipeIndex::load(&root, none));
+        let before: Vec<(String, i32, Option<String>)> = book
+            .entries
+            .iter()
+            .map(|e| (e.id.clone(), e.display_id, e.group.clone()))
+            .collect();
+        let mut sent = Vec::new();
+        for id in sync.advancements.recipes.keys() {
+            for bytes in sync.advancements.book_entries(id, &sync, 0) {
+                sent.push(RecipeBookEntry::read(&mut Reader::new(&bytes)).unwrap());
+            }
+        }
+        assert!(sent.len() > 1000, "{} entries sent", sent.len());
+        let item = |id: i32| {
+            sync.builtin
+                .get("minecraft:item")
+                .and_then(|i| i.name(id))
+                .map(str::to_owned)
+        };
+        let category = |id: i32| {
+            sync.builtin
+                .get("minecraft:recipe_book_category")
+                .and_then(|i| i.name(id))
+                .map(str::to_owned)
+        };
+        let tag = |name: &str| items.item_tag_order.get(name).cloned().unwrap_or_default();
+        book.use_server_entries(
+            &sent,
+            &PacketNames {
+                item: &item,
+                category: &category,
+                tag: &tag,
+            },
+        );
+        let after: Vec<(String, i32, Option<String>)> = book
+            .entries
+            .iter()
+            .map(|e| (e.id.clone(), e.display_id, e.group.clone()))
+            .collect();
+        let changed: Vec<_> = before
+            .iter()
+            .zip(&after)
+            .filter(|(b, a)| b != a)
+            .take(10)
+            .collect();
+        assert_eq!(after.len(), before.len(), "entries were added");
+        assert!(changed.is_empty(), "entries changed: {changed:?}");
+        assert!(book.server_requirements.is_empty());
     }
 }
