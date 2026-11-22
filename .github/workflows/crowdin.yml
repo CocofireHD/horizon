@@ -18,7 +18,6 @@ on:
       - crates/horizon-client/assets/horizon/lang/en_us.json
       - crowdin.yml
       - .github/crowdin-approved.yml
-      - .github/crowdin-upload.yml
       - tools/crowdin_import.py
       - .github/workflows/crowdin.yml
   schedule:
@@ -70,9 +69,10 @@ jobs:
           config: crowdin.yml
           upload_sources: true
           upload_translations: ${{ inputs.upload_translations == true }}
-          # The staged copies live in their own folder, so the upload reads that one and the download
-          # below writes into the folder crowdin.yml names.
-          upload_translations_args: --config .github/crowdin-upload.yml
+          # The staged copies live in their own folder: `-t` names it here rather than in a second
+          # config file, because the action adds `--config` to the command itself and two of those
+          # would be a coin toss. The download below writes into the folder crowdin.yml names.
+          upload_translations_args: -s crates/horizon-client/assets/horizon/lang/en_us.json -t l10n/game-staged/%locale_with_underscore%.json
           download_translations: false
         env:
           CROWDIN_PROJECT_ID: ${{ secrets.CROWDIN_PROJECT_ID }}
