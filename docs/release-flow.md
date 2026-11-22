@@ -134,6 +134,35 @@ ordinary pull request doesn't wait for them.
 Never merge your own pull request: another Team member reviews and merges it. Never push to, force-push or rebase a
 contributor's branch.
 
+**The one exception: the nightly translations pull request merges itself.** `l10n/crowdin`, which
+`.github/workflows/crowdin.yml` opens, carries only `lang/*.json` and `tools/lang_review/game/*.json`, and nothing on
+it is a person's judgement: the strings come from Crowdin's approved export. So with the repository variable
+`CROWDIN_AUTOMERGE` set, the run that opens it waits for its checks and adds it to the merge queue
+(`enqueuePullRequest`, bound with `expectedHeadOid` to the commit that run pushed). Every other condition above still
+applies, and three of them are checked by machine rather than by a reader:
+
+- `tools/l10n_merge_guard.py` reads the branch's whole diff before anything is queued: every changed path must be a
+  language file or a review record (`en_us.json`, the source, never), and every changed string must be one the
+  approved export carries, which is exactly what its reviewed mark records. A string without that mark queues
+  nothing, so a language with no proofreader, or a translator's unproofread edit, flows through the pull request as
+  it always did: a Team member reads and merges it.
+- `l10n (changed paths)` (`.github/workflows/l10n-paths.yml`) is the same path allowlist as a required check, so a
+  later push cannot add a workflow, a tool or a manifest to the branch after it was queued. It runs main's copy of
+  `tools/l10n_merge_guard.py`, never the branch's, so a pull request cannot grade its own work, and it answers
+  `merge_group` as well, or a required check that only speaks for pull requests would stall the queue.
+- The token is the whole job's, not the sync's: `crowdin.yml` imports with the built-in token and hands its files
+  to a second job that pushes, opens and queues, and only that one holds `CROWDIN_PAT` — repository-scoped, with
+  `contents` and `pull requests` write and no ruleset bypass.
+- The switch stays off until a language has an active proofreader in Crowdin: until then every string is unproofread
+  and the pull request holds itself for a person.
+
+Setting it up takes nothing in Settings: `main` already requires the merge queue, and this repository's
+`autoMergeAllowed` is `false` on purpose, so "Allow auto-merge" is not a switch that enables this and `gh pr merge
+--auto` has nothing to enable — which is why the run stays until the checks are done and then adds the entry itself.
+It takes the variable `CROWDIN_AUTOMERGE=true`, the secret `CROWDIN_PAT` (a fine-grained token with `contents` and
+`pull requests` write, so the pull request's checks start), and the ruleset on `main` listing `l10n (changed paths)`
+among its required checks ([translations.md](translations.md#crowdin)).
+
 **A risky pull request gets the `needs-proof` label** and waits for an agent's local proof (both single-player
 paths, `lan_e2e`, a screenshot for anything visible) before it merges. Risky means any of:
 

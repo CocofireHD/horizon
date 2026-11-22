@@ -61,6 +61,37 @@ download writes into `l10n/game` instead, one folder per direction, so a languag
 cannot keep the staged text. After that only what changed moves. Enabling the workflow takes the repository variable `CROWDIN_ENABLED` and the secrets `CROWDIN_PROJECT_ID`
 and `CROWDIN_PERSONAL_TOKEN`; without them it stays switched off.
 
+**The pull request can also put itself in the merge queue.** With the repository variable `CROWDIN_AUTOMERGE` set to
+`true`, the run that opened or updated `l10n/crowdin` waits for that pull request's checks and, when they are green,
+adds it to `main`'s merge queue (`enqueuePullRequest`, bound to the commit it pushed). Every merge to `main` releases
+automatically, so a proofread string reaches the players with the next build instead of waiting for someone to press
+the button. It is the one pull request that may merge itself, and [release-flow.md](release-flow.md#merging) says
+what holds it back.
+
+What that takes, and what it doesn't:
+
+- the secret `CROWDIN_PAT`: a fine-grained token for this repository only, with `contents` and `pull requests`
+  write and no ruleset bypass. A push or a pull request made with `github.token` starts no workflows, so its
+  `verify` would never run. Only the job that pushes holds it — the download and import job runs with the
+  built-in token and hands its files on as an artifact, which is unpacked outside the checkout and copied in as
+  `*.json` only, and the push itself gets the token from a helper that lives for that one command. Crowdin's
+  action never sees it;
+- the queue takes a pull request that is green **now**, it cannot be armed ahead of time: this repository's
+  `autoMergeAllowed` is `false`, so "Allow auto-merge" is not a switch anyone can flip and `gh pr merge --auto`
+  has nothing to enable. That is why the run stays with the pull request until its checks are done;
+- the ruleset on `main` must require `l10n (changed paths)` (`.github/workflows/l10n-paths.yml`), so a later push
+  cannot add a file to the branch after it was queued. Nothing else has to be set: `main` already requires the
+  merge queue.
+
+A format conversion the game cannot render still passes `verify` and then reaches a player as the raw template
+([#19966](https://github.com/horizon-rust/horizon/issues/19966) tracks that check, which the import does not do yet);
+the guard above is about who wrote a string, not about how it is formatted.
+
+What gets imported does not change: the placeholder, untranslated and key-set guards above run before the commit
+exists, the pull request carries only the lang files and the review record, and `tools/l10n_merge_guard.py` holds it
+back unless every changed string is one a proofreader approved. A language whose strings nobody proofread keeps
+waiting for a Team member, exactly as before.
+
 Not in Crowdin, and still hand-edited: the launcher's text (its keys are the English sentences and its language list
 is fixed in code — a later step), and `lmo` and `szl`, for which Crowdin has no Lombard or Silesian.
 

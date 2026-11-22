@@ -7,10 +7,16 @@ name: crowdin
 # CROWDIN_PROJECT_ID and CROWDIN_PERSONAL_TOKEN (Settings → Secrets and variables → Actions). A
 # manual run says which half to do; a push uploads the English text only, the nightly run downloads.
 #
-# The pull request is opened with github.token, which does not start other workflows (GitHub's own
-# rule), so its `verify` run waits for a maintainer to push or re-run it. Set the secret CROWDIN_PAT
-# (a fine-grained token with `contents` and `pull requests`) to open it as that account instead, and
-# its checks run on their own.
+# Two jobs, because of the token. `import` runs Crowdin's action and the import with the built-in
+# token and no way to write; it hands the lang files and the record on as an artifact. `pull-request`
+# is the only job that holds CROWDIN_PAT — a fine-grained token for this repository with `contents`
+# and `pull requests` write and no ruleset bypass — because a push made with `github.token` starts no
+# workflows (GitHub's rule), so the pull request's `verify` would never run.
+#
+# With the variable CROWDIN_AUTOMERGE=true that job also waits for the pull request's checks and adds
+# it to main's merge queue (docs/release-flow.md, "Merging"). It queues nothing unless the whole diff
+# is language files and `tools/l10n_merge_guard.py` finds every changed string proofread: a string no
+# proofreader approved keeps the pull request for a Team member, as before.
 on:
   push:
     branches: [main]
@@ -19,6 +25,7 @@ on:
       - crowdin.yml
       - .github/crowdin-approved.yml
       - tools/crowdin_import.py
+      - tools/l10n_merge_guard.py
       - .github/workflows/crowdin.yml
   schedule:
     - cron: "23 4 * * *"
@@ -36,23 +43,20 @@ on:
 permissions:
   contents: read
 jobs:
-  sync:
+  import:
     concurrency:
       group: crowdin
       cancel-in-progress: false
     if: vars.CROWDIN_ENABLED == 'true'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 45
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
+      # No credential kept: this job only reads, and the one push happens in `pull-request`, which has
+      # its own token for it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          # The same credential `gh` uses below: a `github.token` push starts no workflows, so the
-          # pull request below would wait for a maintainer's push before `verify` ran at all.
-          token: ${{ secrets.CROWDIN_PAT || github.token }}
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -112,8 +116,70 @@ jobs:
           python3 tools/crowdin_import.py --check
           python3 tools/crowdin_import.py --translations l10n/game --approved l10n/game-approved
           python3 tools/lang_coverage.py --summary
-      - name: Open or update the pull request
+      - name: Hand the text on to the job that pushes
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'both' || inputs.mode == 'download'))
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lang
+          # The three folders the import writes, at their own paths, so the next job drops them in place.
+          path: |
+            crates/horizon-client/assets/horizon/lang
+            tools/lang_review/game
+            tools/lang_review/crowdin
+          retention-days: 1
+  pull-request:
+    needs: import
+    if: needs.import.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'both' || inputs.mode == 'download')))
+    concurrency:
+      group: crowdin-pull-request
+      cancel-in-progress: true
+    runs-on: ubuntu-22.04
+    # The wait below is at most 55 minutes, and what it waits for is the pull request's own checks.
+    timeout-minutes: 75
+    permissions:
+      # For the run with no CROWDIN_PAT: `github.token` pushes the branch then, and this is what lets it.
+      contents: write
+      pull-requests: write
+    steps:
+      # No credential in .git/config: this job unpacks files that a third-party action in `import`
+      # produced, and the PAT is put on the push alone (see below).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Take the text the import job wrote
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lang
+          # Somewhere else: nothing an action in `import` uploaded is executed before it is filtered below.
+          path: ${{ runner.temp }}/lang
+      - name: Copy the language files in
+        run: |
+          # JSON only, and only from the three folders the import writes, so an artifact cannot add a
+          # tool or a workflow to the tree this job then runs with the PAT.
+          for folder in crates/horizon-client/assets/horizon/lang tools/lang_review/game tools/lang_review/crowdin; do
+            mkdir -p "$folder"
+            if [ -d "$RUNNER_TEMP/lang/$folder" ]; then
+              find "$RUNNER_TEMP/lang/$folder" -maxdepth 1 -name '*.json' -exec cp {} "$folder/" \;
+            fi
+          done
+          git status --short
+      - name: Check which token this run has
+        env:
+          PAT: ${{ secrets.CROWDIN_PAT }}
+          AUTOMERGE: ${{ vars.CROWDIN_AUTOMERGE }}
+        run: |
+          # A push made with github.token starts no workflows, so the pull request's `verify` would never
+          # run and the queue could never take it: with the switch on, the PAT is not optional.
+          if [ -z "$PAT" ] && [ "$AUTOMERGE" = "true" ]; then
+            echo "::error::CROWDIN_AUTOMERGE is set but CROWDIN_PAT is not, so the pull request's checks would never start and it could never merge. Add the secret, or set CROWDIN_AUTOMERGE to false."
+            exit 1
+          fi
+          if [ -z "$PAT" ]; then
+            echo "::notice::no CROWDIN_PAT: the push and the pull request use github.token, which can push but starts no workflows, so the pull request's checks will not start on their own and a maintainer has to re-run them."
+          fi
+      - name: Open or update the pull request
+        id: pr
         env:
           GH_TOKEN: ${{ secrets.CROWDIN_PAT || github.token }}
         run: |
@@ -127,15 +193,110 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B l10n/crowdin
-          git commit -m "tooling: translations from Crowdin"
+          git commit -m "translations from Crowdin"
+          # The token is handed to git for this one command and taken back out: no secret in
+          # .git/config, no secret in the remote URL, nothing an earlier step could have read.
+          git config --local credential.helper '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'
           git push --force origin l10n/crowdin
+          git config --local --unset credential.helper
+          # The commit this run pushed: the guard measures its diff, and the queue entry is bound to it.
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           body="Translations from [Crowdin](https://crowdin.com/project/horizon-client), written by
           \`tools/crowdin_import.py\` in \`.github/workflows/crowdin.yml\` from run
           ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. The text comes from
           the project; the reviewed marks are its proofreading (docs/translations.md, \"Crowdin\").
           Only translations change here."
-          if gh pr view l10n/crowdin > /dev/null 2>&1; then
-            gh pr edit l10n/crowdin --title "tooling: translations from Crowdin" --body "$body"
-          else
+          # The open pull request for this branch, and only that one: a merged or closed one is no target.
+          owner=${GITHUB_REPOSITORY%%/*}
+          open=$(gh pr list --head "$owner:l10n/crowdin" --base main --state open --json number,isCrossRepository) || {
+            echo "::error::cannot list the open pull requests for l10n/crowdin"; exit 1; }
+          open=$(echo "$open" | jq '[.[] | select(.isCrossRepository == false)]')
+          if [ "$(echo "$open" | jq 'length')" -eq 0 ]; then
             gh pr create --base main --head l10n/crowdin --title "tooling: translations from Crowdin" --body "$body"
+          else
+            gh pr edit "$(echo "$open" | jq -r '.[0].number')" --title "tooling: translations from Crowdin" --body "$body"
           fi
+      - name: Check what the pull request changes
+        id: guard
+        env:
+          SHA: ${{ steps.pr.outputs.sha }}
+        run: |
+          # docs/release-flow.md, "Merging": the paths and the approvals of the whole diff.
+          if [ -z "$SHA" ]; then
+            echo "nothing was pushed, so there is nothing to check"
+            exit 0
+          fi
+          if python3 tools/l10n_merge_guard.py --base "${SHA}^"; then
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::the pull request stays open for a Team member, as every translation pull request did before"
+          fi
+      - name: Queue the pull request to merge itself
+        if: vars.CROWDIN_AUTOMERGE == 'true' && steps.guard.outputs.approved == 'true'
+        timeout-minutes: 60
+        env:
+          GH_TOKEN: ${{ secrets.CROWDIN_PAT }}
+          SHA: ${{ steps.pr.outputs.sha }}
+        run: |
+          owner=${GITHUB_REPOSITORY%%/*}
+          prs=$(gh pr list --head "$owner:l10n/crowdin" --base main --state open --json number,headRefOid,id,isCrossRepository) || {
+            echo "::error::cannot read the open pull requests for l10n/crowdin"; exit 1; }
+          prs=$(echo "$prs" | jq '[.[] | select(.isCrossRepository == false)]')
+          count=$(echo "$prs" | jq 'length')
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected one open pull request for l10n/crowdin, found $count"
+            exit 1
+          fi
+          number=$(echo "$prs" | jq -r '.[0].number')
+          head=$(echo "$prs" | jq -r '.[0].headRefOid')
+          id=$(echo "$prs" | jq -r '.[0].id')
+          # The branch may have moved on since this run pushed it; then this run is not the one to queue.
+          if [ "$head" != "$SHA" ]; then
+            echo "the branch is at $head, not at this run's $SHA: leaving the pull request alone"
+            exit 0
+          fi
+          # main's merge queue takes a pull request that is green now: it does not wait, and it cannot be
+          # armed ahead of time, because this repository can't use auto-merge at all (`autoMergeAllowed`
+          # is false, so `gh pr merge --auto` has nothing to switch). So this job waits for the checks
+          # and then adds the entry, `expectedHeadOid` binding it to the commit it pushed.
+          deadline=$((SECONDS + 3300))
+          said=0
+          while :; do
+            buckets=$(gh pr checks "$number" --json bucket --jq '[.[].bucket] | [(any(. == "fail" or . == "cancel")), (map(select(. != "pass" and . != "skipping" and . != "neutral")) | length)] | "\(.[0]) \(.[1])"' 2>/dev/null) || buckets="could not read"
+            if [ "$buckets" = "could not read" ]; then
+              # The pull request's checks take a moment to appear; one line is enough.
+              if [ "$said" -eq 0 ]; then
+                echo "the pull request's checks are not reported yet; waiting"
+                said=1
+              fi
+            else
+              set -- $buckets
+              if [ "$1" = "true" ]; then
+                echo "::notice::a check is red, so the pull request waits for a Team member, as before"
+                exit 0
+              fi
+              if [ "$2" -eq 0 ]; then
+                break
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::notice::the checks are still running after 55 minutes, so the pull request waits for a Team member"
+              exit 0
+            fi
+            sleep 30
+          done
+          state=$(gh pr view "$number" --json mergeStateStatus --jq .mergeStateStatus)
+          if [ "$state" != "CLEAN" ]; then
+            echo "::notice::the checks pass but the pull request is $state (a change request, a conflict or a missing review), so it waits for a Team member"
+            exit 0
+          fi
+          if ! out=$(gh api graphql -f query='
+            mutation($id: ID!, $oid: GitObjectID!) {
+              enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) {
+                mergeQueueEntry { position } } }' \
+            -f id="$id" -f oid="$SHA" 2>&1); then
+            echo "::notice::the merge queue did not take it: $out"
+            exit 0
+          fi
+          echo "l10n/crowdin is in main's merge queue at position $(echo "$out" | jq -r '.data.mergeQueueEntry.position')"
