@@ -55,9 +55,10 @@ Two things the project does not check, so the import does:
   someone writes it — the game falls back to English meanwhile.
 
 The first run is manual, with **upload_translations** ticked: `tools/crowdin_import.py --stage` copies the lang files
-into the folder Crowdin uploads translations from, so the strings already in the repository reach the project instead
-of an empty staging folder, and the download after it has something to compare with. After that only what changed
-moves. Enabling the workflow takes the repository variable `CROWDIN_ENABLED` and the secrets `CROWDIN_PROJECT_ID`
+into `l10n/game-staged` — the folder `.github/crowdin-upload.yml` names — so the strings already in the repository
+reach the project instead of an empty staging folder, and the download after it has something to compare with. The
+download writes into `l10n/game` instead, one folder per direction, so a language the download carries nothing for
+cannot keep the staged text. After that only what changed moves. Enabling the workflow takes the repository variable `CROWDIN_ENABLED` and the secrets `CROWDIN_PROJECT_ID`
 and `CROWDIN_PERSONAL_TOKEN`; without them it stays switched off.
 
 Not in Crowdin, and still hand-edited: the launcher's text (its keys are the English sentences and its language list

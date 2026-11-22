@@ -18,6 +18,7 @@ on:
       - crates/horizon-client/assets/horizon/lang/en_us.json
       - crowdin.yml
       - .github/crowdin-approved.yml
+      - .github/crowdin-upload.yml
       - tools/crowdin_import.py
       - .github/workflows/crowdin.yml
   schedule:
@@ -59,8 +60,9 @@ jobs:
       - name: Stage the translations the repository already has
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'both' || inputs.mode == 'upload'))
         # Crowdin reads translations from the `translation` folder in crowdin.yml, which is empty on a
-        # fresh checkout; the first run has to put the repository's own text there first.
-        run: python3 tools/crowdin_import.py --stage
+        # fresh checkout; the first run has to put the repository's own text there first. A folder of
+        # its own, so a language the download carries nothing for cannot keep the staged text.
+        run: python3 tools/crowdin_import.py --stage --stage-dir l10n/game-staged
       - name: Upload the English text
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'both' || inputs.mode == 'upload'))
         uses: crowdin/github-action@d651c77756acbe11a31d77a6fb79d8a239e1e05a # v3.6.0
@@ -68,6 +70,9 @@ jobs:
           config: crowdin.yml
           upload_sources: true
           upload_translations: ${{ inputs.upload_translations == true }}
+          # The staged copies live in their own folder, so the upload reads that one and the download
+          # below writes into the folder crowdin.yml names.
+          upload_translations_args: --config .github/crowdin-upload.yml
           download_translations: false
         env:
           CROWDIN_PROJECT_ID: ${{ secrets.CROWDIN_PROJECT_ID }}
