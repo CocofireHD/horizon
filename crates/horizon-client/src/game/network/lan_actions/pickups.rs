@@ -7,12 +7,13 @@ impl Game<'_> {
         let Some(host) = self.lan.as_ref() else {
             return;
         };
-        let (conn, mode, position, id, uuid) = {
+        let (conn, mode, position, dims, id, uuid) = {
             let g = &host.hub.guests[gi];
             (
                 g.conn,
                 g.game_mode,
                 g.position,
+                g.dimensions(),
                 g.entity_id,
                 horizon_client::lan::playerdata::uuid_ints(g.uuid),
             )
@@ -20,8 +21,9 @@ impl Game<'_> {
         if mode == SPECTATOR || self.dropped.is_empty() {
             return;
         }
-        // The test below takes items whose position is less than 1.5 from
-        // the player's on x and z: their boxes reach these columns.
+        // The test below takes items whose box meets the guest's box grown by
+        // (1.0, 0.5, 1.0), which reaches 0.3 + 1.0 past their centre on x and
+        // z: their positions stay within these columns.
         if let Some(columns) = self.pickup_columns.as_mut()
             && !columns.may_reach_area(
                 &self.dropped,
@@ -37,16 +39,25 @@ impl Game<'_> {
         {
             return;
         }
+        // `Player.aiStep`'s pickup area: the player's box grown by (1.0, 0.5, 1.0), which an
+        // item's box touches when it overlaps it (`AABB.intersects`, strict).
+        let w = f64::from(dims.width) / 2.0;
+        let reach = Aabb::new(
+            Vec3::new(position[0] - w, position[1], position[2] - w),
+            Vec3::new(
+                position[0] + w,
+                position[1] + f64::from(dims.height),
+                position[2] + w,
+            ),
+        )
+        .inflate(Vec3::new(1.0, 0.5, 1.0));
         let listens = mod_api::__private::listened(mod_api::HookId::ItemPickedUp);
         let near: Vec<_> = self
             .dropped
             .iter()
             .filter(|d| {
                 (listens || (d.pickup_delay == 0 && d.target.is_none_or(|t| t == uuid)))
-                    && (d.position.x - position[0]).abs() < 1.5
-                    && (d.position.z - position[2]).abs() < 1.5
-                    && d.position.y > position[1] - 0.6
-                    && d.position.y < position[1] + 2.4
+                    && d.bounds().intersects(reach)
             })
             .map(|d| d.id)
             .collect();
@@ -354,6 +365,10 @@ impl Game<'_> {
 #[cfg(test)]
 #[path = "tests/pickup_post_tests.rs"]
 mod pickup_post_tests;
+
+#[cfg(test)]
+#[path = "tests/pickup_reach_tests.rs"]
+mod pickup_reach_tests;
 
 #[cfg(test)]
 #[path = "tests/orb_merge_contract_tests.rs"]

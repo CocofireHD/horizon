@@ -1,0 +1,3 @@
+# A guest's pickup area is the player's box grown by (1.0, 0.5, 1.0) (#20542): prepared resources.
+# PACKAGE TEST TARGET daily REASON; exact logical libtest identities.
+horizon-client game::lan_actions::pickups::pickup_reach_tests::a_guest_takes_what_meets_their_box_grown_by_one_and_a_half_blocks lib daily resources
