@@ -423,14 +423,6 @@ impl Game<'_> {
                     [0.0; 3],
                 );
             }
-            // MinecartTNT.tick: a primed cart counts its fuse down and sheds smoke.
-            if kind == super::minecarts::CartKind::Tnt && fuse {
-                self.particles.add(
-                    &ParticleOptions::simple(ParticleType::Smoke),
-                    [to.x, to.y + 0.5, to.z],
-                    [0.0; 3],
-                );
-            }
             if from != to {
                 self.entity_section_step(id, [from.x, from.y, from.z], [to.x, to.y, to.z]);
             }
