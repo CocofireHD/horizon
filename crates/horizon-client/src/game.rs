@@ -9421,6 +9421,9 @@ impl Game<'_> {
             && horizon_client::keybinds::key_name(key)
                 == Some(self.settings.keys.get("key.fullscreen"))
             && !(self.screen == Screen::Options && self.options_waiting_for_key())
+            // handleGlobalKeyPress returns early while the debug modifier is down: F3+F11 is a
+            // debug combination, not the window's fullscreen shortcut.
+            && !self.debug_keys.modifier_down
         {
             self.last_input = Instant::now();
             if !event.repeat {
