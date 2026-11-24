@@ -1245,7 +1245,7 @@ impl Game<'_> {
             });
             if taken {
                 self.audio
-                    .play("minecraft:ui.stonecutter.select_recipe", None, 1.0, 1.0);
+                    .play("minecraft:ui.stonecutter.select_recipe", None, 0.25, 1.0);
                 self.remote_station_button(index as i32);
                 return true;
             }
