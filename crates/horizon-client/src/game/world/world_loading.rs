@@ -172,6 +172,9 @@ impl WorldRequest {
         horizon_client::save::upgrade_older_world_with(&save_root, upgrade)?;
         horizon_client::save::migrate_legacy(&save_root)?;
         let session_lock = horizon_client::save::SessionLock::acquire(&save_root)?;
+        // A world Paper saved keeps the seed, rules, weather and clocks under the Overworld only.
+        horizon_world::datafix::files::adopt_dimension_saved_data(&save_root)
+            .map_err(|e| format!("reading {}'s saved data: {e}", save_root.display()))?;
         // RandomSequences: the world's data/minecraft/random_sequences.dat.
         let rand_sequences = super::trading::read_random_sequences(&save_root);
         let existing = Level::read_with_registry(&save_root, rule_registry.clone());
@@ -1045,6 +1048,16 @@ pub(super) fn make_streaming(
         shape,
     );
     save.enable_trusted_fluid_load();
+    if let Some(tables) = same_world.and_then(|open| open.tables.get()) {
+        let _ = save.tables.set(Arc::clone(tables));
+    } else if let Some(registry) =
+        super::chat::command_export(&options.resources, options.dedicated.is_none())
+    {
+        let pack_items = res.core.item_data.defaults().entries().keys().cloned();
+        let tables = horizon_client::save::SaveTables::new(&pack.assets)
+            .with_component_registry(registry, pack_items);
+        let _ = save.tables.set(Arc::new(tables));
+    }
     // One section palette budget per world, not one per level.
     if let Some(open) = same_world {
         save.share_section_palettes(open);
@@ -1355,6 +1368,7 @@ pub(super) fn make_streaming(
     streaming.biome_blend = settings.biome_blend;
     streaming.smooth_lighting = settings.smooth_lighting;
     streaming.cutout_leaves = settings.cutout_leaves;
+    streaming.better_grass_mode = settings.better_grass_mode();
     streaming.opaque_ice = settings.horizon.opaque_ice;
     streaming.leaf_culling = settings
         .horizon

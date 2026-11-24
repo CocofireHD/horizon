@@ -35,6 +35,9 @@ impl Game<'_> {
     pub(super) fn send_play_body(&self, packet: S) -> bool {
         let queued = self.remote.is_some() && !self.client_packet_send_canceled(&packet);
         if let (true, Some(r)) = (queued, &self.remote) {
+            if let S::ContainerClick(click) = &packet {
+                self.observe_container_click(click, &r.builtin);
+            }
             r.session.send(packet);
         }
         queued
@@ -145,11 +148,8 @@ impl Game<'_> {
             log::warn!("Dropping a stack with unnegotiated custom components");
             return None;
         }
-        Some(horizon_client::item_sync::from_network(
-            stack,
-            &r.builtin,
-            &r.registries,
-        ))
+        let decoded = horizon_client::item_sync::from_network(stack, &r.builtin, &r.registries);
+        (decoded.count > 0 && &*decoded.item != "minecraft:air").then_some(decoded)
     }
     /// A stack to the server (`SetCreativeModeSlot`): the same component
     /// patch a Horizon server sends its clients, with the registries' ids, so

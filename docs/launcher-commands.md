@@ -105,7 +105,7 @@ Start the client (needs a signed-in Microsoft account that owns Minecraft: Java 
 - `--arg`: An extra argument for the game, passed through as-is (repeatable), for example --server-thread
 - `--account`: Play this launch as this signed-in account (its name or UUID), without changing the one `account select` picked: several games can play as several accounts at once
 
-MCP: `play`, then the `game_*` tools.
+MCP: `play` (its `arg` needs `confirm: true`), then the `game_*` tools.
 
 ## `horizon-launcher server`
 
@@ -257,7 +257,7 @@ Show or set the extra arguments the game starts with (for example --server-threa
 
 - `ARGS`: Omit to show the current arguments
 
-MCP: `game_args`.
+MCP: `game_args`, needs `confirm: true`.
 
 ## `horizon-launcher share-log`
 
@@ -442,7 +442,7 @@ A Java instance's Java: its own Java home or the automatic pick, memory and JVM 
 - `--args`: Extra JVM arguments (one string; "" clears them)
 - `--window`: The game window's size, as 1280x720; "default" goes back to the game's own
 
-MCP: `instance_java`.
+MCP: `instance_java`, needs `confirm: true`.
 
 ## `horizon-launcher instance loader`
 

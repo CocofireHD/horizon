@@ -250,6 +250,19 @@ enum Load<T> {
 }
 
 const LOG_LINES: usize = 2000;
+/// A game folder and the graphics API notice it is due.
+type ApiNoticeOf = (std::path::PathBuf, Option<backend::api_fallback::Notice>);
+
+enum InstallSource {
+    Instance,
+    Manual(instances::ManualInstallTarget),
+    Update,
+}
+
+struct QueuedInstall {
+    release: Release,
+    source: InstallSource,
+}
 
 struct Launcher {
     theme: Theme,
@@ -296,8 +309,8 @@ struct Launcher {
     instance_install: Option<String>,
     /// The displayed instance when a manual install started.
     manual_install_for: Option<instances::ManualInstallTarget>,
-    /// Downloads requested by instance saves, ordered by when they were queued.
-    install_queue: VecDeque<Release>,
+    /// Pending downloads retain the reason and instance that requested them.
+    install_queue: VecDeque<QueuedInstall>,
     /// The Stable build Home's Update is installing (`nightly::install_stable`).
     stable_install: Option<Release>,
     /// A Stable build whose download failed: not offered again until the release list is read
@@ -438,6 +451,8 @@ struct Launcher {
     background_error: Option<String>,
     /// Settings' data relocation confirmation and the worker's last result.
     location_target: Option<std::path::PathBuf>,
+    /// A linked data target discovered at startup, reused while the Settings page redraws.
+    location_real_target: Option<std::path::PathBuf>,
     location_error: Option<String>,
     location_note: Option<String>,
     settings: Settings,
@@ -459,6 +474,12 @@ struct Launcher {
     client_started: Option<std::time::SystemTime>,
     /// The folder the running game keeps its settings in: the game home, or a modpack's.
     client_home: Option<std::path::PathBuf>,
+    /// The Horizon version the last game was started as, for the record of a graphics API
+    /// switched after its start crash (`backend::api_fallback`).
+    client_build: Option<String>,
+    /// A game folder's graphics API notice, read once (`Self::api_notice`); emptied when a game
+    /// ends or the player answers.
+    api_notice: std::cell::RefCell<Option<ApiNoticeOf>>,
     crash: Option<Crash>,
     /// The Servers page (`servers_page.rs`).
     servers: servers_page::Servers,
@@ -560,8 +581,6 @@ struct Launcher {
     /// The size of Home's tab strip, measured as it is laid out: the glass panel's plate cuts
     /// its corner around it.
     home_strip: std::rc::Rc<std::cell::Cell<Option<gpui::Size<Pixels>>>>,
-    /// When the running game was first seen running, for Home's "Playing for…".
-    client_since: Option<Instant>,
     /// The selected instance's mods, for Home's Mods tab (`instance_mods.rs`).
     instance_mods: instance_mods::InstanceMods,
     /// Debug-build previews of the native mod states (`glass_mod_states.rs`).
@@ -882,6 +901,133 @@ mod tests {
         assert!(
             running_ids(true, None).is_empty(),
             "a pack with no instance"
+        );
+    }
+
+    /// Home's play-time line and Play/Stop controls scope running and starting state to the
+    /// started instance, never claiming another selected instance is being played (#20630).
+    #[test]
+    fn home_shows_running_and_starting_for_the_started_instance_only() {
+        use super::frame::RowPhase;
+        use super::{other_game_info, other_game_label, selected_game_state, SelectedGameState};
+        use horizon_launcher::instances::{Channel, Instance, Kind};
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let run = ("inst-1".to_string(), started);
+
+        // Idle when neither running nor starting (even with stale metadata).
+        assert_eq!(
+            selected_game_state(Some("inst-1"), false, Some(&run), false, Some("inst-1")),
+            SelectedGameState::Idle
+        );
+
+        // Running: only the started instance sees SelectedRunning (preserving spawn Instant).
+        assert_eq!(
+            selected_game_state(Some("inst-1"), true, Some(&run), false, None),
+            SelectedGameState::SelectedRunning { since: started }
+        );
+        assert_eq!(
+            selected_game_state(Some("inst-2"), true, Some(&run), false, None),
+            SelectedGameState::OtherRunning { id: Some("inst-1") }
+        );
+        assert_eq!(
+            selected_game_state(None, true, Some(&run), false, None),
+            SelectedGameState::OtherRunning { id: Some("inst-1") }
+        );
+        assert_eq!(
+            selected_game_state(Some("inst-1"), true, None, false, None),
+            SelectedGameState::OtherRunning { id: None }
+        );
+        // Running takes precedence over starting if both flags are set.
+        assert_eq!(
+            selected_game_state(Some("inst-2"), true, Some(&run), true, Some("inst-2")),
+            SelectedGameState::OtherRunning { id: Some("inst-1") }
+        );
+
+        // Starting: only the starting instance sees SelectedStarting.
+        assert_eq!(
+            selected_game_state(Some("inst-1"), false, None, true, Some("inst-1")),
+            SelectedGameState::SelectedStarting
+        );
+        assert_eq!(
+            selected_game_state(Some("inst-2"), false, None, true, Some("inst-1")),
+            SelectedGameState::OtherStarting { id: Some("inst-1") }
+        );
+        assert_eq!(
+            selected_game_state(Some("inst-1"), false, None, true, None),
+            SelectedGameState::OtherStarting { id: None }
+        );
+
+        let make = |id: &str, name: &str, kind: Kind| Instance {
+            id: id.into(),
+            name: name.into(),
+            kind,
+            work: PathBuf::new(),
+            home: PathBuf::new(),
+            icon: None,
+            group: None,
+            version: None,
+            channel: Channel::Nightly,
+            native_profile: Default::default(),
+            played: Duration::ZERO,
+            last_played: None,
+            launch: Default::default(),
+            java: None,
+        };
+        let instances = [
+            make("inst-1", "Horizon", Kind::Default),
+            make("inst-2", "Latest", Kind::Own),
+            make("blank", "   ", Kind::Own),
+            make("port:cool-pack", "Cool Pack", Kind::Port),
+            make("pack:reg-pack", "Registry Pack", Kind::Pack),
+        ];
+
+        assert_eq!(
+            other_game_info(&instances, Some("inst-1")),
+            (Some("Horizon"), true)
+        );
+        assert_eq!(
+            other_game_info(&instances, Some("inst-2")),
+            (Some("Latest"), true)
+        );
+        assert_eq!(
+            other_game_info(&instances, Some("blank")),
+            (None, true),
+            "blank names fall back to generic copy"
+        );
+        assert_eq!(
+            other_game_info(&instances, Some("port:cool-pack")),
+            (Some("Cool Pack"), false),
+            "ported modpacks have no Home page so Stop stays reachable"
+        );
+        assert_eq!(
+            other_game_info(&instances, Some("pack:reg-pack")),
+            (Some("Registry Pack"), false)
+        );
+        assert_eq!(other_game_info(&instances, Some("deleted")), (None, false));
+        assert_eq!(other_game_info(&instances, None), (None, false));
+
+        assert_eq!(
+            other_game_label(RowPhase::Running, Some("Horizon")),
+            "Horizon is running"
+        );
+        assert_eq!(
+            other_game_label(RowPhase::Running, Some("   ")),
+            "Another instance is running"
+        );
+        assert_eq!(
+            other_game_label(RowPhase::Running, None),
+            "Another instance is running"
+        );
+        assert_eq!(
+            other_game_label(RowPhase::Starting, Some("Horizon")),
+            "Horizon is starting"
+        );
+        assert_eq!(
+            other_game_label(RowPhase::Starting, None),
+            "Another instance is starting"
         );
     }
 

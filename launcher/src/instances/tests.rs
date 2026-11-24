@@ -460,8 +460,9 @@ fn migration_leaves_both_files_untouched_when_version_or_instance_data_cannot_be
     fs::remove_file(&versions).unwrap();
     fs::rename(data.join("versions-kept"), &versions).unwrap();
     let game = backend::game_home();
-    let port = game.join("ports/family-pack/pack.json");
-    let registry = game.join("horizon-packs/quiet/pack.json");
+    // Joined part by part: the errors name the path with the platform's separators.
+    let port = game.join("ports").join("family-pack").join("pack.json");
+    let registry = game.join("horizon-packs").join("quiet").join("pack.json");
     put(&port, "broken Java pack");
     assert!(absorb_held_selection()
         .unwrap_err()
@@ -1089,4 +1090,25 @@ fn a_pinned_version_that_is_gone_stays_unresolved() {
     assert_eq!(instance(None, None).missing_pin(&installed), None);
     let java = Some(JavaGame::default());
     assert_eq!(instance(Some("v-a"), java).missing_pin(&installed), None);
+}
+
+/// A sparse file of `len` bytes: it weighs nothing on disk, and reading it whole would allocate.
+fn sparse(path: &Path, len: u64) {
+    fs::File::create(path).unwrap().set_len(len).unwrap();
+}
+
+#[test]
+fn a_file_over_the_cap_is_not_read() {
+    let dir = scratch("capped");
+    let file = dir.join(PICTURE);
+    fs::write(&file, b"abc").unwrap();
+    assert_eq!(read_capped(&file, 3).unwrap(), b"abc");
+    assert!(read_capped(&file, 2).is_err());
+    assert!(read_capped(&dir.join("missing"), 3).is_err());
+    // Just over the cap: refused from its size, without a read of the zeros.
+    sparse(&file, MAX_PICTURE_FILE + 1);
+    assert!(read_capped(&file, MAX_PICTURE_FILE).is_err());
+    sparse(&file, MAX_TEXT_FILE + 1);
+    assert!(read_text_capped(&file, MAX_TEXT_FILE).is_err());
+    fs::remove_dir_all(dir).unwrap();
 }

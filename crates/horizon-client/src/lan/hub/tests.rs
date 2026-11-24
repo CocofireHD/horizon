@@ -1,3 +1,4 @@
+mod block_send_bench;
 mod bundle_sound_tests;
 mod cave_air_tests;
 mod chunk_ready_tests;
@@ -6,6 +7,7 @@ mod effect_meta_tests;
 #[path = "far_tests.rs"]
 mod far_tests;
 mod glide_motion_tests;
+mod ground_claim_tests;
 mod impulse_grace_tests;
 mod live_player_limit_tests;
 mod main_hand_tests;
@@ -21,6 +23,160 @@ mod terrain_send_bench;
 mod terrain_view_tests;
 use super::*;
 use crate::fast_hash::FxHashSet;
+use crate::lan::{Body, Holding, Joined, PlayerSender, flush_all};
+use std::sync::{Arc, atomic::Ordering};
+
+fn add_broadcast_test_guest(
+    hub: &mut Hub,
+    conn: u32,
+) -> std::sync::mpsc::Receiver<crate::lan::Out> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut guest = Guest::new(
+        Joined {
+            conn,
+            uuid: u128::from(conn),
+            name: format!("Player{conn}"),
+            properties: Vec::new(),
+            info: horizon_protocol::packets::configuration::ClientInformation::new(8),
+            brand: "vanilla".into(),
+            sender: PlayerSender::new(tx, Arc::default()),
+            latency: Arc::default(),
+            address: "127.0.0.1:25565".parse().unwrap(),
+            expected: false,
+        },
+        conn as i32,
+        [0.5, 64.0, 0.5],
+        8,
+    );
+    guest.placed = true;
+    guest.dimension = "minecraft:overworld".into();
+    hub.guests.push(guest);
+    rx
+}
+
+/// Direct holders share one encoded body, while a singleton keeps the owned path.
+#[test]
+fn direct_block_broadcasts_share_body_and_charge_each_sender() {
+    let (mut hub, _first) = hub_with_a_guest();
+    let _second = add_broadcast_test_guest(&mut hub, 2);
+
+    let body = vec![1, 2, 3, 4];
+    let holders = [(0, None), (1, None)];
+    let holding = Holding::start();
+    hub.send_to_holders(&holders, &body);
+    let first = hub.guests[0].sender.held_bodies();
+    let second = hub.guests[1].sender.held_bodies();
+    assert!(matches!((&first[..], &second[..]),
+        ([Body::Shared(a)], [Body::Shared(b)]) if Arc::ptr_eq(a, b)));
+    let first_charge = hub.guests[0].sender.pending.load(Ordering::Relaxed);
+    let second_charge = hub.guests[1].sender.pending.load(Ordering::Relaxed);
+    assert_eq!(first_charge, second_charge);
+    assert!(first_charge > 0);
+    drop(holding);
+
+    let (hub, _first) = hub_with_a_guest();
+    let holding = Holding::start();
+    hub.send_to_holders(&[(0, None)], &body);
+    let singleton = hub.guests[0].sender.held_bodies();
+    assert!(matches!(&singleton[..], [Body::Owned(bytes)] if bytes == &body));
+    drop(holding);
+}
+
+/// A direct and viewed holder keep their own wire representation and packet order.
+#[test]
+fn block_broadcast_keeps_viewed_level_wrapping_separate() {
+    let (mut hub, direct_rx) = hub_with_a_guest();
+    let viewed_rx = add_broadcast_test_guest(&mut hub, 2);
+    let body = horizon_protocol::packets::play::Clientbound::BlockUpdate(
+        horizon_protocol::packets::play::BlockUpdate {
+            pos: [1, 64, 3],
+            state: 7,
+        },
+    )
+    .encode();
+    let level = horizon_protocol::viewed_levels::Level::Index(2);
+    let holding = Holding::start();
+    hub.send_to_holders(&[(0, None), (1, Some(level))], &body);
+    flush_all(hub.guests.iter().map(|g| &g.sender));
+    drop(holding);
+
+    let crate::lan::Out::Packets(direct) = direct_rx.try_recv().unwrap() else {
+        panic!("direct holder packet");
+    };
+    assert_eq!(direct, std::slice::from_ref(&body));
+    let crate::lan::Out::Packets(viewed) = viewed_rx.try_recv().unwrap() else {
+        panic!("viewed holder packet");
+    };
+    assert_eq!(viewed.len(), 1);
+    let mut reader = horizon_protocol::buf::Reader::new(&viewed[0]);
+    let id = reader.varint().unwrap();
+    let horizon_protocol::packets::play::Clientbound::CustomPayload(payload) =
+        horizon_protocol::packets::play::Clientbound::decode(id, reader.rest()).unwrap()
+    else {
+        panic!("viewed holder wrapper");
+    };
+    assert_eq!(payload.channel, horizon_protocol::viewed_levels::CHANNEL);
+    let horizon_protocol::viewed_levels::Message::Run {
+        level: got,
+        packets,
+    } = horizon_protocol::viewed_levels::Message::decode_in(
+        &payload.data,
+        horizon_protocol::viewed_levels::REVISION_3,
+    )
+    .unwrap()
+    else {
+        panic!("viewed holder run");
+    };
+    assert_eq!(got, level);
+    assert_eq!(
+        packets,
+        vec![(
+            horizon_protocol::ids::play::clientbound::BLOCK_UPDATE,
+            &body[1..],
+        )]
+    );
+}
+
+/// A light update reaches every direct holder with identical wire bytes.
+#[test]
+fn light_broadcast_reaches_direct_holders_once_in_order() {
+    let (mut hub, first_rx) = hub_with_a_guest();
+    let second_rx = add_broadcast_test_guest(&mut hub, 2);
+    for i in 0..hub.guests.len() {
+        hub.guests.update(i, |g| {
+            g.sent_chunks.insert((0, 0));
+        });
+    }
+    let mut world = World::new(horizon_world::registry::BlockStateId(0), 0);
+    let mut chunk = Chunk::empty(0, 0);
+    chunk.lit = true;
+    world.chunks.insert((0, 0), Arc::new(chunk));
+    world.light_log = Some(
+        [((0, 0), crate::section_mask::SectionMask::single(2))]
+            .into_iter()
+            .collect(),
+    );
+
+    hub.broadcast_light_changes(&mut world);
+
+    let packet = |rx: &std::sync::mpsc::Receiver<crate::lan::Out>| {
+        let crate::lan::Out::Packet(body) = rx.try_recv().unwrap() else {
+            panic!("light update");
+        };
+        let mut reader = horizon_protocol::buf::Reader::new(&body);
+        let id = reader.varint().unwrap();
+        assert!(matches!(
+            horizon_protocol::packets::play::Clientbound::decode(id, reader.rest()),
+            Ok(horizon_protocol::packets::play::Clientbound::LightUpdate(_))
+        ));
+        body
+    };
+    let first = packet(&first_rx);
+    let second = packet(&second_rx);
+    assert_eq!(first, second);
+    assert!(first_rx.try_recv().is_err());
+    assert!(second_rx.try_recv().is_err());
+}
 
 /// Queued one-shot fields wait out a change nobody sees, go in one built tag to
 /// every viewer, and are not sent again; a column sent whole doesn't lose them.
@@ -2316,6 +2472,105 @@ fn a_stab_keeps_the_move_behind_it_in_its_tick() {
     assert_eq!(g.position[0], before.0[0] + 0.3, "the move was not handled");
 }
 
+/// #17206's review: a rider's MoveVehicle and its ClientTickEnd in one drain.
+/// The hub hands the game the move and queues the tick-end reset behind it, so
+/// the game sets the rider's movement before the reset keeps it for the tick
+/// (vanilla runs both handlers in packet order on the main thread,
+/// `ServerGamePacketListenerImpl.handleMoveVehicle` then `handleClientTickEnd`).
+/// The reset used to run inline ahead of the queued move, leaving the flag set
+/// and a stale movement kept into the next tick.
+#[test]
+fn a_vehicle_move_and_its_tick_end_keep_packet_order() {
+    let (mut hub, _rx) = hub_with_a_guest();
+    hub.guests.update(0, |g| {
+        g.load_timeout = 0;
+        g.vehicle = Some(7);
+        // A move from an earlier tick, which the inline reset used to zero
+        // before the queued move of this drain ever ran.
+        g.known_movement = [0.9, 0.0, 0.0];
+        g.movement_this_tick = false;
+        g.inbox.push_back(InboxItem::uncredited(S::MoveVehicle(
+            play::MoveVehicleRequest {
+                position: [0.5, 64.0, 0.5],
+                yaw: 0.0,
+                pitch: 0.0,
+                on_ground: true,
+            },
+        )));
+        g.inbox.push_back(InboxItem::uncredited(S::ClientTickEnd(
+            horizon_protocol::packets::Empty,
+        )));
+    });
+    let mut world = World::new(horizon_world::registry::BlockStateId(0), 0);
+    let mut next_entity = 2;
+    let border = crate::worldborder::WorldBorder::default();
+    let mut ctx = TickCtx {
+        sea_level: 63,
+        world: &mut world,
+        entities: &[],
+        next_entity: &mut next_entity,
+        spawn: [0.5, 64.0, 0.5],
+        spawn_angle: [0.0; 2],
+        spawn_dimension: "minecraft:overworld",
+        difficulty: 2,
+        difficulty_locked: false,
+        clock_rate: 1.0,
+        tick_rate: 20.0,
+        tick_frozen: false,
+        tick_steps: Default::default(),
+        collision: None,
+        border: &border,
+        streaming: None,
+    };
+    let events = hub.drain_packets(&mut ctx);
+    // The move goes to the game first; the tick-end reset follows it in order.
+    let kinds: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            HostEvent::Packet(_, p) if matches!(&**p, S::MoveVehicle(_)) => Some("move"),
+            HostEvent::TickEnd(_) => Some("tick-end"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["move", "tick-end"],
+        "the reset follows the move in packet order: {kinds:?}"
+    );
+    // The hub deferred the movement reset (the stale move is still there for
+    // the game's dispatch to overwrite), but the position flag reset inline:
+    // no queued move bears on it.
+    assert_eq!(
+        hub.guests[0].known_movement,
+        [0.9, 0.0, 0.0],
+        "the movement reset waits for the queued move"
+    );
+    assert!(
+        !hub.guests[0].position_this_tick,
+        "the position flag reset inline"
+    );
+    // The game dispatches the move (sets the movement and the flag), then the
+    // queued tick end keeps that move for the tick and clears the flag.
+    let conn = hub.guests[0].conn;
+    hub.guests.update(0, |g| {
+        g.known_movement = [0.4, 0.0, 0.0];
+        g.movement_this_tick = true;
+    });
+    hub.client_tick_end(conn);
+    assert_eq!(
+        hub.guests[0].known_movement,
+        [0.4, 0.0, 0.0],
+        "the move's own tick keeps it"
+    );
+    assert!(!hub.guests[0].movement_this_tick);
+    // The next tick has no move of either: its tick end zeroes the movement.
+    hub.client_tick_end(conn);
+    assert_eq!(
+        hub.guests[0].known_movement, [0.0; 3],
+        "a client tick with no move of either has none"
+    );
+}
+
 /// STOP_SLEEPING goes to the game, which wakes the guest after the mods
 /// hear it (`player_bed_leave`); the move the client sent after it waits
 /// for the next tick, so it never runs while the guest still sleeps.
@@ -3279,4 +3534,109 @@ fn departing_guest_releases_multiplayer_wire_cache_when_batches_are_empty() {
     let [(_, sections_solo), (heights_solo, _)] = hub.encoder.cache_census();
     assert_eq!(heights_solo, 0);
     assert!(sections_solo < sections_multiplayer);
+}
+/// A mod's view centre (horizon-rust/horizon#19219): the chunk tracking moves there, the client
+/// is told the new cache centre, the chunks around it load as the player's own do, and the
+/// player stays where they are. `None` puts the tracking back on the player.
+#[test]
+fn a_view_centre_moves_the_chunk_tracking_but_not_the_player() {
+    let (mut hub, rx) = hub_with_a_guest();
+    let uuid = hub.guests[0].uuid;
+    let own = hub.guests[0].chunk();
+    let position = hub.guests[0].position;
+    hub.update_view(0, false);
+    let centres = |rx: &std::sync::mpsc::Receiver<crate::lan::Out>| -> Vec<(i32, i32)> {
+        rx.try_iter()
+            .flat_map(|out| match out {
+                crate::lan::Out::Packet(body) => vec![body],
+                crate::lan::Out::Packets(bodies) => bodies,
+                _ => Vec::new(),
+            })
+            .filter_map(|body| {
+                let mut reader = horizon_protocol::buf::Reader::new(&body);
+                let id = reader.varint().unwrap();
+                match play::Clientbound::decode(id, &body[reader.position()..]) {
+                    Ok(C::SetChunkCacheCenter(p)) => Some((p.x, p.z)),
+                    _ => None,
+                }
+            })
+            .collect()
+    };
+    let _ = centres(&rx);
+
+    assert_eq!(hub.set_view_center(uuid, Some((40, -12))), Ok(()));
+    hub.update_view(0, false);
+    assert_eq!(hub.guests[0].center, Some((40, -12)));
+    assert_eq!(centres(&rx), vec![(40, -12)]);
+    assert_eq!(hub.guests[0].position, position);
+    assert_eq!(hub.guests[0].ticket_chunk(), own);
+    let loading: Vec<_> = hub.loading_chunks(|_| true).collect();
+    assert!(loading.contains(&own) && loading.contains(&(40, -12)));
+    assert_eq!(hub.view_center(uuid), Some((40, -12)));
+
+    // Refused, changing nothing.
+    assert_eq!(
+        hub.set_view_center(uuid, Some((1_875_001, 0))),
+        Err(ViewCenterRefusal::OutOfRange)
+    );
+    assert_eq!(
+        hub.set_view_center(uuid + 1, Some((0, 0))),
+        Err(ViewCenterRefusal::NotOnline)
+    );
+    assert_eq!(hub.view_center(uuid), Some((40, -12)));
+
+    assert_eq!(hub.set_view_center(uuid, None), Ok(()));
+    hub.update_view(0, false);
+    assert_eq!(hub.guests[0].center, Some(own));
+    assert_eq!(centres(&rx), vec![own]);
+}
+
+/// `ServerGamePacketListenerImpl.handleMovePlayer` while a teleport awaits its accept
+/// (`updateAwaitingTeleport`): the move's position is ignored but its turn is not,
+/// `absSnapRotationTo(Mth.wrapDegrees(yRot), Mth.wrapDegrees(xRot))` (`Entity` clamps the pitch
+/// to 90 degrees). Expected values worked out from `Mth.wrapDegrees`, not from the code.
+#[test]
+fn a_moves_turn_still_counts_while_a_teleport_awaits() {
+    let (mut hub, _rx) = hub_with_a_guest();
+    hub.guests.update(0, |g| g.load_timeout = 0);
+    let mut world = floor_at(0);
+    hub.teleport(0, Some([5.0, 70.0, 5.0]));
+    assert!(hub.guests[0].awaiting_teleport.is_some());
+    let at = hub.guests[0].position;
+    let turned = |hub: &Hub| (hub.guests[0].yaw, hub.guests[0].pitch);
+    let turn = |yaw, pitch| {
+        S::MovePlayerRot(play::MovePlayerRot {
+            yaw,
+            pitch,
+            flags: 0,
+        })
+    };
+    // 450 degrees is 90; a pitch past the top clamps to 90.
+    tick_packet(&mut hub, &mut world, turn(450.0, 100.0));
+    assert_eq!(turned(&hub), (90.0, 90.0));
+    // -270 wraps to 90 as well, and -540 to -180; the pitch keeps what it is in range.
+    tick_packet(&mut hub, &mut world, turn(-540.0, -30.0));
+    assert_eq!(turned(&hub), (-180.0, -30.0));
+    // A move with a position turns the player too and still does not move them.
+    hub.guests.update(0, |g| g.position_this_tick = false);
+    tick_packet(
+        &mut hub,
+        &mut world,
+        S::MovePlayerPosRot(play::MovePlayerPosRot {
+            x: 50.0,
+            y: 70.0,
+            z: 50.0,
+            yaw: 10.0,
+            pitch: 20.0,
+            flags: 0,
+        }),
+    );
+    assert_eq!(turned(&hub), (10.0, 20.0));
+    assert_eq!(hub.guests[0].position, at);
+    // A move without a turn keeps the one they have, and the teleport is still awaited.
+    hub.guests.update(0, |g| g.position_this_tick = false);
+    tick_guest_move(&mut hub, &mut world, [50.0, 70.0, 50.0], 0);
+    assert_eq!(turned(&hub), (10.0, 20.0));
+    assert!(hub.guests[0].awaiting_teleport.is_some());
+    assert!(hub.guests[0].left_reason.is_empty());
 }

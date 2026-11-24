@@ -184,6 +184,7 @@ impl Launcher {
             restyle: true,
             background_error: None,
             location_target: None,
+            location_real_target: horizon_launcher::data_location::linked_data_folder_target(),
             location_error: location_page::startup_error(),
             location_note: location_page::startup_note(),
             args_input: line_edit::LineEdit::new(settings.game_args.clone(), 1024, 38),
@@ -208,6 +209,8 @@ impl Launcher {
             client_error: None,
             client_started: None,
             client_home: None,
+            client_build: None,
+            api_notice: Default::default(),
             crash: None,
             servers: servers_page::Servers::new(),
             internet: internet::Internet::new(),
@@ -260,7 +263,6 @@ impl Launcher {
             list_hover: None,
             list_menu: None,
             home_strip: Default::default(),
-            client_since: None,
             instance_mods: Default::default(),
             mod_preview: Default::default(),
             project_icons: Default::default(),
@@ -616,8 +618,7 @@ impl Launcher {
         {
             return;
         }
-        self.update_install = Some(release.tag.clone());
-        self.start_install(&release, None);
+        self.queue_install(release, InstallSource::Update);
     }
 
     /// What installed native build `version` was made from (`native_status::Build`), read once.

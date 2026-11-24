@@ -729,9 +729,10 @@ impl Game<'_> {
     /// `vehicle_health` (only riding a mount), `contextual_info_bar` (the
     /// mount's jump bar, the locator bar or the experience bar, with the level
     /// number), `player_health` (the health, armor, food and air rows, drawn in
-    /// one pass), `selected_item_name`, `sleep_overlay`, `overlay_message`
-    /// (the action bar), `title`, `scoreboard_sidebar`, `subtitle_overlay`,
-    /// `chat` and `tab_list`. A layer F1 hides fires nothing, and the chat
+    /// one pass), `selected_item_name` or, for a spectator, `spectator_tooltip`
+    /// (the spectator menu's prompt or selected entry), `sleep_overlay`,
+    /// `overlay_message` (the action bar), `title`, `scoreboard_sidebar`,
+    /// `subtitle_overlay`, `chat` and `tab_list`. A layer F1 hides fires nothing, and the chat
     /// screen draws the focused chat itself, so `chat` is only the unfocused
     /// lines. The camera overlays and the debug screen are not layers here:
     /// they are not drawn in this pass. Draw with `native_fill`, `native_text`
@@ -1022,6 +1023,15 @@ impl Game<'_> {
     ) {
         Self::fire_standalone_models(context, models, forms);
     }
+    /// Entity-context outlines and collisions for vanilla blocks, declared in code as a
+    /// `data/<id>/horizon/vanilla_block_shapes/*.json` file declares them. Asked once at
+    /// start, on every side, before any resource loads; dispatch names the declaring mod.
+    pub(in crate::game) fn native_vanilla_block_shapes(
+        context: &mod_api::RegistrationContext,
+        shapes: &mut Vec<mod_api::Answered<mod_api::VanillaBlockShapes>>,
+    ) {
+        Self::fire_vanilla_block_shapes(context, shapes);
+    }
     /// The player changed setting `key` of mod `mod_id` on its page in Options > Mods; the new
     /// value is kept already.
     pub(in crate::game) fn native_setting_changed(&mut self, mod_id: &str, key: &str) {
@@ -1221,12 +1231,9 @@ impl Game<'_> {
     /// `&self`, so it reads and draws only. The Win and Options screens call
     /// it on their own path, after their drawing.
     ///
-    /// It does not fire for the screens drawn over gameplay after it (a
-    /// server dialog, the server pack, link and code-of-conduct prompts, a
-    /// book, a sign editor): those keep `Screen::Playing`, which it skips (the
-    /// server pack prompt hides an open screen too, and that screen does not
-    /// fire under it), and draw over what it drew, while vanilla's
-    /// `ScreenEvent.Render.Post` fires for them. The title's own screens
+    /// The active book or sign editor fires Post at its own render boundary,
+    /// including when Pre cancelled. Server dialogs and prompts do not fire
+    /// this hook. The title's own screens
     /// (`title`, `world_select`, `world_create`, `multiplayer`…) fire it too,
     /// their `screen.id` from the title state machine and the whole window
     /// their `rect`, and no dialog or prompt over them.
@@ -1252,11 +1259,9 @@ impl Game<'_> {
     /// and the pack list opened from the title screen count, with no player
     /// and no `menu`; the title's own screens, their
     /// `screen.id` from the title state machine). It does not fire on the
-    /// connect and loading screens, nor for a server
-    /// dialog, the server pack, link and code-of-conduct prompts, a book or a
-    /// sign editor drawn over gameplay, nor while a world loads or saves: the
-    /// click there stays the game's own. A gamepad click or a click the
-    /// keyboard's focus sends is not the mouse and fires nothing.
+    /// connect and loading screens, nor for server dialogs or prompts.
+    /// The active book or sign editor receives it, including clicks routed
+    /// there from the controller or keyboard focus.
     pub(in crate::game) fn native_screen_mouse_button_pressed_pre(
         &self,
         screen: &ScreenView<'_>,
@@ -1318,12 +1323,9 @@ impl Game<'_> {
     /// while a screen of the game's or the title's is open (Options and the
     /// pack list opened from the title screen count, with no player and no
     /// `menu`; the title's own). It
-    /// does not fire on the connect and loading
-    /// screens, nor for a server dialog, the server pack, link and
-    /// code-of-conduct prompts, a book or a sign editor drawn over gameplay,
-    /// nor while a world loads or saves: the scroll there stays the game's
-    /// own. A wheel a gamepad or the keyboard's focus sends is not the mouse
-    /// and fires nothing.
+    /// does not fire on the connect and loading screens or server dialogs and
+    /// prompts. The active book or sign editor receives it, including wheels
+    /// routed there from a controller.
     pub(in crate::game) fn native_screen_mouse_scrolled_pre(
         &self,
         screen: &ScreenView<'_>,
@@ -1349,10 +1351,9 @@ impl Game<'_> {
     /// keys and the narrator — and while a screen of the game's or the title's
     /// is open (Options and the pack list opened from the title screen count,
     /// with no player and no `menu`; the title's own). It does
-    /// not fire on the connect and loading screens, nor for a server dialog, the server pack,
-    /// link and code-of-conduct prompts, a book or a sign editor drawn over
-    /// gameplay, nor while a world loads or saves: the key there stays the
-    /// game's own. A cancelled press's release still runs, and its characters
+    /// not fire on the connect and loading screens, nor for server dialogs or
+    /// prompts. The active book or sign editor receives it. A cancelled press's
+    /// release still runs, and its characters
     /// are GLFW's separate char callback and still come; see
     /// `native_screen_char_typed_pre`.
     pub(in crate::game) fn native_screen_key_pressed_pre(
@@ -1385,7 +1386,8 @@ impl Game<'_> {
     ///
     /// `field` is `None` with no box focused, and for the boxes that keep
     /// their own validators: Options' and World Options' fields, the game
-    /// rules' and the block editor's. `cursor` and `highlight` count Unicode
+    /// rules', block editor's and book and sign editors'. The latter can be
+    /// read with `ClientHost::editor_overlay`. `cursor` and `highlight` count Unicode
     /// scalar characters, and a character sees the box as the one before it
     /// left it. Change `value`, `cursor` or `highlight` and the box takes the
     /// change, cancelled or not, so cancel to replace the character yourself.
@@ -1840,6 +1842,20 @@ impl Game<'_> {
         status: i32,
     ) {
         self.fire_resource_pack_status(player, name, status);
+    }
+    /// `native_resource_pack_status` with `pack`, the id of the pack it answers
+    /// (`ServerboundResourcePackPacket.id`, the id a pack pushed by
+    /// `player.push_resource_pack` was given). Heard just before the version
+    /// without it, which keeps its arguments and its firing point; also heard
+    /// while the player is dead.
+    pub(in crate::game) fn native_resource_pack_status_v2(
+        &mut self,
+        player: u128,
+        name: &str,
+        pack: u128,
+        status: i32,
+    ) {
+        self.fire_resource_pack_status_v2(player, name, pack, status);
     }
     /// A server player places a hanging entity: an item frame
     /// (`minecraft:item_frame`, `minecraft:glow_item_frame`), a painting
@@ -2354,15 +2370,17 @@ impl Game<'_> {
     ) {
         self.fire_player_item_frame_change(player, name, entity_id, action, item, rotation);
     }
-    /// Mending repaired a server player's item with experience from an orb. `repair` is durability
-    /// restored and `experience` is the orb's value. Server-side.
+    /// Mending is about to repair a server player's item with experience from an
+    /// orb. `repair` is the durability vanilla would restore and `experience`
+    /// the orb's value; what a listener leaves in them is what the game applies.
+    /// Server-side.
     pub(in crate::game) fn native_player_item_mend(
         &mut self,
         player: u128,
         name: &str,
         item: &str,
-        repair: u32,
-        experience: u32,
+        repair: &mut u32,
+        experience: &mut u32,
     ) {
         self.fire_player_item_mend(player, name, item, repair, experience);
     }
@@ -4477,6 +4495,39 @@ impl Game<'_> {
         }
         Some(self.mod_sounds.queue(sound, after))
     }
+    /// Plays a client mod's own samples for this player only, as `play_local_sound` plays an
+    /// event: signed 16-bit PCM, interleaved, `channels` (1 or 2) to a frame at `rate` frames a
+    /// second (8000 to 192000), beginning `start` frames in. `sound` says how it plays; its event
+    /// names the play and isn't loaded. None, with nothing played, on a server, for a value out of
+    /// range, an empty clip, a `start` past its end or more than `MAX_PCM_SAMPLES` samples.
+    pub(in crate::game) fn play_local_pcm(
+        &self,
+        sound: &SoundPlay,
+        samples: &[i16],
+        rate: u32,
+        channels: u16,
+        start: u32,
+        after: u32,
+    ) -> Option<SoundRef> {
+        use crate::game::native_local_sounds::MAX_PCM_SAMPLES;
+        let frames = samples.len() / usize::from(channels.max(1));
+        if !self.native_window()
+            || !local_sound_ok(sound, after)
+            || !(1..=2).contains(&channels)
+            || !(8_000..=192_000).contains(&rate)
+            || samples.is_empty()
+            || samples.len() > MAX_PCM_SAMPLES
+            || !samples.len().is_multiple_of(usize::from(channels))
+            || start as usize >= frames
+        {
+            return None;
+        }
+        let samples = samples.iter().map(|&s| f32::from(s) / 32768.0).collect();
+        Some(
+            self.mod_sounds
+                .queue_pcm(sound, samples, rate, channels, u64::from(start), after),
+        )
+    }
     /// The particles alive in the client's level (`ParticleEngine.countParticles`): 0 once
     /// a clear is asked, and on a server.
     pub(in crate::game) fn particle_count(&self) -> u32 {
@@ -4680,6 +4731,11 @@ impl Game<'_> {
         self.native_mod_screen
             .as_deref()
             .filter(|_| self.screen == Screen::Mod)
+    }
+    /// Active Options page name (`"key_binds"`, `"controls"`, `"main"`, ...) when
+    /// `Screen::Options` is open, or `None` otherwise.
+    pub(in crate::game) fn options_page(&self) -> Option<String> {
+        options_page_name(self.screen, self.ui.options.page())
     }
     /// The open menu's title (the block's name, or the one it was given),
     /// as plain text.
@@ -4920,6 +4976,51 @@ impl Game<'_> {
     ) -> Result<(), String> {
         let item = mod_api::__private::item_key_id(item).ok_or("unknown item key")?;
         self.recipe_give(item, count)
+    }
+}
+
+fn options_page_name(screen: Screen, page: horizon_client::options_ui::Page) -> Option<String> {
+    if screen != Screen::Options {
+        return None;
+    }
+    use horizon_client::options_ui::Page;
+    Some(match page {
+        Page::Main => "main",
+        Page::Video => "video",
+        Page::Sound => "sound",
+        Page::Controls => "controls",
+        Page::KeyBinds => "key_binds",
+        Page::Mouse => "mouse",
+        Page::Chat => "chat",
+        Page::Accessibility => "accessibility",
+        Page::Language => "language",
+        Page::Font => "font",
+        Page::Packs => "packs",
+        Page::Mods => "mods",
+        Page::Graphics => "graphics",
+        Page::ShaderPacks => "shader_packs",
+        _ => "other",
+    }
+    .to_owned())
+}
+
+#[cfg(test)]
+mod options_page_tests {
+    use super::*;
+
+    #[test]
+    fn options_page_returns_none_outside_options_and_names_active_page() {
+        use horizon_client::options_ui::Page;
+        assert_eq!(options_page_name(Screen::Playing, Page::KeyBinds), None);
+        assert_eq!(options_page_name(Screen::Paused, Page::Main), None);
+        assert_eq!(
+            options_page_name(Screen::Options, Page::KeyBinds).as_deref(),
+            Some("key_binds")
+        );
+        assert_eq!(
+            options_page_name(Screen::Options, Page::Controls).as_deref(),
+            Some("controls")
+        );
     }
 }
 

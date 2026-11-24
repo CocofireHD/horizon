@@ -43,6 +43,7 @@ impl Game<'_> {
         }
         if !r.loaded_sent {
             r.loaded_sent = true;
+            r.status.clear();
             self.send(S::PlayerLoaded(Empty));
         }
         // LevelLoadingScreen.onClose.
@@ -207,7 +208,6 @@ impl Game<'_> {
         // Player.tick's sleep counter (the darkening and the wake-up fade).
         self.sleep_timer =
             super::super::tick_sleep_timer(self.sleep_timer, self.sleeping.is_some());
-        let stick = self.pad_move();
         if self.player.is_none() {
             return Ok(());
         }
@@ -217,6 +217,12 @@ impl Game<'_> {
             .as_ref()
             .is_some_and(|r| r.level_load.is_active());
         let playing = self.screen == Screen::Playing && !loading && !self.dialog_open();
+        let external_server = self.input_is_external_multiplayer();
+        let (stick, bypass_square_movement) = if playing {
+            self.input_move_for_tick(external_server)
+        } else {
+            (None, false)
+        };
         let held = |action| playing && self.keys.held(action);
         let mut keys = Keys {
             forward: held(Action::Forward),
@@ -229,12 +235,12 @@ impl Game<'_> {
             sprint_suppressed: false,
             analog: None,
         }
-        .with_stick(stick.filter(|_| playing));
+        .with_stick(stick);
         // On a server (not this game's own server thread), the stick moves as the keys it sets do
         // (`KeyboardInput.tick`: 8 directions, full speed). The server only hears those keys
         // (`ServerboundPlayerInputPacket`), and an anticheat that predicts from them pulls back
         // a player moving at the stick's own angle and speed.
-        if self.integrated.is_none() && self.server_address().is_some() {
+        if external_server {
             keys.analog = None;
         }
         let keys = self.mod_movement_keys(keys);
@@ -253,10 +259,18 @@ impl Game<'_> {
         } else {
             Keys::default()
         };
+        // A later movement-input hook may replace the stick with keys or with its own axes.
+        // The opt-out belongs only to the analog direction selected by the controller hook.
+        let bypass_square_movement = bypass_square_movement
+            && !external_server
+            && keys.analog.is_some()
+            && keys.analog == stick;
         // The held lead's end eases from the look at the start of the tick
         // (`yRotO`/`xRotO`), as the local tick does; `tick` returns before it
         // reaches its own write when this window is a server client.
         self.rope_rot_old = (self.yaw, self.pitch);
+        // Before the tick, and a rider's toggle in `remote_ride`.
+        let was_flying = self.player.as_ref().is_some_and(|p| p.flying);
         // A passenger moves with its vehicle (Entity.rideTick), not by itself.
         let riding = self.screen != Screen::Dead && self.remote_ride(keys, sprint_window)?;
         // The server sends no passenger's position: they sit where their
@@ -283,7 +297,6 @@ impl Game<'_> {
             [player.velocity.x, player.velocity.y, player.velocity.z],
             [player.position.x, player.position.y, player.position.z],
         );
-        let was_flying = player.flying;
         self.sync_player_body();
         // LivingEntity.tickDeath: the local player counts its deathTime once
         // per client tick while dead (the camera's death roll and zoom).
@@ -319,7 +332,7 @@ impl Game<'_> {
                         .map(|m| (m.id, m.bounds())),
                 );
             }
-            MotionWorld {
+            let mut motion = MotionWorld {
                 entities: &entity_collisions,
                 player,
                 scene: &mut self.world,
@@ -331,8 +344,12 @@ impl Game<'_> {
                 damage_hooks: &self.damage_hooks,
                 tag_items: None,
                 block_registries: None,
+            };
+            if bypass_square_movement {
+                motion.controlled_simulation_tick_with_linear_stick(keys, sprint_window)?;
+            } else {
+                motion.controlled_simulation_tick_with_sprint_window(keys, sprint_window)?;
             }
-            .controlled_simulation_tick_with_sprint_window(keys, sprint_window)?;
         } else {
             // LivingEntity.baseTick counts hurtTime down for a dead or riding
             // player too (controlled_simulation_tick does it otherwise): left
@@ -358,6 +375,16 @@ impl Game<'_> {
                 // frostbite overlay shows it (#8156).
                 passenger.passenger_block_effects_tick()?;
             }
+        }
+        // Player.tick holds the player at the world's edge after the move: X
+        // and Z clamp, Y does not (Player.java:264-265). A passenger is left
+        // alone: Entity.rideTick runs Player.tick and only then seats the rider
+        // on the vehicle (`Entity.java:2433-2439`), so the seat's position is
+        // what survives the tick, and clamping here would pull a rider off a
+        // seat that legally sits past the edge.
+        if !riding {
+            player.position.x = player.position.x.clamp(-2.9999999E7, 2.9999999E7);
+            player.position.z = player.position.z.clamp(-2.9999999E7, 2.9999999E7);
         }
         // The server decides fire the window cannot predict (blaze fireballs,
         // fire aspect, lightning): Entity.isOnFire reads the synched flag, so

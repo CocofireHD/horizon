@@ -29,8 +29,9 @@ def tar_members(archive: bytes) -> list[tuple]:
 
 
 # Packing the Linux fixture (`SdkAssetTests.out`) runs a process pool, and Python can't start one on Windows while
-# `sys.platform` says "linux" (it takes the POSIX spawn path). CI runs these on Linux, where the fixture is native.
-packs_the_linux_fixture = unittest.skipIf(os.name == "nt", "packs the Linux fixture through a process pool")
+# `sys.platform` says "linux" (it takes the POSIX spawn path). The fixture's `.so` names and Linux target triple are
+# also only what the tool expects on Linux. CI runs these on Linux, where the fixture is native.
+packs_the_linux_fixture = unittest.skipUnless(sys.platform.startswith("linux"), "packs the Linux fixture")
 
 
 def write_build_data(root: Path, identity: dict | None = None, commit: str = COMMIT) -> None:
@@ -54,6 +55,32 @@ def write_build_data(root: Path, identity: dict | None = None, commit: str = COM
 
 
 class StageToolTests(unittest.TestCase):
+    def test_tracked_blobs_drains_tar_padding_before_waiting_for_git(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive_path = root / "fixture.tar"
+            content = b"tracked file contents"
+            with tarfile.open(archive_path, "w") as archive:
+                member = tarfile.TarInfo("tracked.txt")
+                member.size = len(content)
+                archive.addfile(member, io.BytesIO(content))
+            with archive_path.open("ab") as archive:
+                # Use more padding than a pipe can buffer, so the writer needs the reader to finish.
+                archive.write(bytes(2 * 1024 * 1024))
+
+            pipe_archive = (
+                "from pathlib import Path; import sys; "
+                "sys.stdout.buffer.write(Path(sys.argv[1]).read_bytes())"
+            )
+            real_popen = subprocess.Popen
+
+            def archive_process(_command, **kwargs):
+                return real_popen([sys.executable, "-c", pipe_archive, str(archive_path)],
+                                  stderr=subprocess.DEVNULL, **kwargs)
+
+            with patch.object(prebuilt_game.subprocess, "Popen", side_effect=archive_process):
+                self.assertEqual(list(prebuilt_game.tracked_blobs(root, COMMIT)), [("tracked.txt", content)])
+
     def test_prebuilt_tool_stages_fresh_tracked_copy_without_cargo(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -956,6 +983,9 @@ if __name__ == "__main__":
     unittest.main()
 
 
+# `start` bundles the installation into a Horizon.app and probes it on macOS, which the stubbed `subprocess.run`
+# these tests give it cannot answer; every other platform takes the plain executable's path.
+@unittest.skipIf(sys.platform == "darwin", "start bundles and probes a Horizon.app on macOS")
 class SmokeStartTests(unittest.TestCase):
     def test_only_expected_missing_resources_exit_is_accepted_and_homes_are_scratch(self):
         from types import SimpleNamespace

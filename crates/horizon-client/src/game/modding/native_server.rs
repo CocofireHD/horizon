@@ -23,8 +23,8 @@ use super::{Dim, Game, commands::execute, respawn_anchor::RespawnConfig};
 use crate::game::level_control_hooks::LevelControl;
 pub(super) use argument_kinds::{CommandArguments, command_arguments};
 use argument_kinds::{
-    UNCENTERED, argument_type, custom_value, dimension_value, nbt_value, parsed_type, parser,
-    positional_value, resource_parser,
+    TOKEN, UNCENTERED, argument_type, custom_value, dimension_value, nbt_value, parsed_type,
+    parser, positional_value, resource_parser,
 };
 use mod_api::__private::game::*;
 pub(super) use registered_commands::NativeCommandState;
@@ -111,9 +111,16 @@ fn usage_nodes(
             .transpose()?;
         let builtin =
             resource.or_else(|| parser(kind).map(|(parser, properties, _)| (parser, properties)));
+        let mut token = false;
         let (parser, properties, greedy, custom) = match builtin {
             Some((parser, properties)) => (parser, properties, kind == "text", None),
             None => {
+                // `token:<id>` reads the registered type `<id>` as one space-free token.
+                // A type registered under the full `token:...` id keeps it.
+                let (kind, as_token) = match kind.strip_prefix("token:") {
+                    Some(id) if !custom.contains_key(kind) => (id, true),
+                    _ => (kind, false),
+                };
                 let Some(argument) = custom.get(kind) else {
                     return Err(format!("`{usage}`: unknown kind `{kind}`"));
                 };
@@ -122,7 +129,17 @@ fn usage_nodes(
                 )
                 .map_err(|_| format!("`{usage}`: argument type `{kind}` panicked"))?
                 {
-                    mod_api::CommandArgumentKind::Word => (json!({"type": "word"}), false),
+                    // The wire says `word`: a client that does not know the type parses one
+                    // word, and the node's `token` marker (below) makes the server read a token.
+                    mod_api::CommandArgumentKind::Word => {
+                        token = as_token;
+                        (json!({"type": "word"}), false)
+                    }
+                    mod_api::CommandArgumentKind::Greedy if as_token => {
+                        return Err(format!(
+                            "`{usage}`: `token:{kind}` needs a Word type, `{kind}` takes the rest of the line"
+                        ));
+                    }
                     mod_api::CommandArgumentKind::Greedy => (json!({"type": "greedy"}), true),
                     _ => {
                         return Err(format!(
@@ -142,11 +159,15 @@ fn usage_nodes(
         if kind == "vec3_uncentered" {
             node[UNCENTERED] = true.into();
         }
-        // A registered type goes out as a Brigadier string an unmodded client can read; it and
-        // the free `id`, which has no list of its own, ask the server (the mods' `tab_complete`).
-        if custom.is_some() || kind == "id" {
+        // A registered type goes out as a Brigadier string an unmodded client can read; it, the
+        // free `id`, which has no list of its own, and `player_name`, which completes names but no
+        // selectors, ask the server (the mods' `tab_complete`).
+        if custom.is_some() || kind == "id" || kind == "player_name" {
             if let Some(id) = custom {
                 node["custom_argument"] = id.into();
+            }
+            if token {
+                node[TOKEN] = true.into();
             }
             node["suggestions"] = "minecraft:ask_server".into();
         }
@@ -562,7 +583,9 @@ impl Game<'_> {
         let mut state = ScopedPlayerState::new(self.motion, self.items(), setup)?;
         let host = self.lan.as_mut().expect("validated fake's host");
         host.hub.guests.update(gi, |guest| state.swap(guest));
-        let play = host.play.insert(conn, Default::default());
+        let play = host
+            .play
+            .insert(conn, crate::game::lan_actions::GuestPlay::scoped());
         let menus = host.menus.insert(conn, Default::default());
         // A hook that panics during the action must not leave the fake on the scoped body: its
         // own body, inventory, menus and play state are put back before the panic goes on.
@@ -2195,6 +2218,10 @@ impl Game<'_> {
             let ty = parsed_type(&self.ui.dispatcher.0, &context.nodes, argument.range);
             let value = match argument.value {
                 Arg::Str(text) if matches!(ty, Some(ArgType::Nbt)) => nbt_value(&text)?,
+                // A `player_name` argument takes a name, never a selector.
+                Arg::Entity(_) if matches!(ty, Some(ArgType::GameProfile)) => {
+                    return Err(err("argument.entity.notfound.player", &[]));
+                }
                 Arg::Str(value) => Value::String(value),
                 Arg::Int(value) => Value::Integer(value),
                 Arg::Double(value) => Value::Number(value),
@@ -3326,6 +3353,48 @@ mod tests {
     }
 
     #[test]
+    fn the_player_name_kind_completes_names_only_and_refuses_a_selector() {
+        let (tree, _, problems) = tree(&[mod_api::Command::new("seen <who:player_name>")]);
+        assert!(problems.is_empty(), "{problems:?}");
+        let who = &tree["children"]["seen"]["children"]["who"];
+        assert_eq!(who["parser"], "minecraft:game_profile");
+        assert_eq!(who["suggestions"], "minecraft:ask_server");
+
+        let mut dispatcher = Dispatcher::new();
+        register_dispatcher(
+            &mut dispatcher,
+            &tree,
+            "native_mod_command",
+            &command_arguments(),
+        );
+        let registries = horizon_client::command::Registries {
+            players: vec!["Alex".into(), "Steve".into()],
+            ..Default::default()
+        };
+        let typed = "seen ";
+        let parse = dispatcher.parse(typed, &registries);
+        let (_, suggestions) = dispatcher.suggestions(&parse, typed.len(), &registries);
+        let texts: Vec<_> = suggestions.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["Alex", "Steve"], "no selector is offered");
+        let parsed = dispatcher.parse("seen Alex", &registries);
+        let (context, _) = parsed.executable().unwrap();
+        assert_eq!(
+            context.get("who"),
+            Some(&Arg::Custom {
+                kind: argument_kinds::MOD_ID.into(),
+                value: "Alex".into(),
+            })
+        );
+        assert!(
+            dispatcher
+                .parse("seen @p", &registries)
+                .executable()
+                .is_err(),
+            "a selector is not a name"
+        );
+    }
+
+    #[test]
     fn the_id_kind_reads_a_free_identifier_with_no_registry() {
         let (tree, _, problems) = tree(&[mod_api::Command::new("map fullrender <world:id>")]);
         assert!(problems.is_empty(), "{problems:?}");
@@ -3433,6 +3502,67 @@ mod tests {
         let (range, suggestions) = dispatcher.suggestions(&parse, typed.len(), &registries);
         assert_eq!(range, (8, typed.len()));
         assert_eq!(suggestions[0].apply(typed), "replace dirt");
+    }
+
+    /// A test mod's account argument: one token, so `*` and `**` are taken as typed.
+    struct TokenArgument;
+
+    impl mod_api::CommandArgumentType for TokenArgument {
+        fn kind(&self) -> mod_api::CommandArgumentKind {
+            mod_api::CommandArgumentKind::Word
+        }
+
+        fn parse(&self, input: &str) -> Result<String, mod_api::CommandArgumentError> {
+            Ok(input.to_owned())
+        }
+
+        fn suggest(
+            &self,
+            _: Option<&mod_api::CommandSender>,
+            _: &str,
+        ) -> Vec<mod_api::CommandSuggestion> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_token_argument_goes_out_as_a_word_and_is_read_as_a_token_by_the_server() {
+        let arguments: CommandArguments = HashMap::from([(
+            "test:account".into(),
+            Arc::new(TokenArgument) as Arc<dyn mod_api::CommandArgumentType>,
+        )]);
+        let (tree, _, problems) = super::command_tree(
+            &[mod_api::Command::new(
+                "eco give <who:token:test:account> <amount:integer>",
+            )],
+            |_| false,
+            &arguments,
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        let who = &tree["children"]["eco"]["children"]["give"]["children"]["who"];
+        assert_eq!(who["parser"], "brigadier:string");
+        assert_eq!(who["properties"]["type"], "word");
+        assert_eq!(who["token"], true);
+        // The same type without the prefix stays a word.
+        let (plain, _, problems) = super::command_tree(
+            &[mod_api::Command::new("eco give <who:test:account>")],
+            |_| false,
+            &arguments,
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(plain["children"]["eco"]["children"]["give"]["children"]["who"]["token"].is_null());
+        let mut dispatcher = Dispatcher::new();
+        register_dispatcher(&mut dispatcher, &tree, "native_mod_command", &arguments);
+        let registries = horizon_client::command::Registries::default();
+        let parsed = dispatcher.parse("eco give ** 7", &registries);
+        let (context, _) = parsed.executable().unwrap();
+        assert_eq!(
+            context.get("who"),
+            Some(&Arg::Custom {
+                kind: "test:account".into(),
+                value: "**".into(),
+            })
+        );
     }
 
     /// A type whose completion mixes one the text can hold with one it cannot.
@@ -5118,6 +5248,45 @@ pub(super) mod fake_action_tests {
                 .unwrap();
             assert_eq!(rod.outcome, ActionOutcome::Consumed, "the rod casts");
             assert!(game.hook.is_none(), "no hook is left for nobody to reel in");
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn scoped_fake_player_attack_starts_fully_charged() {
+        use super::super::native_entity_refs::tests::with_game;
+        with_game(|game| {
+            let (player, ..) = fake(game, None, 0);
+            let kind = game.res.mob_types().get("minecraft:cow").unwrap().clone();
+            game.mobs.push(horizon_client::mobs::Mob::new(
+                5001,
+                kind,
+                horizon_core::geometry::Vec3::new(2.0, 64.0, 0.5),
+                0.0,
+            ));
+            let target = game.entity(5001).unwrap();
+            let setup = mod_api::PlayerActionSetup::new(
+                Some(crate::game::api_values::test_snapshot(&ItemStack::new(
+                    "minecraft:diamond_sword",
+                    1,
+                ))),
+                [0.5, 64.0 + f64::from(1.62_f32), 0.5],
+                -90.0,
+                0.0,
+                false,
+            );
+            let result = player
+                .perform_action_scoped(game, PlayerAction::Attack { target }, setup)
+                .unwrap();
+            assert_eq!(result.outcome, ActionOutcome::Consumed);
+            let cow = game.mobs.iter().find(|m| m.id == 5001).unwrap();
+            // A fully charged diamond sword deals 7.0 damage to a 10.0-HP cow (leaving 3.0);
+            // an uncharged attack at attack_ticks == 0 would deal only a small fraction.
+            assert!(
+                (cow.health - 3.0).abs() < 0.01,
+                "expected full-charge diamond sword hit leaving 3.0 HP, got {}",
+                cow.health
+            );
         });
     }
 
