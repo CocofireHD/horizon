@@ -313,3 +313,22 @@ fn opening_a_screen_releases_mod_holds() {
         ));
     });
 }
+
+/// `Gui.handleKeybinds` opens the chat screen from key.chat (T) and key.command (`/`) only: no
+/// vanilla `KeyMapping` defaults to Enter, and a key with no mapping reaches the client unchanged,
+/// so Enter in play must leave the world as it is (#20879).
+#[test]
+#[ignore = "daily"]
+fn enter_opens_no_chat_where_t_opens_the_message_chat() {
+    with_pressing_game(|game, _packets, _triggered| {
+        game.key_pressed(winit::keyboard::KeyCode::Enter, winit::keyboard::KeyCode::Enter)
+            .unwrap();
+        assert_eq!(game.screen, Screen::Playing, "Enter opened a screen");
+        assert!(game.ui.chat_screen.is_none(), "Enter opened the chat");
+        game.key_pressed(winit::keyboard::KeyCode::KeyT, winit::keyboard::KeyCode::KeyT)
+            .unwrap();
+        assert_eq!(game.screen, Screen::Chat, "T opens the message chat");
+        let chat = game.ui.chat_screen.as_ref().unwrap();
+        assert_eq!(chat.input.value, "", "T opens an empty message");
+    });
+}

@@ -1,0 +1,3 @@
+# Gui.handleKeybinds opens the chat screen from key.chat and key.command only, never an unbound Enter (#20879): prepared resources.
+# PACKAGE TEST TARGET daily REASON; exact logical libtest identities.
+horizon-client game::remote::interaction_event_tests::mapping_press_tests::enter_opens_no_chat_where_t_opens_the_message_chat lib daily resources

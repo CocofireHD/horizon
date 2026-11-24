@@ -200,8 +200,10 @@ impl Game<'_> {
             return Ok(false);
         }
         match key {
-            KeyCode::KeyT | KeyCode::Slash | KeyCode::Enter => {
-                // ChatScreen, over the server's command tree.
+            KeyCode::KeyT | KeyCode::Slash => {
+                // ChatScreen, over the server's command tree. `Gui.handleKeybinds` opens it from
+                // key.chat and key.command only: no vanilla mapping defaults to Enter, and a key
+                // with no mapping reaches here unchanged, so Enter must not open the chat.
                 self.open_chat_method(if key == KeyCode::Slash { "/" } else { "" });
                 // `Minecraft.handleKeybinds` opens it in the call that then
                 // releases an active use (Gui.handleKeybinds runs before the
