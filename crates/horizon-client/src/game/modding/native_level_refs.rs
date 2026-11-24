@@ -3,7 +3,12 @@
 //! reach any loaded level; both-side reads also reach the client's current level.
 //! A handle of an earlier open or an unloaded block reads `None` (or `false`).
 use super::Game;
-use horizon_client::{mobs::spawn_rules, streaming::Streaming, world::World};
+use horizon_client::{
+    mobs::spawn_rules,
+    streaming::Streaming,
+    ticket_levels::{self, ChunkTickets},
+    world::World,
+};
 use horizon_core::{
     geometry::Direction,
     position::{BlockPos, ChunkPos},
@@ -12,9 +17,9 @@ use horizon_items::items::ItemStack;
 use horizon_world::registry::BlockStateId;
 use mod_api::world::mod_chunk_tickets::ModTicket;
 use mod_api::{
-    BlockHit, BlockTransformPreview, ChunkDeltaCursor, ChunkDeltas, ChunkRef, ChunkStatus, ClipBlock,
-    ClipFluid, DimensionKey, Hand, LevelRef, LightLayer, MapState, PlayerRef, RespawnData,
-    TicketController, Vec3,
+    BlockHit, BlockTransformPreview, ChunkDeltaCursor, ChunkDeltas, ChunkRef, ChunkStatus,
+    ChunkTicket, ClipBlock, ClipFluid, DimensionKey, FullChunkStatus, Hand, LevelRef, LightLayer,
+    MapState, PlayerRef, RespawnData, TicketController, Vec3,
 };
 
 fn block_pos([x, y, z]: [i32; 3]) -> BlockPos {
@@ -437,6 +442,93 @@ impl Game<'_> {
     pub(super) fn chunk_status(&self, chunk: ChunkRef) -> Option<ChunkStatus> {
         self.chunk(chunk.level(), chunk.pos())
             .map(|_| ChunkStatus::Full)
+    }
+    /// Ticket state belongs to the same resident server level as the chunk, not necessarily
+    /// the level being ticked. Looking at a parked chunk does not switch the level in.
+    fn resident_chunk_ticket_sources(
+        &self,
+        level: LevelRef,
+        chunk: (i32, i32),
+    ) -> Option<(&ChunkTickets, &Streaming)> {
+        if !self.is_logical_server() || !self.level_handle_current(level) {
+            return None;
+        }
+        if level.dimension() == self.dim.key() {
+            return self
+                .world
+                .chunks
+                .contains_key(&chunk)
+                .then_some((&self.tickets, &self.streaming));
+        }
+        self.levels
+            .parked_of(level.dimension_id())?
+            .resident_chunk_ticket_sources(chunk)
+    }
+    /// `ChunkHolder.getFullStatus`: the loading track alone determines a resident chunk's status.
+    pub(super) fn chunk_full_status(&self, chunk: ChunkRef) -> Option<FullChunkStatus> {
+        let [x, z] = chunk.pos();
+        let (tickets, _) = self.resident_chunk_ticket_sources(chunk.level(), (x, z))?;
+        Some(match tickets.loading_level(x, z) {
+            ..=ticket_levels::ENTITY_TICKING => FullChunkStatus::EntityTicking,
+            ticket_levels::BLOCK_TICKING => FullChunkStatus::BlockTicking,
+            ticket_levels::FULL => FullChunkStatus::Full,
+            _ => FullChunkStatus::Inaccessible,
+        })
+    }
+    /// Direct tickets only: the scheduler's sources and the individual owners of its forced input.
+    pub(super) fn chunk_tickets(&self, chunk: ChunkRef) -> Option<Vec<ChunkTicket>> {
+        let [x, z] = chunk.pos();
+        let pos = (x, z);
+        let (tickets, streaming) = self.resident_chunk_ticket_sources(chunk.level(), pos)?;
+        let mut direct = Vec::new();
+        let mut push = |kind: &str, level| direct.push(ChunkTicket::new(kind.into(), level));
+        tickets.visit_direct_tickets(pos, &mut push);
+        let forced_level = i32::from(ticket_levels::ENTITY_TICKING);
+        if streaming.commanded().contains(&pos) {
+            push("forced", forced_level);
+        }
+        for controller in streaming
+            .mod_tickets()
+            .controllers_at(pos)
+            .filter_map(TicketController::from_slot)
+        {
+            push(controller.id(), forced_level);
+        }
+        direct.sort_unstable_by(|a, b| (&a.kind, a.level).cmp(&(&b.kind, b.level)));
+        Some(direct)
+    }
+    /// The section Y coordinates (bottom up) of a loaded chunk whose palette may hold
+    /// any state of `block` (`PalettedContainer.maybeHas`). None on a client, for a
+    /// stale handle, or when the chunk is not loaded.
+    pub(super) fn chunk_sections_with_block(
+        &self,
+        chunk: ChunkRef,
+        block: mod_api::BlockKey,
+    ) -> Option<Vec<i32>> {
+        let world = self.native_level_world(chunk.level())?;
+        let [cx, cz] = chunk.pos();
+        let loaded = world.chunks.get(&(cx, cz))?;
+        let name = block.id(self);
+        if name.is_empty() {
+            return Some(Vec::new());
+        }
+        let registry = self.pack.assets.registry;
+        let min_section = loaded.min_y() >> 4;
+        Some(
+            loaded
+                .sections
+                .iter()
+                .enumerate()
+                .filter(|(_, section)| {
+                    section.blocks.maybe_has(|v| {
+                        registry
+                            .state(BlockStateId(v))
+                            .is_some_and(|s| s.name == name)
+                    })
+                })
+                .map(|(index, _)| min_section + index as i32)
+                .collect(),
+        )
     }
     /// A handle for chunk `pos` of an open level, loaded or not, so a mod can
     /// force an unloaded chunk. None for a stale handle, on a client, and for
@@ -2225,6 +2317,153 @@ mod tests {
 
     #[test]
     #[ignore = "daily"]
+    fn chunk_ticket_diagnostics_distinguish_direct_sources_and_propagated_status() {
+        use crate::game::execution_role::ExecutionRole;
+        use horizon_client::{
+            chunk::Chunk,
+            motion::PlayerMotion,
+            ticket_levels::{Sources, ViewedTicket},
+        };
+        use horizon_core::geometry::Vec3;
+        use mod_api::FullChunkStatus::{self, BlockTicking, EntityTicking, Full, Inaccessible};
+        use std::sync::Arc;
+
+        with_machines(|game| {
+            let insert = |game: &mut super::Game<'_>, level: LevelRef, [x, z]: [i32; 2]| {
+                game.world
+                    .chunks
+                    .insert((x, z), Arc::new(Chunk::empty(x, z)));
+                game.chunk(level, [x, z]).unwrap()
+            };
+            let reads = |game: &super::Game<'_>,
+                         chunk: ChunkRef,
+                         status: FullChunkStatus,
+                         direct: &[(&str, i32)]| {
+                assert_eq!(chunk.full_status(game), Some(status), "{chunk:?}");
+                let tickets = chunk.tickets(game).unwrap();
+                let actual: Vec<_> = tickets.iter().map(|t| (t.kind.as_str(), t.level)).collect();
+                assert_eq!(actual, direct, "{chunk:?}");
+            };
+            let unavailable = |game: &super::Game<'_>, chunk: ChunkRef| {
+                assert_eq!(chunk.full_status(game), None, "{chunk:?}");
+                assert_eq!(chunk.tickets(game), None, "{chunk:?}");
+            };
+
+            let overworld = game.level(Dim::Overworld.id()).unwrap();
+            let end = LevelRef::new(overworld.epoch(), Dim::End.key());
+            let player = insert(game, overworld, [0, 0]);
+            let player_view = insert(game, overworld, [2, 0]);
+            let player_ring = insert(game, overworld, [3, 0]);
+            let forced = insert(game, overworld, [20, 0]);
+            let forced_ring = insert(game, overworld, [21, 1]);
+            let full_ring = insert(game, overworld, [22, 2]);
+            let idle = insert(game, overworld, [23, 3]);
+            let portal = insert(game, overworld, [40, 0]);
+            let portal_neighbor = insert(game, overworld, [41, 1]);
+            let mod_only = insert(game, overworld, [60, 0]);
+            game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+            game.settings.render_distance = 2;
+            game.settings.simulation_distance = 6;
+            assert!(forced.set_forced(game, true));
+            {
+                let _guard = in_mod("machines");
+                assert!(forced.set_mod_forced(
+                    game,
+                    quarry(),
+                    TicketOwner::Block([320, 64, 0]),
+                    true,
+                    false
+                ));
+                assert!(forced.set_transient_forced(game, quarry(), 1, true, false));
+                assert!(mod_only.set_transient_forced(game, quarry(), 2, true, false));
+            }
+            game.tickets.add_portal((40, 0));
+            game.update_chunk_tickets();
+            let count = game.world.chunks.len();
+
+            reads(
+                game,
+                player,
+                EntityTicking,
+                &[("player_loading", 31), ("player_simulation", 25)],
+            );
+            reads(game, player_view, EntityTicking, &[("player_loading", 31)]);
+            // Simulation permits entities here, but the loading track is only block ticking.
+            assert!(game.tickets.levels().in_entity_ticking_range(3, 0));
+            reads(game, player_ring, BlockTicking, &[]);
+            let forced_sources = [
+                ("forced", 31),
+                ("machines:quarry", 31),
+                ("machines:quarry", 31),
+            ];
+            reads(game, forced, EntityTicking, &forced_sources);
+            reads(game, forced_ring, BlockTicking, &[]);
+            reads(game, full_ring, Full, &[]);
+            reads(game, idle, Inaccessible, &[]);
+            reads(game, portal, EntityTicking, &[("portal", 30)]);
+            reads(game, portal_neighbor, EntityTicking, &[]);
+            reads(game, mod_only, EntityTicking, &[("machines:quarry", 31)]);
+            assert_eq!(idle.status(game), Some(mod_api::ChunkStatus::Full));
+
+            game.world.chunks.remove(&(21, 1)).unwrap();
+            game.world.chunks.remove(&(60, 0)).unwrap();
+            unavailable(game, forced_ring);
+            unavailable(game, mod_only);
+            unavailable(game, ChunkRef::new(end, forced.pos()));
+            let stale = LevelRef::new(
+                WorldEpoch::new(overworld.epoch().get() + 1),
+                overworld.dimension(),
+            );
+            unavailable(game, ChunkRef::new(stale, forced.pos()));
+            assert_eq!(game.world.chunks.len(), count - 2, "reads must not load");
+            assert_eq!(
+                game.tickets.portal_tickets()[0].ticks_left,
+                300,
+                "reads must not age tickets"
+            );
+
+            game.player = None;
+            game.world_root = game.save.root.clone();
+            game.enter_level(Dim::End).unwrap();
+            let viewed = insert(game, end, forced.pos());
+            let arena = insert(game, end, [0, 0]);
+            let arena_ring = insert(game, end, [9, 9]);
+            let ticking_view = insert(game, end, [2000, 2000]);
+            // Supply these inputs to the real scheduler without joining a remote viewer.
+            game.tickets.update(Some(Sources {
+                dragon: Some((0, 0)),
+                viewed: vec![
+                    ViewedTicket {
+                        center: (19, 0),
+                        radius: 1,
+                        ticking: false,
+                    },
+                    ViewedTicket {
+                        center: (2000, 2000),
+                        radius: 0,
+                        ticking: true,
+                    },
+                ],
+                ..Sources::default()
+            }));
+            reads(game, viewed, Full, &[("viewed", 33)]);
+            reads(game, ticking_view, EntityTicking, &[("viewed", 31)]);
+            reads(game, arena, EntityTicking, &[("dragon", 24)]);
+            reads(game, arena_ring, Full, &[]);
+            reads(game, forced, EntityTicking, &forced_sources);
+            assert_eq!(game.dim, Dim::End, "parked reads must not switch levels");
+
+            game.options.execution_role = ExecutionRole::Client;
+            unavailable(game, arena);
+            game.options.execution_role = ExecutionRole::IntegratedServer;
+            game.native_lifecycle.begin_close();
+            game.native_lifecycle_world_closed();
+            unavailable(game, arena);
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn water_tickets_hydrate_real_farmland_and_preserve_vanilla_water_and_rain() {
         use horizon_client::chunk::Chunk;
         use std::sync::Arc;
@@ -3743,5 +3982,34 @@ mod environment_read_tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn chunk_sections_with_block_skips_empty_sections_and_returns_none_when_unloaded() {
+        if std::env::var_os("HORIZON_TEST_RESOURCES").is_none() {
+            return;
+        }
+        let mut game = crate::game::native_machines::tests::server_game();
+        game.world
+            .chunks
+            .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        let ore = game
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:diamond_ore")
+            .unwrap();
+        game.world.set(1, -48, 1, ore).unwrap();
+        game.world.set(2, 20, 2, ore).unwrap();
+
+        let level = <dyn mod_api::Host>::level(&game, "minecraft:overworld").unwrap();
+        let loaded = level.chunk_ref(&game, [0, 0]).unwrap();
+        let unloaded = level.chunk_ref(&game, [5, 5]).unwrap();
+        let ore_key = mod_api::__private::block_key("minecraft:diamond_ore").unwrap();
+        let gold_key = mod_api::__private::block_key("minecraft:gold_ore").unwrap();
+
+        assert_eq!(loaded.sections_with_block(&game, ore_key), Some(vec![-3, 1]));
+        assert_eq!(loaded.sections_with_block(&game, gold_key), Some(Vec::new()));
+        assert_eq!(unloaded.sections_with_block(&game, ore_key), None);
     }
 }

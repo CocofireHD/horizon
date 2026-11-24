@@ -250,6 +250,19 @@ pub trait LevelsBackend {
     #[access(WorldOnly)]
     fn chunk_status(&self, chunk: ChunkRef) -> Option<ChunkStatus>;
     /// Side: server.
+    /// `ChunkHolder.getFullStatus`: the resident chunk's propagated loading status, independent
+    /// of its simulation level. Reads active and parked levels and never loads a chunk.
+    /// None on a client, for a stale or unavailable level, or when the chunk is not loaded.
+    #[access(WorldOnly)]
+    fn chunk_full_status(&self, chunk: ChunkRef) -> Option<FullChunkStatus>;
+    /// Side: server.
+    /// `TicketStorage.getTickets`: the direct tickets on this loaded chunk, sorted by kind
+    /// then level. Propagated tickets from other chunks are not listed. A loaded chunk with
+    /// no direct tickets gives an empty list. Reads active and parked levels without loading
+    /// chunks. None on a client, for a stale or unavailable level, or for an unloaded chunk.
+    #[access(WorldOnly)]
+    fn chunk_tickets(&self, chunk: ChunkRef) -> Option<Vec<ChunkTicket>>;
+    /// Side: server.
     /// Whether the chunk passes vanilla's seeded slime-chunk test, independent of
     /// dimension, height, biome and other spawn conditions. Works for unloaded chunks
     /// in active or parked open levels. None for a stale level, a client or a chunk
@@ -265,6 +278,15 @@ pub trait LevelsBackend {
     /// watches gives an empty list. None on a client and for a stale handle.
     #[access(WorldOnly)]
     fn chunk_watchers(&self, chunk: ChunkRef) -> Option<Vec<PlayerRef>>;
+    /// Side: server.
+    /// The section Y coordinates (bottom up, `min_y / 16` upward) of this loaded chunk
+    /// whose palette may contain any state of `block` (`PalettedContainer.maybeHas`).
+    /// Lets mods skip sections that cannot hold `block` without reading every block.
+    /// A section whose palette is global or retains an unused entry for `block` may be
+    /// included even if no block in it currently has that state. Returns `None` on a
+    /// client, for a stale handle, or when the chunk is not loaded.
+    #[access(WorldOnly)]
+    fn chunk_sections_with_block(&self, chunk: ChunkRef, block: BlockKey) -> Option<Vec<i32>>;
     /// Side: server.
     /// Match and assemble through the engine's recipe matcher, without consuming inputs.
     /// Covers minecraft:crafting, smelting, blasting, smoking, campfire_cooking,
