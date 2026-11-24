@@ -45,14 +45,17 @@ fn takes(game: &mut Game<'_>, at: [f64; 3], item: [f64; 3]) -> bool {
 #[ignore = "daily"]
 fn a_guest_takes_what_meets_their_box_grown_by_one_and_a_half_blocks() {
     crate::game::native_guest_turn_tests::with_guests(|game| {
-        // The issue's two holes: the guest stands at x=2.3, the item lies in the corner of
-        // the hole at x=0.875. The grown box starts at 1.0 and the item's ends at 1.0: they
-        // touch, so vanilla leaves it there (`AABB.intersects` is strict).
-        assert!(!takes(game, [2.3, 65.0, 0.7], [0.875, 65.0, 0.875]));
+        // The issue's two holes: the guest stands pressed against the wall at x=2.0, its half
+        // width 0.3F (widened to f64 as 0.30000001192) placing its centre at 2.0 plus that, so
+        // its grown box starts at exactly 1.0. The item lies in the corner of the far hole, its
+        // box ends at 1.0: the two only touch, and vanilla leaves the item there
+        // (`AABB.intersects` is strict).
+        let x = 2.0 + f64::from(0.6_f32 / 2.0);
+        assert!(!takes(game, [x, 65.0, 0.7], [0.875, 65.0, 0.875]));
         // A fortieth closer: the boxes overlap, and vanilla takes it.
-        assert!(takes(game, [2.3, 65.0, 0.7], [0.9, 65.0, 0.875]));
+        assert!(takes(game, [x, 65.0, 0.7], [0.9, 65.0, 0.875]));
         // 1.425 apart on both x and z at once, the furthest a centre can be: still a touch.
-        assert!(!takes(game, [2.3, 65.0, 2.3], [0.875, 65.0, 0.875]));
+        assert!(!takes(game, [x, 65.0, x], [0.875, 65.0, 0.875]));
         // The box starts 0.5 under the feet, so an item's box 0.7 below still meets it and
         // one 0.75 below only touches it.
         assert!(takes(game, [3.0, 65.0, 5.0], [3.0, 64.3, 5.0]));
