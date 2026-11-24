@@ -133,5 +133,51 @@ class GuardTests(unittest.TestCase):
         self.assertIn("all language files", result.stdout)
 
 
+
+    def approved(self, body: str) -> str:
+        """A `l10n/game-approved` folder as one run downloads it, holding `xx` and nothing else."""
+        folder = self.root / "approved"
+        folder.mkdir(exist_ok=True)
+        (folder / "xx.json").write_text(body, encoding="utf-8")
+        return str(folder)
+
+    def patch(self, path: str, deleted: bool = False) -> str:
+        """A patch of one path, as `git -c core.quotePath=false diff --binary --no-renames` writes it."""
+        body = f"diff --git a/{path} b/{path}\n"
+        body += "deleted file mode 100644\n" if deleted else "new file mode 100644\n"
+        body += f"--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-{{}}\n+{{\"a\": \"x\"}}\n"
+        file = self.root / "l10n.patch"
+        file.write_text(body, encoding="utf-8")
+        return str(file)
+
+    def test_the_approved_export_has_to_carry_the_string_too(self):
+        """A mark in the record a person wrote by hand is not a proofreader's approval."""
+        self.write(f"{LANG}/xx.json", '{\n  "a": "Manzana",\n  "b": "Platano verde"\n}\n')
+        self.write(f"{REVIEW}/xx.json", '{\n  "a": "Manzana",\n  "b": "Platano verde"\n}\n')
+        self.commit("the record carries it, this run's export does not")
+        code, out, _ = self.guard("--approved", self.approved('{\n  "a": "Manzana"\n}\n'))
+        self.assertEqual(code, 1)
+        self.assertIn("1 string not in this run's approved export", out)
+        self.assertIn("b", out)
+
+    def test_the_export_the_proofreader_approved_lets_it_queue(self):
+        self.write(f"{LANG}/xx.json", '{\n  "a": "Manzana",\n  "b": "Platano verde"\n}\n')
+        self.write(f"{REVIEW}/xx.json", '{\n  "a": "Manzana",\n  "b": "Platano verde"\n}\n')
+        self.commit("both the mark and the export carry it")
+        approved = self.approved('{\n  "a": "Manzana",\n  "b": "Platano verde"\n}\n')
+        code, out, _ = self.guard("--approved", approved)
+        self.assertEqual(code, 0, out)
+
+    def test_a_patch_is_judged_before_anything_applies_it(self):
+        self.assertEqual(run("--patch", self.patch(f"{LANG}/xx.json"), "--paths-only")[0], 0)
+        code, out, _ = run("--patch", self.patch(".github/workflows/l10n-paths.yml"), "--paths-only")
+        self.assertEqual(code, 1)
+        self.assertIn("not a language file or a review record", out)
+
+    def test_a_patch_may_delete_a_record(self):
+        self.assertEqual(run("--patch", self.patch(f"{REVIEW}/xx.json", deleted=True), "--paths-only")[0], 0)
+
+    def test_a_patch_without_paths_only_is_no_verdict(self):
+        self.assertEqual(run("--patch", self.patch(f"{LANG}/xx.json"))[0], 2)
 if __name__ == "__main__":
     unittest.main()

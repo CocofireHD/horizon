@@ -8,10 +8,11 @@ name: crowdin
 # manual run says which half to do; a push uploads the English text only, the nightly run downloads.
 #
 # Two jobs, because of the token. `import` runs Crowdin's action and the import with the built-in
-# token and no way to write; it hands the lang files and the record on as an artifact. `pull-request`
-# is the only job that holds CROWDIN_PAT — a fine-grained token for this repository with `contents`
-# and `pull requests` write and no ruleset bypass — because a push made with `github.token` starts no
-# workflows (GitHub's rule), so the pull request's `verify` would never run.
+# token and no way to write; it hands the change on as a patch (deletions included) together with the
+# export the proofreaders approved. `pull-request` is the only job that holds `CROWDIN_PAT` — a
+# fine-grained token for this repository with `contents` and `pull requests` write and no ruleset
+# bypass — because a push made with `github.token` starts no workflows (GitHub's rule), so the
+# pull request's `verify` would never run.
 #
 # With the variable CROWDIN_AUTOMERGE=true that job also waits for the pull request's checks and adds
 # it to main's merge queue (docs/release-flow.md, "Merging"). It queues nothing unless the whole diff
@@ -55,7 +56,9 @@ jobs:
       # its own token for it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          # The run's own commit: both jobs measure from the same base, whatever `main` is by the
+          # time the second one starts.
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -116,17 +119,31 @@ jobs:
           python3 tools/crowdin_import.py --check
           python3 tools/crowdin_import.py --translations l10n/game --approved l10n/game-approved
           python3 tools/lang_coverage.py --summary
-      - name: Hand the text on to the job that pushes
+      - name: Write what changed as a patch
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'both' || inputs.mode == 'download'))
+        run: |
+          # The change itself, deletions included: a folder of files cannot say that a record is gone,
+          # and copying it over a newer `main` would quietly undo whatever landed there since.
+          git add -A -- crates/horizon-client/assets/horizon/lang tools/lang_review/game tools/lang_review/crowdin
+          git -c core.quotePath=false diff --cached --binary --no-renames > l10n.patch
+          git -c core.quotePath=false diff --cached --stat
+      - name: Hand the patch on to the job that pushes
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'both' || inputs.mode == 'download'))
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: lang
-          # The three folders the import writes, at their own paths, so the next job drops them in place.
-          path: |
-            crates/horizon-client/assets/horizon/lang
-            tools/lang_review/game
-            tools/lang_review/crowdin
+          name: change
+          path: l10n.patch
           retention-days: 1
+      - name: Hand the proofreaders' export on too
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'both' || inputs.mode == 'download'))
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: approved
+          # What proofreaders approved in this run: the job below checks every changed string against
+          # it, because a mark in the repository's record is not their word on its own.
+          path: l10n/game-approved
+          retention-days: 1
+          if-no-files-found: ignore
   pull-request:
     needs: import
     if: needs.import.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'both' || inputs.mode == 'download')))
@@ -145,24 +162,34 @@ jobs:
       # produced, and the PAT is put on the push alone (see below).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          # The run's own commit: both jobs measure from the same base, whatever `main` is by the
+          # time the second one starts.
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Take the text the import job wrote
+      - name: Take the change the import job wrote
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: lang
-          # Somewhere else: nothing an action in `import` uploaded is executed before it is filtered below.
-          path: ${{ runner.temp }}/lang
-      - name: Copy the language files in
+          name: change
+          # Somewhere else, and read as data: nothing a job in `import` produced is written to this
+          # tree before the guard below has said where the patch would write.
+          path: ${{ runner.temp }}/change
+      - name: Take the export the proofreaders approved
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: approved
+          path: ${{ runner.temp }}/approved
+      - name: Apply the change, once every path in it is allowed
+        env:
+          PATCH: ${{ runner.temp }}/change/l10n.patch
         run: |
-          # JSON only, and only from the three folders the import writes, so an artifact cannot add a
-          # tool or a workflow to the tree this job then runs with the PAT.
-          for folder in crates/horizon-client/assets/horizon/lang tools/lang_review/game tools/lang_review/crowdin; do
-            mkdir -p "$folder"
-            if [ -d "$RUNNER_TEMP/lang/$folder" ]; then
-              find "$RUNNER_TEMP/lang/$folder" -maxdepth 1 -name '*.json' -exec cp {} "$folder/" \;
-            fi
-          done
+          if [ ! -s "$PATCH" ]; then
+            echo "the import wrote no change, so there is nothing to push"
+            exit 0
+          fi
+          # This checkout is the run's own commit of main, so the guard reading it is main's copy: a
+          # patch may only touch the language files and the record, and nothing else reaches the branch.
+          python3 tools/l10n_merge_guard.py --patch "$PATCH" --paths-only
+          git apply --index --whitespace=nowarn "$PATCH"
           git status --short
       - name: Check which token this run has
         env:
@@ -183,9 +210,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.CROWDIN_PAT || github.token }}
         run: |
-          changed="crates/horizon-client/assets/horizon/lang tools/lang_review/game tools/lang_review/crowdin"
-          git add $changed
-          # Staged, because a record file the import newly wrote is untracked and `git diff` skips it.
+          # Staged by `git apply --index`, deletions included; with no change this is quiet.
           if git diff --cached --quiet; then
             echo "no translation changed, so no pull request"
             exit 0
@@ -207,11 +232,18 @@ jobs:
           the project; the reviewed marks are its proofreading (docs/translations.md, \"Crowdin\").
           Only translations change here."
           # The open pull request for this branch, and only that one: a merged or closed one is no target.
-          owner=${GITHUB_REPOSITORY%%/*}
-          open=$(gh pr list --head "$owner:l10n/crowdin" --base main --state open --json number,isCrossRepository) || {
+          # `--head` takes a branch name, not `owner:branch`: gh documents that the syntax is not
+          # supported. What keeps a fork's branch of the same name out is the filter, and the count keeps
+          # two of ours from being chosen between.
+          open=$(gh pr list --head l10n/crowdin --base main --state open --json number,isCrossRepository) || {
             echo "::error::cannot list the open pull requests for l10n/crowdin"; exit 1; }
           open=$(echo "$open" | jq '[.[] | select(.isCrossRepository == false)]')
-          if [ "$(echo "$open" | jq 'length')" -eq 0 ]; then
+          count=$(echo "$open" | jq 'length')
+          if [ "$count" -gt 1 ]; then
+            echo "::error::$count open pull requests for l10n/crowdin, expected one: a person has to sort them out"
+            exit 1
+          fi
+          if [ "$count" -eq 0 ]; then
             gh pr create --base main --head l10n/crowdin --title "tooling: translations from Crowdin" --body "$body"
           else
             gh pr edit "$(echo "$open" | jq -r '.[0].number')" --title "tooling: translations from Crowdin" --body "$body"
@@ -220,13 +252,16 @@ jobs:
         id: guard
         env:
           SHA: ${{ steps.pr.outputs.sha }}
+          BASE: ${{ github.sha }}
+          APPROVED: ${{ runner.temp }}/approved
         run: |
-          # docs/release-flow.md, "Merging": the paths and the approvals of the whole diff.
+          # docs/release-flow.md, "Merging": the paths of the whole diff and every changed string, the
+          # latter against the export this run's proofreading produced rather than a mark in a file.
           if [ -z "$SHA" ]; then
             echo "nothing was pushed, so there is nothing to check"
             exit 0
           fi
-          if python3 tools/l10n_merge_guard.py --base "${SHA}^"; then
+          if python3 tools/l10n_merge_guard.py --base "$BASE" --approved "$APPROVED"; then
             echo "approved=true" >> "$GITHUB_OUTPUT"
           else
             echo "approved=false" >> "$GITHUB_OUTPUT"
@@ -239,8 +274,9 @@ jobs:
           GH_TOKEN: ${{ secrets.CROWDIN_PAT }}
           SHA: ${{ steps.pr.outputs.sha }}
         run: |
-          owner=${GITHUB_REPOSITORY%%/*}
-          prs=$(gh pr list --head "$owner:l10n/crowdin" --base main --state open --json number,headRefOid,id,isCrossRepository) || {
+          # `--head` takes a branch name, not `owner:branch`; the filter keeps a fork's branch of the same
+          # name out, and the count keeps two of ours from being picked from.
+          prs=$(gh pr list --head l10n/crowdin --base main --state open --json number,headRefOid,id,isCrossRepository) || {
             echo "::error::cannot read the open pull requests for l10n/crowdin"; exit 1; }
           prs=$(echo "$prs" | jq '[.[] | select(.isCrossRepository == false)]')
           count=$(echo "$prs" | jq 'length')
@@ -260,28 +296,33 @@ jobs:
           # armed ahead of time, because this repository can't use auto-merge at all (`autoMergeAllowed`
           # is false, so `gh pr merge --auto` has nothing to switch). So this job waits for the checks
           # and then adds the entry, `expectedHeadOid` binding it to the commit it pushed.
+          #
+          # The two checks that decide are asked for by name, on this run's own commit: a poll that only
+          # asks "is anything still running" can look at a partial set and call it green.
           deadline=$((SECONDS + 3300))
-          said=0
           while :; do
-            buckets=$(gh pr checks "$number" --json bucket --jq '[.[].bucket] | [(any(. == "fail" or . == "cancel")), (map(select(. != "pass" and . != "skipping" and . != "neutral")) | length)] | "\(.[0]) \(.[1])"' 2>/dev/null) || buckets="could not read"
-            if [ "$buckets" = "could not read" ]; then
-              # The pull request's checks take a moment to appear; one line is enough.
-              if [ "$said" -eq 0 ]; then
-                echo "the pull request's checks are not reported yet; waiting"
-                said=1
-              fi
-            else
-              set -- $buckets
-              if [ "$1" = "true" ]; then
-                echo "::notice::a check is red, so the pull request waits for a Team member, as before"
-                exit 0
-              fi
-              if [ "$2" -eq 0 ]; then
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?filter=latest&per_page=100" 2>/dev/null) || runs=""
+            seen=0 running=0 passed=0 red=0
+            if [ -n "$runs" ]; then
+              red=$(echo "$runs" | jq '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required")] | length')
+              seen=$(echo "$runs" | jq '[.check_runs[] | select(.name == "verify" or .name == "l10n (changed paths)")] | length')
+              running=$(echo "$runs" | jq '[.check_runs[] | select((.name == "verify" or .name == "l10n (changed paths)") and .status != "completed")] | length')
+              passed=$(echo "$runs" | jq '[.check_runs[] | select((.name == "verify" or .name == "l10n (changed paths)") and .status == "completed" and .conclusion == "success")] | length')
+            fi
+            if [ "$red" -gt 0 ]; then
+              echo "::notice::a check is red, so the pull request waits for a Team member, as before"
+              exit 0
+            fi
+            if [ "$seen" -eq 2 ] && [ "$running" -eq 0 ]; then
+              if [ "$passed" -eq 2 ]; then
                 break
               fi
+              echo "::notice::verify or l10n (changed paths) did not pass, so the pull request waits for a Team member"
+              exit 0
             fi
+            echo "the checks are not reported yet, or still running; waiting"
             if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::notice::the checks are still running after 55 minutes, so the pull request waits for a Team member"
+              echo "::notice::verify and l10n (changed paths) are not both green after 55 minutes, so the pull request waits for a Team member"
               exit 0
             fi
             sleep 30
@@ -299,4 +340,4 @@ jobs:
             echo "::notice::the merge queue did not take it: $out"
             exit 0
           fi
-          echo "l10n/crowdin is in main's merge queue at position $(echo "$out" | jq -r '.data.mergeQueueEntry.position')"
+          echo "l10n/crowdin is in main's merge queue at position $(echo "$out" | jq -r '.data.enqueuePullRequest.mergeQueueEntry.position')"

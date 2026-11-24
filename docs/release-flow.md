@@ -137,24 +137,32 @@ contributor's branch.
 **The one exception: the nightly translations pull request merges itself.** `l10n/crowdin`, which
 `.github/workflows/crowdin.yml` opens, carries only `lang/*.json` and `tools/lang_review/game/*.json`, and nothing on
 it is a person's judgement: the strings come from Crowdin's approved export. So with the repository variable
-`CROWDIN_AUTOMERGE` set, the run that opens it waits for its checks and adds it to the merge queue
-(`enqueuePullRequest`, bound with `expectedHeadOid` to the commit that run pushed). Every other condition above still
+`CROWDIN_AUTOMERGE` set, the run that opens it waits for `verify` and `l10n (changed paths)` by name on
+the commit it pushed, and then adds it to the merge queue (`enqueuePullRequest`, bound with
+`expectedHeadOid` to that same commit). Every other condition above still
 applies, and three of them are checked by machine rather than by a reader:
 
 - `tools/l10n_merge_guard.py` reads the branch's whole diff before anything is queued: every changed path must be a
   language file or a review record (`en_us.json`, the source, never), and every changed string must be one the
-  approved export carries, which is exactly what its reviewed mark records. A string without that mark queues
-  nothing, so a language with no proofreader, or a translator's unproofread edit, flows through the pull request as
+  export the run downloaded with `export_only_approved` carries; the record's mark alone is not enough,
+  because a person may add one by hand and a proofreader may withdraw one. A string the export does not
+  carry queues nothing, so a language with no proofreader, or a translator's unproofread edit, flows through the pull request as
   it always did: a Team member reads and merges it.
 - `l10n (changed paths)` (`.github/workflows/l10n-paths.yml`) is the same path allowlist as a required check, so a
-  later push cannot add a workflow, a tool or a manifest to the branch after it was queued. It runs main's copy of
-  `tools/l10n_merge_guard.py`, never the branch's, so a pull request cannot grade its own work, and it answers
+  later push cannot add a workflow, a tool or a manifest to the branch after it was queued. The workflow runs on
+  `pull_request_target`, so the definition that decides is main's: the branch is fetched as git objects, diffed
+  from its merge base and never checked out, and the verdict is reported on the branch's own commit. The guard it
+  runs is main's copy too, never the branch's, so a pull request cannot grade its own work, and it answers
   `merge_group` as well, or a required check that only speaks for pull requests would stall the queue.
 - The token is the whole job's, not the sync's: `crowdin.yml` imports with the built-in token and hands its files
   to a second job that pushes, opens and queues, and only that one holds `CROWDIN_PAT` — repository-scoped, with
   `contents` and `pull requests` write and no ruleset bypass.
 - The switch stays off until a language has an active proofreader in Crowdin: until then every string is unproofread
   and the pull request holds itself for a person.
+
+Nothing here judges how a translation is formatted: a conversion the game cannot render still passes `verify` and
+reaches a player as the raw template ([#19966](https://github.com/horizon-rust/horizon/issues/19966) tracks that
+check), so that part of translation quality is not covered by this exception.
 
 Setting it up takes nothing in Settings: `main` already requires the merge queue, and this repository's
 `autoMergeAllowed` is `false` on purpose, so "Allow auto-merge" is not a switch that enables this and `gh pr merge

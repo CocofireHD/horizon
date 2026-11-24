@@ -2,51 +2,91 @@ name: l10n
 # The required check a translations pull request carries (docs/release-flow.md, "Merging"): whatever it
 # holds, it may change language files and their review record and nothing else.
 #
-# It matters because `l10n/crowdin` is the one pull request that may merge itself. A later push could
-# add a workflow, a tool or a manifest to that branch after the run that queued it, so the branch's shape
-# is checked on the pull request itself, by name, rather than only by the run that opens it. It passes on
-# every other pull request, so main's ruleset can require the same check for all of them.
+# It matters because `l10n/crowdin` is the one pull request that may merge itself, and because a later
+# push could add a workflow, a tool or a manifest to that branch after the run that queued it. So the
+# definition that decides is main's: the workflow runs on `pull_request_target`, which takes this file
+# and the guard from the base branch, never from the branch being judged. The branch comes in as git
+# objects and is only diffed; nothing of it runs and its tree is never checked out.
 #
-# Two details keep the check honest:
-# - it runs **main's** copy of `tools/l10n_merge_guard.py`, not the branch's: a pull request that rewrote
-#   the guard would otherwise grade its own work;
-# - it also answers the merge queue (`merge_group`), because a required check that never reports there
-#   leaves every queued pull request waiting. That run checks nothing: the queue's content is main plus
-#   pull requests that each passed this check on their own commit.
+# With `pull_request_target` the run's own check belongs to main's commit, and a required check has to
+# speak about the commit a queue would merge, so the verdict is posted by hand on the branch's commit.
+# It passes on every other pull request, so main's ruleset can require the same name for all of them.
+#
+# It also answers `merge_group`, because a required check that never reports there leaves every queued
+# pull request waiting. That run checks nothing: the queue's content is main plus pull requests that
+# each passed this check on their own commit.
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
   merge_group:
     types: [checks_requested]
 permissions:
   contents: read
-concurrency:
-  group: l10n-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
 jobs:
   paths:
     name: l10n (changed paths)
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      # The verdict below is a check run of its own, on the branch's commit.
+      checks: write
+    concurrency:
+      group: l10n-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
     steps:
-      - name: Check out the pull request's commit
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'l10n/crowdin'
+      - name: Check out main, whose copy decides
+        if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'l10n/crowdin'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: main
+          # The two commits and their merge base; the branch itself is never checked out.
+          fetch-depth: 0
+          filter: blob:none
           persist-credentials: false
-      - name: Check the changed paths against main's guard
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'l10n/crowdin'
+          sparse-checkout: |
+            tools/l10n_merge_guard.py
+          sparse-checkout-cone-mode: false
+      - name: Read the branch's whole diff, main's guard doing the reading
+        id: judge
+        if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'l10n/crowdin'
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
           TOKEN: ${{ github.token }}
         run: |
-          # One commit of the base is enough for `git diff` and for the file the branch started from.
+          # Objects, not a checkout: the branch's tree is read by git and none of its code runs. The
+          # diff is measured from the merge base, so main moving on is not read as the branch's change.
           git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)" \
-            fetch --depth=1 origin "$BASE"
+            fetch --no-tags origin "+$BASE:refs/l10n/base" "+$HEAD:refs/l10n/head"
+          merge=$(git merge-base refs/l10n/base refs/l10n/head)
           # The branch may have rewritten the guard; the copy that decides is the one main has.
-          if ! git cat-file -e "$BASE:tools/l10n_merge_guard.py" 2>/dev/null; then
-            echo "::error::main has no tools/l10n_merge_guard.py at $BASE, so there is nothing to check this branch against."
+          if ! git cat-file -e "$merge:tools/l10n_merge_guard.py" 2>/dev/null; then
+            echo "::error::$merge has no tools/l10n_merge_guard.py, so there is nothing to check this branch against."
             exit 1
           fi
-          git show "$BASE:tools/l10n_merge_guard.py" > "$RUNNER_TEMP/l10n_merge_guard.py"
-          python3 "$RUNNER_TEMP/l10n_merge_guard.py" --root "$GITHUB_WORKSPACE" --base "$BASE" --paths-only
+          git show "$merge:tools/l10n_merge_guard.py" > "$RUNNER_TEMP/l10n_merge_guard.py"
+          python3 "$RUNNER_TEMP/l10n_merge_guard.py" --root "$GITHUB_WORKSPACE" --base "$merge" \
+            --head refs/l10n/head --paths-only
+      - name: Report the verdict on the branch's commit
+        if: always() && github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          OUTCOME: ${{ steps.judge.outcome }}
+          BRANCH: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || '' }}
+        run: |
+          if [ "$BRANCH" != "l10n/crowdin" ]; then
+            conclusion=success
+            summary="Not a translations branch: this check has nothing to hold back here."
+          elif [ "$OUTCOME" = "success" ]; then
+            conclusion=success
+            summary="Every changed path is a language file or a review record."
+          else
+            conclusion=failure
+            summary="This branch changes something other than language files and their record; the run's log names the path."
+          fi
+          jq -n --arg name "l10n (changed paths)" --arg sha "$HEAD" --arg conclusion "$conclusion" \
+            --arg summary "$summary" \
+            '{name: $name, head_sha: $sha, status: "completed", conclusion: $conclusion,
+              output: {title: "l10n (changed paths)", summary: $summary}}' |
+            gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" --input -
