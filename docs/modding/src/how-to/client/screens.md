@@ -40,6 +40,118 @@ the sign's block position and whether its front side is being edited. It returns
 editor open, or outside a world. A close of the sign editor always sends the sign update, however it
 closes; there is no close that skips it, because the vanilla client never omits that packet.
 
+## Book and sign overlay hooks
+
+The active editor has a stable `event.screen.id` in the screen render and input hooks:
+
+| ID | `host.editor_overlay()` snapshot |
+|---|---|
+| `book_view` | `BookView`: zero-based `page`, displayed `page_count` (at least one), current page `text` as a component or `None`, optional `lectern` position, and `can_take` for its Take Book button. |
+| `book_edit` | `BookEdit`: zero-based `page`, `page_count`, current page `text`, and `selection`. |
+| `book_sign` | `BookSign`: proposed `title`, displayed `author`, and `selection` in the title box. |
+| `sign_edit` | `Sign`: block `pos`, `front` side flag, `hanging: false`, the four displayed `lines`, zero-based focused `line`, and its `selection`. |
+| `hanging_sign_edit` | The same `Sign` fields, with `hanging: true` (including wall-mounted hanging signs). |
+
+Each `selection` is `[caret, anchor]` in Unicode scalar characters. These are owned, read-only
+snapshots, available to native and Wasm mods. Request one only when you need the text; the hook
+itself only carries the usual `ScreenView` (no menu, title or slots for these editors).
+`screen.rect` gives `[x, y, width, height]` in GUI pixels around the stock editor and footer buttons,
+not its full-screen shade. A covered editor does not receive hooks while a modal prompt or loading
+screen owns the UI. The opening, initialization and closing notices still use their original IDs
+(including `lectern` and `sign_editor`).
+
+`screen_render_pre` runs before the editor's stock drawing. Cancel it to skip the editor (including
+its shade, widgets and tooltips) without skipping the world, HUD, toasts or unrelated IME drawing.
+Background runs after the stock background, Foreground after the editor's contents, and Post after
+its tooltips. Only Post still runs when Pre cancels. Use the event's `draw` context to paint a
+replacement there.
+
+Mouse press, release, drag, wheel, named keys, typed characters and IME preedit reach the active
+editor's cancellable pre hooks. Controller actions routed to the editor also reach the corresponding
+pre hook; controls that only navigate the on-screen keyboard do not target the editor. Cancelling a
+key does not cancel the separate typed-character event. In `screen_char_typed_pre` the editor's
+`field` is `None`; use the snapshot to read it instead. Render cancellation alone does not change
+input. Unconsumed input takes the stock editing, page navigation, close or save path and retains all
+existing text checks and server validation.
+
+## Reading and interacting with a container
+
+`host.screen_menu()` returns the live menu only when its container screen is open, including the
+normal player inventory but not creative tabs. In `container_mouse_input_pre`, `event.menu` is that
+same handle. Button presses and releases, held-button movement and wheel scroll arrive after the
+existing read-only screen Pre hook and before the screen acts. This hook has a mutable `ClientHost`.
+Returning `Flow::Cancel` replaces the screen's handling of that input, including its usual Post
+hook. If you take over a press and its drag, handle the matching release too; don't swallow the
+release of a drag the screen itself started.
+
+Use menu-order indices throughout. `menu.slot_count(host)` is the count, `menu.slot(host, index)`
+and `menu.carried(host)` read live stacks (`Some(None)` is empty, outer `None` means unavailable),
+and `menu.hovered_slot(host)` gives the screen's actual click target, even when empty. It follows
+the game's hit margin, layout offsets and hidden slots; a narrow recipe book covering the menu
+returns no hover. `menu.slot_kinds(host)` identifies known result slots, such as inventory
+crafting slot 0. `menu.slot_holds(host, index, &candidate)` instead gives the maximum count the
+slot can hold for that stack, including its components and the slot's own restrictions.
+`Some(0)` means it won't accept that stack (e.g. stone into head armour, or into a result slot);
+it does not identify the slot's role. This is not remaining space or a server promise.
+
+```rust
+use mod_api::{
+    ClientHost, ContainerMouseInput, ContainerMouseInputPreEvent, Flow, Hooks, MenuClick,
+    ScreenRenderPostEvent,
+};
+
+#[derive(Default)]
+struct ContainerHelper;
+
+#[mod_api::horizon_mod]
+impl Hooks for ContainerHelper {
+    fn container_mouse_input_pre(
+        &self,
+        host: &mut dyn ClientHost,
+        event: &mut ContainerMouseInputPreEvent,
+    ) -> Flow {
+        // Example gesture: Alt + wheel up shift-clicks the hovered slot.
+        if event.modifiers & 4 == 0
+            || !matches!(event.input, ContainerMouseInput::Scroll([_, y]) if y > 0.0)
+        {
+            return Flow::Continue;
+        }
+        let menu = event.menu;
+        let Some(slot) = menu.hovered_slot(host) else {
+            return Flow::Continue;
+        };
+        if menu.click(host, &[MenuClick::QuickMove { slot }]) {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    fn screen_render_post(&self, host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
+        let Some(menu) = host.screen_menu() else { return };
+        let Some(index) = menu.hovered_slot(host) else { return };
+        let Some(boxes) = menu.slot_boxes(host) else { return };
+        if let Some(&Some(rect)) = boxes.get(index) {
+            event.draw.fill(rect, 0x66ff_a000);
+        }
+    }
+}
+```
+
+For a move plan, submit `Pickup` with `MouseButton::Left` or `Right`, `QuickMove` for
+Shift-click, or `PickupAll` to collect matching stacks onto a stack already carried (the
+ordinary double-click action). `Drag` submits a complete quick-craft gesture. These are the
+ordinary predicted menu operations and server packets, not synthetic mouse input. A successful
+submission is not acknowledgement. Reread `slot` and `carried` immediately to see prediction and
+again on the next input or tick to see server corrections, rather than assuming the plan's state
+is still current. Reacquire the handle and discard a pending plan if the screen closes, its handle
+changes, or a read becomes unavailable. A stale handle cannot act on a replacement menu, even
+when the server reuses the same window id.
+
+`screen_render_post` already composites above the game's screen. Use the slot boxes in GUI
+pixels to draw markers for locked slots as well as the highlight above. A hidden slot has no
+box; while a narrow recipe book covers the menu there are no boxes to draw.
+
 ## Replacing the title splash
 
 Native and Wasm mods can call `host.title_splash()` from the title's screen render hooks

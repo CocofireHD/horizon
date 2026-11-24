@@ -3348,7 +3348,7 @@ impl Hub {
 
     /// `ParticleTypes.STREAM_CODEC`'s value for `options`: the type's
     /// network id and the data it carries (`state` for the block particles).
-    /// None for a particle whose data isn't sent from here (items, trails).
+    /// None for a particle whose data isn't sent from here (items).
     pub fn particle(
         &self,
         options: &crate::particles::ParticleOptions,
@@ -3409,7 +3409,12 @@ impl Hub {
                     ticks: *ticks,
                 })
             }
-            T::Item | T::Trail => return item_particles::encode(self, id, options),
+            T::Item => return item_particles::encode(self, id, options),
+            // `TrailParticleOption(target, color, duration)`.
+            T::Trail => {
+                let (target, duration) = options.trail?;
+                Some(ParticleData::Trail(target, rgb, duration))
+            }
             _ => None,
         };
         Some(Particle { id, data })
@@ -3794,12 +3799,13 @@ impl Hub {
                             now,
                             &mut g.advancements,
                             &mut g.recipe_book,
+                            &mut g.recipes_unlocked,
                         );
                         if let Some(add) = first.recipe_book_add {
                             g.send(&raw(ids::RECIPE_BOOK_ADD, add));
                         }
                         g.send(&raw(ids::UPDATE_ADVANCEMENTS, first.update_advancements));
-                        g.advancements_visible = sync.advancements.visibility(&g.advancements);
+                        g.advancements_visible = first.visible;
                         g.advancements_changed.clear();
                     }
                 });

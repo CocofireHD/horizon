@@ -20,6 +20,7 @@ mod animate;
 mod atlas_32x_tests;
 pub mod cit_glint;
 mod clip_corner;
+pub mod dynamic_textures;
 mod gui_sprite;
 #[cfg(test)]
 mod material_name_tests;
@@ -77,6 +78,8 @@ pub struct HudAtlas {
     pictures: std::sync::Mutex<pictures::Cache>,
     /// Identity of this packed atlas, used to invalidate cached model UV data
     /// even when a resource reload places sprites at the same coordinates.
+    /// Client mods' dynamic textures (`dynamic_textures`) add and remove
+    /// sprites without changing it.
     pub revision: u64,
     /// RGBA8, `width` by `height`, as built: empty once `pack_pixels` has
     /// compressed them (read them through `pixels()`).
@@ -111,6 +114,7 @@ pub struct HudAtlas {
     /// `misc/enchanted_glint_armor`, the armour layers' `GlintSampler`.
     pub glint_armor: (Vec<u8>, u32, u32),
     pub text_shaders: crate::gfx::core_text::TextShaders,
+    pub(crate) model_shaders: crate::gfx::core_models::ModelShaders,
     /// A resource pack's own `core/rendertype_lines` shader for the block outline, translated;
     /// none draws the outline natively.
     pub lines_shader: Option<std::sync::Arc<crate::core_shader::CoreProgram>>,
@@ -139,6 +143,9 @@ pub struct HudAtlas {
     pub material_maps: std::sync::Arc<[Option<crate::paged_maps::PagedMap>; 2]>,
     /// The white texel flat fills sample (also `hud_kit::shapes`).
     pub(crate) white: Rect,
+    /// Where client mods' dynamic textures go (`dynamic_textures`): packed only with a client
+    /// mod loaded, and out of `sprites`, which name each image instead.
+    pub dynamic_texture_page: Option<dynamic_textures::Page>,
 }
 /// Atlas rows reserved for glyphs rasterized at run time.
 pub const GLYPH_ROWS: u32 = 512;
@@ -1014,16 +1021,24 @@ impl HudAtlas {
         Self::build_over_with_image(root, defaults, false)
     }
     /// The atlas above, with a slot for a client mod's own image
-    /// (`horizon/modimage`) only when `mod_image` says a client mod is loaded,
-    /// native or wasm: the slot costs 4 MiB of pixels, so a game without
-    /// mods holds none of them.
+    /// (`horizon/modimage`) and the page of client mods' dynamic textures
+    /// (`dynamic_texture_page`) only when `mod_image` says a client mod is
+    /// loaded, native or wasm: the slot costs 4 MiB of pixels and the page 8.5,
+    /// so a game without mods holds none of them.
     pub fn build_over_with_image(
         root: &ResourceSource,
         defaults: &ResourceSource,
         mod_image: bool,
     ) -> Result<Self> {
         let mut atlas = Self::pack(root, defaults, WALKED_TEXTURE_FOLDERS, true, mod_image)?;
+        // Only the page the builder reserved: without a mod, a pack texture under the page's
+        // name stays one of the pack's sprites.
+        if mod_image {
+            atlas.dynamic_texture_page =
+                dynamic_textures::Page::take(&mut atlas.sprites, atlas.width, atlas.height);
+        }
         pack_text::load_shaders(&mut atlas, root, defaults);
+        atlas.model_shaders = crate::gfx::core_models::ModelShaders::load(root, defaults);
         atlas.sprite_modifiers = std::sync::Arc::new(sprite_modifiers::SpriteModifiers::read(
             root,
             atlas.sprites.keys(),
@@ -1047,12 +1062,20 @@ impl HudAtlas {
             crate::minimap::SIZE as u32,
             Vec::new(),
         ));
-        // A mod's own image (`mod_image`), only when a client mod is loaded.
+        // A mod's own image (`mod_image`) and the mods' dynamic textures, only when a client
+        // mod is loaded.
         if mod_image {
             images.push((
                 MOD_IMAGE_SPRITE.into(),
                 MOD_IMAGE_SIZE,
                 MOD_IMAGE_SIZE,
+                Vec::new(),
+            ));
+            let [width, height] = dynamic_textures::PAGE;
+            images.push((
+                dynamic_textures::PAGE_SPRITE.into(),
+                width,
+                height,
                 Vec::new(),
             ));
         }
@@ -1108,6 +1131,7 @@ impl HudAtlas {
             glint: (Vec::new(), 1, 1),
             glint_armor: (Vec::new(), 1, 1),
             text_shaders: Default::default(),
+            model_shaders: Default::default(),
             lines_shader: None,
             sky_shader: None,
             stars_shader: None,
@@ -1120,6 +1144,7 @@ impl HudAtlas {
             emissive: Arc::default(),
             blinks: Default::default(),
             white,
+            dynamic_texture_page: None,
         })
     }
     /// The boot screen's atlas, before any pack loads: the theme's run-time
@@ -1181,6 +1206,7 @@ impl HudAtlas {
             glint_armor: (vec![0; 4], 1, 1),
             white,
             text_shaders: Default::default(),
+            model_shaders: Default::default(),
             lines_shader: None,
             sky_shader: None,
             stars_shader: None,
@@ -1192,6 +1218,7 @@ impl HudAtlas {
             random_textures: Default::default(),
             emissive: Default::default(),
             blinks: Default::default(),
+            dynamic_texture_page: None,
         }
     }
     /// Shelf placements of `images` (tallest first) in the narrowest atlas
@@ -1806,6 +1833,7 @@ impl HudAtlas {
             glint,
             glint_armor,
             text_shaders: Default::default(),
+            model_shaders: Default::default(),
             lines_shader: None,
             sky_shader: None,
             stars_shader: None,
@@ -1819,6 +1847,7 @@ impl HudAtlas {
             blinks,
             font,
             white,
+            dynamic_texture_page: None,
         })
     }
     /// `misc/<name>.png` on its own, or a transparent texel if the resource
@@ -2027,6 +2056,9 @@ pub enum Blend {
     /// The same blit as the atlas tiles it draws natively, translucent: drawn unless the pack's
     /// shader draws the `PackBlit` of picture `id` after it.
     PackBlitNative(u64),
+    /// A baked GUI item material, with `Lighting.Entry.ITEMS_3D` when true
+    /// and `ITEMS_FLAT` when false.
+    ItemModel(bool),
 }
 
 /// The blend selected by `GuiGraphicsExtractor.fill` and `textHighlight`.
@@ -2386,6 +2418,26 @@ impl HudBatch {
                 text: 0,
             });
         }
+    }
+    /// A face of `GuiItemAtlas.drawToSlot`. A non-glint model uses the spare
+    /// glint attribute for its three signed, quantized normal components.
+    pub fn item_model_quad(
+        &mut self,
+        p: [[f32; 3]; 4],
+        uv: [[f32; 2]; 4],
+        normal: [f32; 3],
+        color: u32,
+        block_light: bool,
+    ) {
+        let start = self.vertices.len();
+        self.quad_3d(p, uv, color);
+        let normal = normal.into_iter().enumerate().fold(0u32, |bits, (i, n)| {
+            bits | (((n.clamp(-1.0, 1.0) * 127.0).round() as i32 + 127) as u32) << (i * 8)
+        });
+        for v in &mut self.vertices[start..] {
+            v.glint_uv[0] = normal as f32;
+        }
+        self.blend_since(start, Blend::ItemModel(block_light));
     }
     /// `RenderTypes.armorCutoutNoCullGlint` (and the items' glint types) over a
     /// [`Self::quad_3d`] face: `uv` is the face's atlas UV,
@@ -3447,6 +3499,7 @@ pub struct HudRenderer {
     /// group for each picture a `Blend::PackBlit` reads.
     pack_blit: Option<pack_text::PackText>,
     pack_blit_groups: HashMap<u64, wgpu::BindGroup>,
+    pub(crate) pack_item: Option<crate::gfx::core_models::Gui>,
     /// Target pixels per window pixel: above 1 for a screenshot drawn larger than the
     /// window (`Renderer::screenshot_quality`).
     pub zoom: f32,
@@ -3742,8 +3795,13 @@ impl HudRenderer {
             pack_gui: None,
             pack_blit: None,
             pack_blit_groups: HashMap::new(),
+            pack_item: None,
             zoom: 1.0,
         })
+    }
+
+    pub(crate) fn pack_model_coverage(&self) -> bool {
+        self.coverage
     }
     /// Draw the CIT glint layers of `textures` (the pack's enchantment rules); `None` or no
     /// textures draws none.
@@ -3901,6 +3959,9 @@ impl HudRenderer {
         {
             pack.prepare(uploads, encoder, batch, size, batch.scale * self.zoom);
         }
+        if let Some(item) = &self.pack_item {
+            item.prepare(uploads, encoder, batch, size, batch.scale * self.zoom);
+        }
     }
     /// Draw the batch `prepare` staged.
     pub fn draw(
@@ -4028,6 +4089,14 @@ impl HudRenderer {
                     } => &self.through_walls_overlay_pipeline,
                     Blend::Vignette => &self.vignette_pipeline,
                     Blend::EndPortal => &self.end_portal_pipeline,
+                    Blend::ItemModel(block_light) => {
+                        if let Some(item) = &self.pack_item {
+                            item.draw(&mut pass, range.clone(), *block_light, coverage.is_some());
+                            pass.set_bind_group(0, &self.group, &[]);
+                            continue;
+                        }
+                        &self.pipeline
+                    }
                     Blend::CitGlint(blend) => {
                         if let Some(cit) = &self.cit_glint {
                             cit.draw(&mut pass, *blend, range.clone(), coverage.is_some());
@@ -4152,7 +4221,8 @@ mod tests {
         assert!(atlas.object_skins.is_empty());
     }
 
-    /// The mod image slot is paid only by a game with a client mod loaded.
+    /// The mod image slot and the dynamic texture page are paid only by a game with a client
+    /// mod loaded; no sprite name reaches the page.
     #[test]
     fn the_mod_image_slot_exists_only_when_a_mod_is_loaded() {
         let root = Path::new("/nonexistent/horizon-test-assets");
@@ -4161,6 +4231,7 @@ mod tests {
         ))
         .unwrap();
         assert!(!plain.sprites.contains_key(MOD_IMAGE_SPRITE));
+        assert_eq!(plain.dynamic_texture_page, None);
         let with_mod = HudAtlas::build_over_with_image(
             &horizon_assets::resource_source::ResourceSource::directory(root.to_path_buf()),
             &horizon_assets::resource_source::ResourceSource::directory(root.to_path_buf()),
@@ -4168,6 +4239,10 @@ mod tests {
         )
         .unwrap();
         assert!(with_mod.sprites.contains_key(MOD_IMAGE_SPRITE));
+        let page = with_mod.dynamic_texture_page.expect("a page");
+        assert_eq!(page.size, dynamic_textures::PAGE);
+        assert_eq!(page.atlas, [with_mod.width, with_mod.height]);
+        assert!(!with_mod.sprites.contains_key(dynamic_textures::PAGE_SPRITE));
     }
 
     #[test]

@@ -55,8 +55,10 @@ clients mesh chunks and show loading progress; a client never runs a simulation 
 Connecting or disconnecting changes `remote`, independently of the execution role.
 
 The server thread has a hub without a host player. The window joins it through memory as one
-more player. It still sets `options.dedicated` for gameplay checks outside the role migration's
-startup/world-loading scope. Everything above serves both servers, and `server_dimension_players`
+more player. The server loads the chunks held by saved tickets before opening the owner's memory
+connection, so this work does not run down the login timeout. The server thread still sets
+`options.dedicated` for gameplay checks outside the role migration's startup/world-loading scope.
+Everything above serves both servers, and `server_dimension_players`
 (vanilla clients on Horizon's dedicated server) and `lan_e2e` (Horizon clients on the
 server thread) check it from the two sides.
 
@@ -92,10 +94,12 @@ block the save.
 
 ## What's checked
 
-`python3 tools/lan_e2e.py --check portals --check levels`:
+`python3 tools/lan_e2e.py --check portals --check levels --check boat_end_portal`:
 
 - `portals`: the guest goes to the Nether through a portal while the host stays. The host then goes
   to the End while the guest is in the Nether, so three levels run at once, and both come back.
+- `boat_end_portal`: the host and then the guest paddle a boat off a ledge. The boat crosses the
+  thin End portal between its two movement endpoints, and each rider arrives still in its boat.
 - `levels`, with the host and the guest each in a level of its own:
   - `execute in the_nether run tp` moves the guest alone. From the Nether, `execute in overworld` and
     `execute at` the host change and test blocks in the host's level.
