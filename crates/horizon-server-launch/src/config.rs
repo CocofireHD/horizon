@@ -48,6 +48,9 @@ seed = ""                    # empty: a random seed on the first start
 game_mode = "survival"       # survival, creative, adventure or spectator
 difficulty = "easy"          # peaceful, easy, normal or hard
 hardcore = false             # one life: a player who dies becomes a spectator
+level_type = "minecraft:normal" # a new world's preset: minecraft:flat, large_biomes, amplified, single_biome_surface
+generator_settings = "{}"    # a JSON object; minecraft:flat reads its layers and biome from it
+generate_structures = true   # villages, temples, strongholds and the like in a new world
 
 # Any other server.properties key, spelled as vanilla spells it, for example:
 # spawn-protection = 16
@@ -135,7 +138,7 @@ enabled = true               # false pauses it and keeps the webhook
 "##;
 
 /// Each typed setting: its section, its name, and the vanilla key it writes.
-pub const TYPED: [(&str, &str, &str); 21] = [
+pub const TYPED: [(&str, &str, &str); 24] = [
     ("server", "motd", "motd"),
     ("server", "port", "server-port"),
     ("server", "bind", "server-ip"),
@@ -181,6 +184,17 @@ pub const TYPED: [(&str, &str, &str); 21] = [
     ("world", "game_mode", "gamemode"),
     ("world", "difficulty", "difficulty"),
     ("world", "hardcore", "hardcore"),
+    ("world", "level_type", "level-type"),
+    ("world", "generator_settings", "generator-settings"),
+    ("world", "generate_structures", "generate-structures"),
+];
+
+/// The typed settings a `server.toml` from before they were typed sets under `[properties]`: there, and not
+/// in `[world]`, they are taken as the typed setting rather than refused ([`Config::parse`]).
+const ONCE_UNTYPED: [(&str, &str); 3] = [
+    ("level_type", "level-type"),
+    ("generator_settings", "generator-settings"),
+    ("generate_structures", "generate-structures"),
 ];
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -438,6 +452,12 @@ pub struct World {
     pub game_mode: String,
     pub difficulty: String,
     pub hardcore: bool,
+    /// The world preset a new world is made with (`level-type`); vanilla lower-cases it, and an id it
+    /// doesn't know makes a `minecraft:normal` world with a warning.
+    pub level_type: String,
+    /// `generator-settings`: a JSON object, which only `minecraft:flat` reads.
+    pub generator_settings: String,
+    pub generate_structures: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -700,6 +720,9 @@ impl Default for World {
             game_mode: "survival".into(),
             difficulty: "easy".into(),
             hardcore: false,
+            level_type: "minecraft:normal".into(),
+            generator_settings: "{}".into(),
+            generate_structures: true,
         }
     }
 }
@@ -739,9 +762,36 @@ fn text_or_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::E
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
-        let config: Self = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut config: Self = toml::from_str(text).map_err(|e| e.to_string())?;
+        config.adopt_once_untyped(text);
         config.check()?;
         Ok(config)
+    }
+
+    /// A setting of [`ONCE_UNTYPED`] that `[properties]` sets and `[world]` doesn't: the typed setting, so a
+    /// `server.toml` written before it was typed still starts. Set in both, it stays in `[properties]` and
+    /// [`Config::check`] refuses it.
+    fn adopt_once_untyped(&mut self, text: &str) {
+        let written: toml::Table = toml::from_str(text).unwrap_or_default();
+        let in_world = |field: &str| {
+            written
+                .get("world")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|w| w.contains_key(field))
+        };
+        let mut world = toml::Table::try_from(&self.world).expect("[world] is a table");
+        for (field, key) in ONCE_UNTYPED {
+            let Some(value) = self.properties.get(key).filter(|_| !in_world(field)) else {
+                continue;
+            };
+            if let Some(typed) = typed_value(&property_text(value), &world[field]) {
+                world.insert(field.into(), typed);
+                self.properties.remove(key);
+            }
+        }
+        if let Ok(adopted) = world.try_into() {
+            self.world = adopted;
+        }
     }
 
     pub fn load(dir: &Path) -> Result<Self, String> {
@@ -780,6 +830,15 @@ impl Config {
                 w.name
             ));
         }
+        // Read as the game reads it, so a value the game would refuse at its start is refused here.
+        let mut settings = Properties::default();
+        settings.put("generator-settings", w.generator_settings.clone());
+        ServerProperties::new(settings, &mut SystemEntropy::default()).map_err(|e| {
+            format!(
+                "world.generator_settings is {:?}: it must be a JSON object ({e})",
+                w.generator_settings
+            )
+        })?;
         self.backups.interval()?;
         self.panel.address()?;
         self.api.check()?;
@@ -867,6 +926,20 @@ impl Config {
                 ((*key).to_owned(), property_text(&table[*section][*field]))
             })
             .collect();
+        // As the game stores them when it starts (lower-cased, the JSON compact), so its rewrite of
+        // server.properties is no change for `sync_back` to copy into server.toml.
+        const STORED: [&str; 2] = ["level-type", "generator-settings"];
+        let mut world = Properties::default();
+        for (key, value) in out.iter().filter(|(k, _)| STORED.contains(&k.as_str())) {
+            world.put(key, value.clone());
+        }
+        if let Ok(read) = ServerProperties::new(world, &mut SystemEntropy::default()) {
+            for (key, value) in out.iter_mut().filter(|(k, _)| STORED.contains(&k.as_str())) {
+                if let Some(stored) = read.raw.get(key) {
+                    *value = stored.to_owned();
+                }
+            }
+        }
         out.extend(
             self.properties
                 .iter()
@@ -1097,29 +1170,117 @@ static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// default, and the next start would write those into `server.properties`. Another process (the
 /// CLI's `config set`) has its own temporary file.
 pub(crate) fn replace(path: &Path, text: &str) -> std::io::Result<()> {
+    replace_with(path, text, || {})
+}
+
+/// [`replace`], with `before_publish` run once per attempt between staging and publishing (a test
+/// uses it to create the destination at that moment).
+fn replace_with(path: &Path, text: &str, mut before_publish: impl FnMut()) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .map_or_else(Default::default, |n| n.to_string_lossy());
-    let tmp = path.with_file_name(format!(
-        ".{name}.{}.{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let written = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut file, text.as_bytes())?;
-        file.sync_all()?;
-        if let Ok(meta) = std::fs::metadata(path) {
-            std::fs::set_permissions(&tmp, meta.permissions())?;
+    loop {
+        let tmp = path.with_file_name(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A target that is missing is a new file; any other failure to look at it is the caller's to
+        // see, not a reason to treat the file as new.
+        let old = match std::fs::metadata(path) {
+            Ok(meta) => Some(meta),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // These files hold secrets (the RCON password, the management secret, the API token): with an
+        // old file to keep the mode of, the temporary one is owner-only until it has that mode, so it
+        // is never more readable than what it replaces. A new file gets the default mode, as vanilla's.
+        #[cfg(unix)]
+        if old.is_some() {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         }
-        std::fs::rename(&tmp, path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        // A temporary name taken by another writer fails here, and that writer's file is left alone:
+        // only a file this call created is removed below.
+        let mut file = options.open(&tmp)?;
+        let written = (|| {
+            std::io::Write::write_all(&mut file, text.as_bytes())?;
+            file.sync_all()?;
+            // The old file's mode, read as late as possible and applied to the staged file's own
+            // handle before it is renamed into place.
+            if old.is_some() {
+                match std::fs::metadata(path) {
+                    Ok(meta) => file.set_permissions(meta.permissions())?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })();
+        // Closed before the rename and the cleanup, as Windows may refuse either on an open file.
+        drop(file);
+        before_publish();
+        let published = written.and_then(|()| {
+            if old.is_some() {
+                std::fs::rename(&tmp, path).map(|()| true)
+            } else {
+                publish_new(&tmp, path)
+            }
+        });
+        if !matches!(published, Ok(true)) {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        match published {
+            Ok(true) => return Ok(()),
+            // A file appeared at the path while this one was staged (another initializer, an admin):
+            // it is not clobbered with the default mode; the next attempt replaces it keeping its mode.
+            Ok(false) => continue,
+            Err(e) => return Err(e),
+        }
     }
-    written
+}
+
+/// Puts the staged file `tmp` at `path` only if nothing is there yet: `Ok(false)` when something
+/// is, and `tmp` is left for the caller to remove. A hard link fails when its name exists, where a
+/// rename would replace it. A file system without hard links gets the file created at `path` only
+/// if it is absent (`create_new`) and `tmp`'s text copied into it, so nothing there is replaced.
+fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<bool> {
+    match std::fs::hard_link(tmp, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(tmp);
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(_) => {
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            let copied = std::fs::File::open(tmp)
+                .and_then(|mut src| std::io::copy(&mut src, &mut file))
+                .and_then(|_| file.sync_all());
+            drop(file);
+            match copied {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(tmp);
+                    Ok(true)
+                }
+                // Only the file this call created is removed.
+                Err(e) => {
+                    let _ = std::fs::remove_file(path);
+                    Err(e)
+                }
+            }
+        }
+    }
 }
 
 /// Sets one typed setting in `server.toml` (`whitelist on`), keeping the owner's comments.
@@ -1154,8 +1315,23 @@ fn load_properties(path: &Path, bytes: &[u8]) -> Result<Properties, String> {
         .map_err(|(e, line)| format!("{}, line {line}: {e}", path.display()))
 }
 
-/// Sets one value in a TOML document, keeping the comment after the old value.
+/// Sets one value in a TOML document, keeping the comment after the old value. A [`ONCE_UNTYPED`] setting
+/// that `[world]` doesn't hold yet moves there: its `[properties]` key goes, or the document would set it
+/// twice. Set in both places already, both stay and [`Config::parse`] refuses the document.
 fn set(doc: &mut toml_edit::DocumentMut, section: &str, key: &str, value: &toml::Value) {
+    let in_section = doc
+        .get(section)
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(|t| t.contains_key(key));
+    if section == "world"
+        && !in_section
+        && let Some((_, untyped)) = ONCE_UNTYPED.iter().find(|(field, _)| *field == key)
+        && let Some(properties) = doc
+            .get_mut("properties")
+            .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        properties.remove(untyped);
+    }
     let Some(table) = doc
         .entry(section)
         .or_insert_with(toml_edit::table)
@@ -1218,6 +1394,66 @@ mod tests {
             p.put(k, (*v).to_owned());
         }
         p
+    }
+
+    /// The replacement itself runs everywhere; the mode it keeps is a Unix check.
+    #[test]
+    fn replace_keeps_the_mode_of_the_file_it_replaces() {
+        let dir = std::env::temp_dir().join(format!("horizon-replace-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.properties");
+        std::fs::write(&path, "old").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o640))
+            .unwrap();
+        replace(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&path).unwrap().permissions()
+            ) & 0o777,
+            0o640
+        );
+        // A new file is made too, and no temporary file stays.
+        replace(&dir.join("fresh.properties"), "x").unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file that appears while a new one is staged (another initializer's owner-only file) is not
+    /// replaced by a default-mode file: the write retries as a replacement and keeps its mode.
+    #[test]
+    fn a_file_that_appears_during_a_new_write_keeps_its_mode() {
+        let dir = std::env::temp_dir().join(format!("horizon-replace-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut first = true;
+        replace_with(&path, "new", || {
+            if std::mem::take(&mut first) {
+                std::fs::write(&path, "theirs").unwrap();
+                #[cfg(unix)]
+                std::fs::set_permissions(
+                    &path,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                )
+                .unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&path).unwrap().permissions()
+            ) & 0o777,
+            0o600
+        );
+        // No temporary file of either attempt stays.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `server.toml` is checked as `config set` checks `backups.keep`: 0 would make the supervisor delete
@@ -1284,6 +1520,93 @@ keep = {keep}
         assert!(interval("6é").is_err());
         assert!(interval("é").is_err());
         assert!(interval(&format!("{}d", u64::MAX)).is_err());
+    }
+
+    /// `level-type`, `generator-settings` and `generate-structures` are typed `[world]` keys, written as the game
+    /// stores them (lower-cased, the JSON compact), so its rewrite of server.properties changes nothing.
+    #[test]
+    fn a_new_worlds_preset_is_typed_and_written_as_the_game_stores_it() {
+        let config = Config::parse(
+            r#"[world]
+level_type = "Minecraft:Flat"
+generator_settings = '{ "layers": [ { "block": "minecraft:stone", "height": 1 } ] }'
+generate_structures = false
+"#,
+        )
+        .unwrap();
+        let written = config.vanilla();
+        let value = |key: &str| {
+            written
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(value("level-type"), Some("minecraft:flat"));
+        assert_eq!(
+            value("generator-settings"),
+            Some(r#"{"layers":[{"block":"minecraft:stone","height":1}]}"#)
+        );
+        assert_eq!(value("generate-structures"), Some("false"));
+        // What the game refuses at its start is refused here.
+        let err = Config::parse("[world]\ngenerator_settings = \"[1]\"\n").unwrap_err();
+        assert!(err.contains("world.generator_settings"), "got {err:?}");
+    }
+
+    /// A `server.toml` from before these keys were typed sets them under `[properties]`: it still starts, with
+    /// the value as the typed key's. Set in both places, the `[properties]` one is refused as for any typed key.
+    #[test]
+    fn a_preset_set_under_properties_before_it_was_typed_is_taken() {
+        let config = Config::parse(
+            r#"[properties]
+level-type = "minecraft:amplified"
+generate-structures = false
+spawn-protection = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.world.level_type, "minecraft:amplified");
+        assert!(!config.world.generate_structures);
+        assert_eq!(
+            config.properties.keys().collect::<Vec<_>>(),
+            ["spawn-protection"]
+        );
+        let err = Config::parse(
+            r#"[world]
+level_type = "minecraft:flat"
+[properties]
+level-type = "minecraft:amplified"
+"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "[properties] sets level-type: set world.level_type instead"
+        );
+    }
+
+    /// `config set` (and the API, and `sync_back`) on a `server.toml` that sets the preset the old way, under
+    /// `[properties]`: the setting moves to `[world]` with the new value, instead of the file setting it twice.
+    #[test]
+    fn setting_a_preset_set_under_properties_moves_it_to_world() {
+        let dir = std::env::temp_dir().join(format!("horizon-server-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(FILE),
+            "[properties]\nlevel-type = \"minecraft:flat\"\nspawn-protection = 0\n",
+        )
+        .unwrap();
+        let amplified = toml::Value::String("minecraft:amplified".into());
+        update(&dir, "world", "level_type", amplified).unwrap();
+        let text = std::fs::read_to_string(dir.join(FILE)).unwrap();
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.world.level_type, "minecraft:amplified");
+        assert!(!text.contains("level-type"), "{text}");
+        assert_eq!(
+            config.properties.keys().collect::<Vec<_>>(),
+            ["spawn-protection"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Bind prepared registry states to model choices; bake each transformed model
 //! once and share its geometry across positions. Resource failure recovery and
 //! resource-pack reloads remain separate work.
+pub(super) mod baking_result;
+
 use crate::{Result, sprites::Sprites};
 use horizon_assets::{
     bake::{BlockModelTransform, ModelQuad, RenderType, bake_block_model},
@@ -48,7 +50,7 @@ impl QuadShape {
         const SOUTH: usize = 3;
         const WEST: usize = 4;
         const EAST: usize = 5;
-        let (mut min, mut max) = ([32f32; 3], [-32f32; 3]);
+        let (mut min, mut max) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
         for p in positions {
             for i in 0..3 {
                 min[i] = min[i].min(p[i]);
@@ -230,16 +232,7 @@ fn bake_resolved(
         .into_iter()
         .map(|quad| {
             let layer = sprites.insert(&quad.material.sprite)?;
-            // A model's `render_type` replaces the pass its sprite would pick.
-            let (translucent, opaque) = match quad.render_type {
-                Some(RenderType::Translucent | RenderType::Tripwire) => (true, false),
-                Some(RenderType::Solid) => (false, true),
-                Some(RenderType::Cutout | RenderType::CutoutMipped) => (false, false),
-                None | Some(RenderType::Unsupported) => (
-                    quad.material.force_translucent || sprites.translucent[layer as usize],
-                    sprites.region_opaque(layer, &quad.uv),
-                ),
-            };
+            let (translucent, opaque) = face_transparency(sprites, &quad, layer);
             Ok(BakedFace::new(quad, layer, opaque, translucent, None))
         })
         .collect::<Result<_>>()?;
@@ -250,6 +243,19 @@ fn bake_resolved(
         faces,
         cube,
     })
+}
+
+fn face_transparency(sprites: &Sprites, quad: &ModelQuad, layer: u32) -> (bool, bool) {
+    // A model's `render_type` replaces the pass its sprite would pick.
+    match quad.render_type {
+        Some(RenderType::Translucent | RenderType::Tripwire) => (true, false),
+        Some(RenderType::Solid) => (false, true),
+        Some(RenderType::Cutout | RenderType::CutoutMipped) => (false, false),
+        None | Some(RenderType::Unsupported) => (
+            quad.material.force_translucent || sprites.translucent[layer as usize],
+            sprites.region_opaque(layer, &quad.uv),
+        ),
+    }
 }
 
 /// `FaceBakery.bakeQuad`: use the same centered geometry and inverse face UV
@@ -513,9 +519,18 @@ impl StateModels {
                 models.block_library_or_missing(root, names)?
             }
         };
+        // A model that reads but does not resolve (a cycle, a composite past its budget) is the
+        // missing model for its variants only, as an item's is; the other blocks still bake.
         let resolved: Vec<_> = variants
             .iter()
-            .map(|(name, ..)| library.resolve(name))
+            .map(|(name, ..)| {
+                library.resolve(name).or_else(|e| {
+                    log::warn!(
+                        "Horizon: block model {name} not resolved ({e}); using the missing model"
+                    );
+                    library.resolve(horizon_assets::resolve::MISSING_MODEL)
+                })
+            })
             .collect();
         // Every texture the models name, decoded side by side before the bake adds them one
         // by one in its own order, as many as the renderer's arrays hold.
@@ -994,6 +1009,68 @@ mod tests {
             1,
             "asset reads did not touch prepared tables"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_model_that_does_not_resolve_is_the_missing_model_for_its_block_only() -> Result<()> {
+        use crate::resource_source::ResourceSource;
+        use {horizon_core::nbt::Tag, horizon_world::DATA_VERSION};
+        let fixture = Fixture(
+            std::env::temp_dir().join(format!("horizon-unresolved-{}", std::process::id())),
+        );
+        fixture.write(
+            "demo:block/good",
+            r##"{"textures":{"all":"demo:block/good"},"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{"up":{"texture":"#all"}}}]}"##,
+        );
+        // Each alias copies the 64 KiB sprite: past what one resolve may copy.
+        let mut textures = vec![format!(r#""all":"demo:block/{}""#, "a".repeat(64 << 10))];
+        textures.extend((0..32).map(|i| format!(r##""a{i}":"#all""##)));
+        fixture.write(
+            "demo:block/huge",
+            &format!(r#"{{"textures":{{{}}}}}"#, textures.join(",")),
+        );
+        let mut names = Vec::new();
+        let mut states = Vec::new();
+        for block in ["good", "huge"] {
+            let path = fixture
+                .0
+                .join(format!("assets/demo/blockstates/{block}.json"));
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(
+                path,
+                format!(r#"{{"variants":{{"":{{"model":"demo:block/{block}"}}}}}}"#),
+            )?;
+            names.push(format!("demo:{block}"));
+            states.push(
+                BlockState {
+                    name: format!("demo:{block}"),
+                    properties: Default::default(),
+                }
+                .to_nbt(),
+            );
+        }
+        let registry = BlockRegistry::from_nbt(&Tag::compound([
+            ("DataVersion", Tag::Int(DATA_VERSION)),
+            ("states", Tag::List(states)),
+            (
+                "defaults",
+                Tag::compound([("demo:good", Tag::Int(0)), ("demo:huge", Tag::Int(1))]),
+            ),
+        ]))?;
+        let facts: BTreeMap<String, Value> = serde_json::from_str(
+            r#"{"demo:good":{"schema":{},"states":[{}]},"demo:huge":{"schema":{},"states":[{}]}}"#,
+        )?;
+        let source = ResourceSource::directory(fixture.0.clone());
+        let mut sprites = Sprites::new(source.clone());
+        let blocks: Vec<&str> = names.iter().map(String::as_str).collect();
+        let catalog = StateModels::from_facts(&source, &registry, &blocks, &mut sprites, &facts)?;
+        let faces = |state| -> Result<usize> {
+            let picked = catalog.collect(BlockStateId(state), BlockPos::new(0, 0, 0))?;
+            Ok(picked[0].1.faces.len())
+        };
+        assert_eq!(faces(0)?, 1, "the good block keeps its own model");
+        assert_eq!(faces(1)?, 6, "the other one is the missing cube");
         Ok(())
     }
 

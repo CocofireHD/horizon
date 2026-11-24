@@ -9,7 +9,7 @@ use crate::{
     graphics::{
         EntityCullingMode, FarDetail, FrameGeneration, GpuCullingMode, GraphicsApi, HdrLook,
         HdrMode, HdrSetup as Setup, LeafCullingMode, Overlay, Pacing, ParallelTickMode,
-        ParticleCullingMode, PresentMode, Preset, Upscaling,
+        ParticleCullingMode, PresentMode, Preset, RayTracingMode, Upscaling,
     },
     graphics_style::Cost,
     lang,
@@ -21,6 +21,30 @@ use crate::{
 
 /// The language key of the screen's name.
 const TITLE: &str = "Graphics";
+
+/// The language key of the Performance page's warning while the OS's energy saver is on: the
+/// system's own switch, which these settings don't set. The page says that and nothing more;
+/// whether and how much it costs frames is the system's business, not this screen's.
+const OS_ENERGY_SAVER: &str = "horizon.graphics.os_energy_saver";
+
+/// The language key of the page's warning while the OS holds the CPU below full speed for heat:
+/// that one does slow the game, and the page says so in the warning colour above its description.
+const OS_THERMAL_LIMIT: &str = "horizon.graphics.os_thermal_limit";
+
+/// What the OS reports about this machine right now, as the key of the warning the Performance page
+/// shows, or `None` while it reports nothing (`horizon_system::power`). The thermal limit wins when
+/// both are on: it is the one that costs frames.
+fn os_limit() -> Option<&'static str> {
+    let sample = horizon_system::power::sample();
+    if !sample.limited() {
+        return None;
+    }
+    Some(if sample.thermal.limited() {
+        OS_THERMAL_LIMIT
+    } else {
+        OS_ENERGY_SAVER
+    })
+}
 
 /// The screen's pages, in its order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +141,8 @@ pub enum H {
     HdrLook,
     BatteryMode,
     ShadowCache,
+    /// Hardware ray tracing for packs that declare it (`Graphics::ray_tracing`): Auto, On or Off.
+    RayTracing,
     /// Opens the shader pack list (`options_ui::Page::ShaderPacks`).
     ShaderPacks,
     GraphicsApi,
@@ -336,6 +362,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             "Leaves with see-through gaps. Off draws them solid.",
                         ),
                         v(
+                            Opt::BetterGrass,
+                            Low,
+                            "horizon.options.better_grass.tooltip",
+                        ),
+                        v(
                             Opt::ImprovedTransparency,
                             Medium,
                             "Sorts water and glass more exactly behind each other.",
@@ -536,6 +567,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         H::ShadowCache,
                         Saves,
                         "Reuses the pack shadow map when sun, view and world match. Off by default.",
+                    ),
+                    h(
+                        H::RayTracing,
+                        High,
+                        "Ray tracing for packs that use it: Auto as the pack asks, On always, Off never.",
                     ),
                 ],
             )],
@@ -984,6 +1020,7 @@ impl H {
             ),
             H::BatteryMode => labelled("Battery Mode", on_off(g.battery)),
             H::ShadowCache => labelled("Shadow Cache", on_off(g.shadow_cache)),
+            H::RayTracing => labelled("Ray Tracing", g.ray_tracing.label()),
             // A press across the row, as Calibrate...: the list it opens shows the pick.
             H::ShaderPacks => Text::literal(lang::get("Shader Packs...")),
             H::GraphicsApi => labelled("Graphics API", g.api.label()),
@@ -1126,6 +1163,7 @@ impl H {
             H::HdrLook => g.hdr_look = step(&HdrLook::ALL, g.hdr_look, back),
             H::BatteryMode => g.battery = !g.battery,
             H::ShadowCache => g.shadow_cache = !g.shadow_cache,
+            H::RayTracing => g.ray_tracing = step(&RayTracingMode::ALL, g.ray_tracing, back),
             H::GraphicsApi => {
                 g.api = step(GraphicsApi::choices(), g.api, back);
                 g.watchdog_api = None;
@@ -1345,6 +1383,7 @@ impl Item {
                         | H::FrameGeneration
                         | H::BatteryMode
                         | H::ShadowCache
+                        | H::RayTracing
                         | H::GraphicsApi
                         | H::TranslucentBatching
                 )
@@ -1362,6 +1401,7 @@ impl Item {
                         | Opt::Vignette
                         | Opt::Autosave
                         | Opt::AttackIndicator
+                        | Opt::BetterGrass
                         | Opt::FovEffects
                 )
         );
@@ -1473,6 +1513,7 @@ fn read(s: &Settings) -> impl std::fmt::Debug + '_ {
         s.cutout_leaves,
         s.improved_transparency,
         &s.graphics_preset,
+        s.better_grass_mode(),
     );
     let window = (
         s.fullscreen,
@@ -1510,6 +1551,9 @@ impl Screen for GraphicsScreen {
             self.output,
             g::translucent_batching_offered(),
             g::gpu_culling_offer(),
+            // What the OS reports, not whether it reports something: a reason that changes without a
+            // moment of nothing (the saver, then the CPU's heat) has to rebuild the sheets too.
+            os_limit(),
         );
         shell::stamp_of(&(read(s), s.fullbright_held, &s.running_pack, offers))
     }
@@ -1518,7 +1562,13 @@ impl Screen for GraphicsScreen {
             id: page,
             name: lang::get(page.name()),
             about: lang::get(page.about()),
-            warning: None,
+            // What the machine is doing is no setting of this screen: when the OS itself limits
+            // the machine, the page that sells power use says what, before the player blames a
+            // switch for it.
+            warning: (page == Page::Performance)
+                .then(os_limit)
+                .flatten()
+                .map(lang::get),
             groups: groups
                 .into_iter()
                 .map(|(name, settings)| Group {
@@ -1606,6 +1656,7 @@ impl Screen for GraphicsScreen {
         s.chunk_fade = b.chunk_fade;
         s.mipmap_levels = b.mipmap_levels;
         s.cutout_leaves = b.cutout_leaves;
+        s.better_grass = b.better_grass_mode();
         s.improved_transparency = b.improved_transparency;
         s.prioritize_chunk_updates = b.prioritize_chunk_updates;
         // Presets set it beside the options above.

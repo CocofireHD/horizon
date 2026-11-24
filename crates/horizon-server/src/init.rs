@@ -23,6 +23,9 @@ pub struct Answers {
     pub eula: bool,
     pub world: Option<String>,
     pub seed: Option<String>,
+    /// A new world's preset (`level-type`), and its `generator-settings` JSON.
+    pub level_type: Option<String>,
+    pub generator_settings: Option<String>,
     pub port: Option<u16>,
     pub whitelist: Option<bool>,
     pub players: Vec<String>,
@@ -35,8 +38,9 @@ pub struct Answers {
 
 impl Answers {
     /// The answers in the environment, for containers: `HORIZON_EULA=true`, `HORIZON_WORLD`,
-    /// `HORIZON_SEED`, `HORIZON_PORT`, `HORIZON_WHITELIST=true|false` (also on/off, yes/no, 1/0), `HORIZON_PLAYERS` (names separated by
-    /// commas), `HORIZON_OP` and `HORIZON_ONLINE=true|false`. Flags given on the command line win.
+    /// `HORIZON_SEED`, `HORIZON_LEVEL_TYPE`, `HORIZON_GENERATOR_SETTINGS`, `HORIZON_PORT`,
+    /// `HORIZON_WHITELIST=true|false` (also on/off, yes/no, 1/0), `HORIZON_PLAYERS` (names separated by commas),
+    /// `HORIZON_OP` and `HORIZON_ONLINE=true|false`. Flags given on the command line win.
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -59,6 +63,8 @@ impl Answers {
             eula: flag("HORIZON_EULA")?.unwrap_or(false),
             world: var("HORIZON_WORLD"),
             seed: var("HORIZON_SEED"),
+            level_type: var("HORIZON_LEVEL_TYPE"),
+            generator_settings: var("HORIZON_GENERATOR_SETTINGS"),
             port: var("HORIZON_PORT")
                 .map(|p| {
                     p.parse()
@@ -166,7 +172,7 @@ pub fn run(dir: &Path, answers: Answers) -> Result<(), String> {
         std::fs::write(&eula_path, eula::file(now_millis(), true)).map_err(|e| e.to_string())?;
     }
 
-    // 2. The world: an existing one keeps its seed.
+    // 2. The world: an existing one keeps its seed and its preset.
     cfg.world.name = answers
         .world
         .unwrap_or_else(|| prompt.ask("World name", &cfg.world.name));
@@ -176,6 +182,12 @@ pub fn run(dir: &Path, answers: Answers) -> Result<(), String> {
         cfg.world.seed = answers
             .seed
             .unwrap_or_else(|| prompt.ask("Seed (empty for a random one)", &cfg.world.seed));
+        if let Some(level_type) = answers.level_type {
+            cfg.world.level_type = level_type;
+        }
+        if let Some(settings) = answers.generator_settings {
+            cfg.world.generator_settings = settings;
+        }
     }
 
     // 3. The port, checked free now rather than at the first start.
@@ -251,7 +263,10 @@ pub fn run(dir: &Path, answers: Answers) -> Result<(), String> {
         Err(e) => println!("{e}"),
     }
 
-    std::fs::write(&toml_path, config::render(&cfg)).map_err(|e| e.to_string())?;
+    // Owner only: server.toml can hold the API token, the RCON password and the Discord webhook.
+    // (Existing files keep their mode when the server rewrites them.)
+    horizon_platform::server_files::private_file::write_private(&toml_path, config::render(&cfg))
+        .map_err(|e| e.to_string())?;
     println!(
         "Wrote {}. Start the server with: horizon-server run --dir {}",
         toml_path.display(),
@@ -365,6 +380,10 @@ mod tests {
             eula: true,
             world: Some("survival".into()),
             seed: Some("12345".into()),
+            level_type: Some("minecraft:flat".into()),
+            generator_settings: Some(
+                r#"{"layers": [{"block": "minecraft:stone", "height": 1}]}"#.into(),
+            ),
             port: Some(25599),
             whitelist: Some(true),
             players: vec!["Alex".into(), "Steve".into()],
@@ -383,6 +402,11 @@ mod tests {
             ),
             ("survival", "12345", 25599)
         );
+        assert_eq!(cfg.world.level_type, "minecraft:flat");
+        assert_eq!(
+            cfg.world.generator_settings,
+            r#"{"layers": [{"block": "minecraft:stone", "height": 1}]}"#
+        );
         assert!(eula::agreed(&dir.join("eula.txt")).unwrap());
         assert!(!cfg.server.online_mode);
         let white = std::fs::read_to_string(dir.join("whitelist.json")).unwrap();
@@ -394,6 +418,16 @@ mod tests {
         assert!(
             ops.contains("\"Alex\"") && ops.contains("\"level\": 4"),
             "{ops}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(dir.join(config::FILE))
+                    .unwrap()
+                    .permissions()
+            ) & 0o777,
+            0o600,
+            "server.toml holds secrets"
         );
         // A second init refuses to overwrite the configuration.
         assert!(run(&dir, Answers::default()).is_err());

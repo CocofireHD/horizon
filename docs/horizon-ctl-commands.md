@@ -135,6 +135,11 @@ Every command `horizon-ctl` takes, its MCP tool in `horizon-ctl mcp` (the launch
 | `render-distance N` | CLI only | Chunks, 2..128 | `chunks` (integer, required): render distance |
 | `wait TICKS` | `wait` | Wait until TICKS game ticks have passed (20 per second) | `ticks` (integer, required): game ticks |
 
+`tp`, `give`, `xp`, `enchant`, `potion`, `effect`, `time`, `summon`, and a writing
+`container` require the world's host. To ask a multiplayer server to act, use `command`
+with the corresponding server command; the server checks the player's permissions.
+Reading `container` as a guest returns the items the client currently knows.
+
 ## Scripting and benchmarks
 
 | Command | MCP tool | What it does | Arguments |
@@ -194,7 +199,7 @@ The reply fields of the commands described so far (more follow, a group at a tim
 | `lod` | object | far terrain: distances, tiles, quads and sampling progress |
 | `renderer` | object, null | GPU, driver, backend, size, draw counts and GPU memory; null without a renderer |
 | `display` | object, null | the monitor: width, height, scale, refresh_hz; null without a window |
-| `server` | object, null | the connected server's address, name and state; null when not connected |
+| `server` | object, null | the connected server's address, name and state (status is connection or terrain-loading text, empty once the client has sent its loaded packet); null when not connected |
 
 ### `hello`
 

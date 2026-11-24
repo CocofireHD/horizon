@@ -770,6 +770,14 @@
   {
     "package": "horizon-client-render",
     "target": "lib",
+    "test": "level_loading::styled_loading_overlay_blends_both_logo_halves_on_gpu",
+    "path": "crates/horizon-client-render/src/level_loading.rs",
+    "reason": "requires a software Vulkan adapter",
+    "rationale": "Explicit software Vulkan test in tools/ci/ignored-tests/manual-horizon-client-render.txt; asserts both logo halves and the stock and styled progress bar on the real HUD pipeline."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
     "test": "particles::tick_bench::particle_tick_cost",
     "path": "crates/horizon-client-render/src/particles/tick_bench.rs",
     "reason": "a measurement, not a check",
@@ -858,6 +866,14 @@
   {
     "package": "horizon-core",
     "target": "lib",
+    "test": "paletted::tests::benchmark_pack_and_unpack_widths",
+    "path": "crates/horizon-core/src/paletted/tests.rs",
+    "reason": "microbenchmark; run with --ignored --nocapture",
+    "rationale": "Explicit manual runner by-hand in tools/ci/ignored-tests/manual-horizon-core.txt: microbenchmark; run with --ignored --nocapture. Not selected by daily shards."
+  },
+  {
+    "package": "horizon-core",
+    "target": "lib",
     "test": "paletted::tests::benchmark_palette_ids",
     "path": "crates/horizon-core/src/paletted.rs",
     "reason": "microbenchmark; run with --ignored --nocapture",
@@ -878,6 +894,14 @@
     "path": "crates/horizon-core/src/random/positional.rs",
     "reason": "benchmark",
     "rationale": "Existing explicit manual runner by-hand in tools/ci/ignored-tests/manual-horizon-core.txt: benchmark. Not selected by daily shards."
+  },
+  {
+    "package": "horizon-core",
+    "target": "lib",
+    "test": "storage::tests::benchmark_unpack",
+    "path": "crates/horizon-core/src/storage.rs",
+    "reason": "microbenchmark; run with --ignored --nocapture",
+    "rationale": "Explicit manual runner by-hand in tools/ci/ignored-tests/manual-horizon-core.txt: microbenchmark of PackedStorage::unpack_into; run with --release --ignored --nocapture. Not selected by daily shards; its correctness is covered by the other storage tests."
   },
   {
     "package": "horizon-items",
@@ -1218,10 +1242,26 @@
   {
     "package": "horizon-world",
     "target": "lib",
+    "test": "chunk::tests::benchmark_paletted_container_baseline",
+    "path": "crates/horizon-world/src/chunk/tests.rs",
+    "reason": "headless palette baseline; run with --ignored --nocapture",
+    "rationale": "Manual optimized timing on an idle host. Correctness comparisons run inside the benchmark, but timing is not a daily gate."
+  },
+  {
+    "package": "horizon-world",
+    "target": "lib",
     "test": "chunk::tests::benchmark_section_get_set",
     "path": "crates/horizon-world/src/chunk.rs",
     "reason": "microbenchmark; run with --ignored --nocapture",
     "rationale": "Opt-in measurement, not an ordinary daily correctness check: microbenchmark; run with --ignored --nocapture. Run by hand on an idle machine with the optimized profile and its explicitly requested inputs; all assertions remain in the test."
+  },
+  {
+    "package": "horizon-world",
+    "target": "lib",
+    "test": "level::fluids::tests::benchmark_lava_flood",
+    "path": "crates/horizon-world/src/level/fluids.rs",
+    "reason": "headless lava scene; run with --ignored --nocapture",
+    "rationale": "Manual optimized timing on an idle host. The scene checks spread and dispatch counts; timing is not a daily gate."
   },
   {
     "package": "horizon-world",
@@ -1238,5 +1278,13 @@
     "path": "crates/horizon-world/tests/it/world_io.rs",
     "reason": "microbenchmark; run with --ignored --nocapture",
     "rationale": "Existing explicit manual runner by-hand in tools/ci/ignored-tests/manual-horizon-world.txt: microbenchmark; run with --ignored --nocapture. Not selected by daily shards."
+  },
+  {
+    "package": "horizon-client-lib",
+    "target": "lib",
+    "test": "lan::hub::tests::block_send_bench::block_fanout_benchmark",
+    "path": "crates/horizon-client/src/lan/hub/tests/block_send_bench.rs",
+    "reason": "timing",
+    "rationale": "Opt-in measurement, not an ordinary daily correctness check: timing. Run by hand on an idle machine with HORIZON_BLOCK_FANOUT_BENCH=1 and the optimized profile; all assertions remain in the test."
   }
 ]

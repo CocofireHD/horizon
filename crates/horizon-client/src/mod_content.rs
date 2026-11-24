@@ -85,8 +85,19 @@ pub fn drop_dangling_remainders(mods: &mut Vec<ContentMod>) -> Vec<String> {
 /// The mods' mob effects in registry order: by id, as items are. Their
 /// network ids follow vanilla's in this order.
 pub fn mob_effects(mods: &[ContentMod]) -> Vec<&MobEffect> {
-    let mut effects: Vec<&MobEffect> = mods.iter().flat_map(|m| &m.content.effects).collect();
-    effects.sort_by(|a, b| a.id.cmp(&b.id));
+    mob_effects_with_owners(mods)
+        .into_iter()
+        .map(|(_, effect)| effect)
+        .collect()
+}
+
+/// The mods' mob effects in registry order alongside each effect's declaring mod id.
+pub fn mob_effects_with_owners(mods: &[ContentMod]) -> Vec<(&str, &MobEffect)> {
+    let mut effects: Vec<(&str, &MobEffect)> = mods
+        .iter()
+        .flat_map(|m| m.content.effects.iter().map(move |e| (m.id.as_str(), e)))
+        .collect();
+    effects.sort_by(|(_, a), (_, b)| a.id.cmp(&b.id));
     effects
 }
 
@@ -949,20 +960,17 @@ struct NewBlock<'a> {
     /// Each state's template state offset and combination index, in registry order
     /// (`state_order`).
     order: Vec<(u32, u32)>,
-    /// The sign whose item places this block on a wall, which makes that item
+    /// The primary block whose item places this block on a wall, which makes that item
     /// this block's too (`StandingAndWallBlockItem.registerBlocks`).
     wall_of: Option<String>,
 }
 impl NewBlock<'_> {
-    /// The item its gameplay row names when that is not the template's item
-    /// renamed: `block_item`, or `minecraft:air` for a block with no item
-    /// (a sign's wall form keeps the paired sign's). `Block.asItem` and, unless
-    /// the block has a `pick_item` row of its own, pick-block read this value.
+    /// Overrides the template's renamed item for `Block.asItem` and default pick-block.
     fn item_row(&self) -> Option<&str> {
-        match &self.decl.block_item {
-            Some(item) => Some(item),
-            None => (!self.decl.item && self.wall_of.is_none()).then_some("minecraft:air"),
-        }
+        self.wall_of
+            .as_deref()
+            .or(self.decl.block_item.as_deref())
+            .or_else(|| (!self.decl.item).then_some("minecraft:air"))
     }
 
     /// Template states and declared combinations in registry order.
@@ -982,8 +990,8 @@ struct NewItem {
     crafting_remainder: Option<String>,
     block: Option<String>,
     arm_pose: Option<horizon_mod_package::content::ArmPose>,
-    /// `StandingAndWallBlockItem.wallBlock`, when its block declares it.
-    wall_block: Option<String>,
+    /// Explicit standing/wall placement: wall block, attachment direction, hanging sign.
+    wall_pair: Option<(String, &'static str, bool)>,
     template: Option<String>,
 }
 
@@ -1647,14 +1655,15 @@ impl<'a> Plan<'a> {
                 });
             }
         }
-        // A sign's wall form, which `Content` checked against its mod's blocks.
+        // Wall forms inherit the paired block's item, even when their template has no item.
+        // `Content` already checked that the blocks belong to the same mod.
         let pairs: Vec<_> = blocks
             .iter()
             .filter_map(|b| Some((b.decl.wall_block.clone()?, b.decl.id.clone())))
             .collect();
-        for (wall, sign) in pairs {
+        for (wall, primary) in pairs {
             if let Some(block) = blocks.iter_mut().find(|b| b.decl.id == wall) {
-                block.wall_of = Some(sign);
+                block.wall_of = Some(primary);
             }
         }
         if next > MAX_STATES {
@@ -1703,7 +1712,17 @@ impl<'a> Plan<'a> {
                     crafting_remainder: None,
                     block: None,
                     arm_pose: None,
-                    wall_block: b.decl.wall_block.clone(),
+                    wall_pair: b.decl.wall_block.as_ref().map(|wall| {
+                        let hanging_sign = b.decl.template.ends_with("_hanging_sign");
+                        let attachment = if hanging_sign
+                            || b.decl.attachment_direction.as_deref() == Some("up")
+                        {
+                            "UP"
+                        } else {
+                            "DOWN"
+                        };
+                        (wall.clone(), attachment, hanging_sign)
+                    }),
                     template: None,
                 });
             }
@@ -1724,7 +1743,7 @@ impl<'a> Plan<'a> {
                     crafting_remainder: i.crafting_remainder.clone(),
                     block: i.block.clone(),
                     arm_pose: i.arm_pose,
-                    wall_block: None,
+                    wall_pair: None,
                     template: i.block.is_none().then(|| i.template.clone()),
                 });
             }
@@ -1770,9 +1789,7 @@ impl<'a> Plan<'a> {
     }
 
     /// What moves in a new block's copies of its template's rows: the
-    /// block, and the template's item when it has another name. A block
-    /// without an item gets `minecraft:air` where rows name one, except a
-    /// sign's wall form, whose item is the paired sign's.
+    /// block, and the template's item when it has another name.
     fn renames(&self, b: &NewBlock) -> Vec<Rename> {
         let mut out = vec![b.rename.clone()];
         let own = b.decl.item.then_some(b.decl.id.as_str());
@@ -1978,16 +1995,44 @@ impl<'a> Plan<'a> {
                 );
                 continue;
             }
+            if !components && let Some((wall, attachment, hanging_sign)) = &i.wall_pair {
+                let mut classes = vec![
+                    J::Str("StandingAndWallBlockItem".into()),
+                    J::Str("BlockItem".into()),
+                    J::Str("Item".into()),
+                ];
+                if *hanging_sign {
+                    classes.insert(0, J::Str("HangingSignItem".into()));
+                }
+                if let Some(J::Arr(template_classes)) =
+                    map.get(&i.rename.from).and_then(|v| v.get("class"))
+                    && template_classes
+                        .iter()
+                        .any(|v| matches!(v, J::Str(name) if name == "GameMasterBlockItem"))
+                {
+                    classes.insert(0, J::Str("GameMasterBlockItem".into()));
+                }
+                map.set(
+                    &i.rename.to,
+                    J::Obj(vec![
+                        ("class".into(), J::Arr(classes)),
+                        (
+                            "fields".into(),
+                            J::Obj(vec![
+                                ("block".into(), J::Str(i.rename.to.clone())),
+                                ("wallBlock".into(), J::Str(wall.clone())),
+                                ("attachmentDirection".into(), J::Str((*attachment).into())),
+                            ]),
+                        ),
+                    ]),
+                );
+                continue;
+            }
             let Some(v) = map.get(&i.rename.from) else {
                 continue;
             };
             let mut v = v.clone();
             v.rename(&i.rename, false);
-            if let Some(wall) = &i.wall_block
-                && let Some(fields) = v.get_mut("fields")
-            {
-                fields.set("wallBlock", J::Str(wall.clone()));
-            }
             if components {
                 if let Some(n) = i.max_stack_size {
                     v.set("minecraft:max_stack_size", J::Num(n.into()));
@@ -2190,6 +2235,24 @@ impl<'a> Plan<'a> {
                 }
             }
             "worldgen/blocks/survival-rules.json" => self.names(doc, false),
+            "worldgen/blocks/placement-definitions.json" => {
+                // `SimpleBlockFeature.place` dispatches by block class to
+                // `DoublePlantBlock.placeAt` or `MossyCarpetBlock.placeAt`.
+                // Content blocks inherit that dispatch from their template.
+                for key in ["double_plants", "mossy_carpets"] {
+                    if let Some(J::Arr(names)) = doc.get_mut(key) {
+                        let vanilla_count = names.len();
+                        for b in &self.blocks {
+                            if names[..vanilla_count]
+                                .iter()
+                                .any(|name| name.as_str() == Some(b.decl.template.as_str()))
+                            {
+                                names.push(J::Str(b.decl.id.clone()));
+                            }
+                        }
+                    }
+                }
+            }
             "worldgen/blocks/survival-extra-definitions.json" => {
                 if let Some(map) = doc.at("ignition_odds") {
                     self.names(map, false);
@@ -2522,7 +2585,7 @@ impl<'a> Plan<'a> {
 }
 
 /// The JSON and NBT tables rewritten for new blocks and items.
-const JSON_TABLES: [&str; 16] = [
+const JSON_TABLES: [&str; 17] = [
     "facts.json",
     "entity-types.json",
     "creative-inventory.json",
@@ -2539,6 +2602,7 @@ const JSON_TABLES: [&str; 16] = [
     "worldgen/blocks/structure-blocks.json",
     "worldgen/blocks/survival-rules.json",
     "worldgen/blocks/survival-extra-definitions.json",
+    "worldgen/blocks/placement-definitions.json",
 ];
 const NBT_TABLES: [&str; 6] = [
     "occlusion.nbt",
@@ -3325,7 +3389,10 @@ struct ModLayer<'a> {
 
 impl<'a> ModLayer<'a> {
     fn new(id: String, source: crate::packs::Source, jar: Option<&'a JarRef>) -> Result<Self> {
-        let source = source.open()?;
+        let mut source = source.open()?;
+        if let Some(jar) = jar.filter(|jar| jar.take().is_some()) {
+            source = taken(&id, source, jar);
+        }
         let data = crate::datapack::DataPack::from_source(id.clone(), source.clone());
         Ok(Self {
             assets: crate::packs::Pack::mod_layer(id, crate::packs::Source::Opened(source)),
@@ -3333,6 +3400,34 @@ impl<'a> ModLayer<'a> {
             jar,
         })
     }
+}
+
+/// A jar's view holding only the files its `take` keeps, so its asset pack and its data
+/// pack never see the rest. An entry that keeps nothing is logged, not refused: the
+/// jar's hash pins its files, and `cargo horizon-mod use-jar --take` already checked them.
+fn taken(
+    layer: &str,
+    source: horizon_assets::resource_source::ResourceSource,
+    jar: &JarRef,
+) -> horizon_assets::resource_source::ResourceSource {
+    use horizon_assets::resource_source::{Resource, ResourceSource};
+    let names = source.list("");
+    for entry in jar.take().unwrap_or_default() {
+        let within = |name: &String| {
+            name.strip_prefix(entry.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        };
+        if !names.iter().any(within) {
+            log::warn!("Horizon: mod layer {layer}: take entry {entry} matches no file in the jar");
+        }
+    }
+    ResourceSource::indexed(
+        names
+            .into_iter()
+            .filter(|name| jar.takes(name))
+            .map(|name| (name.clone(), Resource::file(source.clone(), name)))
+            .collect(),
+    )
 }
 
 struct ModLayers<'a> {
@@ -3381,8 +3476,8 @@ fn load_layers<'a>(jar_store: &Path, mods: &'a [ContentMod]) -> Result<Vec<ModLa
 
 /// Builds generated content tables for `mods` over `base` in `out`.
 /// Asset layers remain in their sources and are resolved by `resolved_resources`.
-/// Each jar's file is `<sha512>.jar` in `jar_store`, where the launcher
-/// puts it. A missing file refuses the load before decoded output is written.
+/// Each jar's file is `<sha512>.jar` in `jar_store` (staged there by
+/// `cargo horizon-mod use-jar` / `run`). A missing file refuses the load before decoded output is written.
 /// Returns warnings for shared tag replacements and duplicate asset paths.
 pub fn build(
     base: &Path,
@@ -3577,7 +3672,12 @@ const JAR_INPUTS: &str = "horizon-mod-jar-inputs.json";
 
 /// Check the accepted inputs of a composed resource root before server reload.
 /// This reads no candidate packages and never reopens or rehashes an archive.
-pub fn check_jars(root: &Path, jar_store: &Path) -> std::result::Result<(), JarInputsError> {
+/// A run of `side` checks only the jars it needs: a server's never names a client-only jar.
+pub fn check_jars(
+    root: &Path,
+    jar_store: &Path,
+    side: horizon_mod_package::manifest::Side,
+) -> std::result::Result<(), JarInputsError> {
     let marker = root.join(MARKER);
     if !marker.try_exists().map_err(|source| JarInputsError::Io {
         path: marker,
@@ -3590,9 +3690,10 @@ pub fn check_jars(root: &Path, jar_store: &Path) -> std::result::Result<(), JarI
         path: path.clone(),
         source,
     })?;
-    let requirements: Vec<horizon_mod_package::manifest::JarRequirement> =
+    let mut requirements: Vec<horizon_mod_package::manifest::JarRequirement> =
         serde_json::from_slice(&bytes)
             .map_err(|source| JarInputsError::Invalid { path, source })?;
+    requirements.retain(|requirement| requirement.needed_on(side));
     let missing = missing_jars(jar_store, &requirements).map_err(|source| JarInputsError::Io {
         path: jar_store.to_owned(),
         source,

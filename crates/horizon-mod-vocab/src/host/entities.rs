@@ -178,6 +178,12 @@ pub trait EntitiesBackend {
     /// False for a stale handle or on a client.
     #[access(WorldOnly)]
     fn entity_added_to_level(&self, entity: EntityRef) -> bool;
+    /// Side: server.
+    /// The online players currently tracking this entity (in its level or via a viewed level),
+    /// in the order the server keeps its players. Does not include the entity itself when it is
+    /// a player. None on a client, for a stale handle, or for an invalid/removed entity.
+    #[access(WorldOnly)]
+    fn entity_trackers(&self, entity: EntityRef) -> Option<Vec<PlayerRef>>;
     /// Side: both.
     /// The entity's position (`Entity.position`): its feet, the middle of
     /// its box for a painting or an item frame. A client display reports the
@@ -512,6 +518,19 @@ pub trait EntitiesBackend {
     /// On a client, the local player's own (`LocalPlayer`'s); None for any other entity there.
     #[access(WorldOnly)]
     fn entity_is_in_water(&self, entity: EntityRef) -> Option<bool>;
+    /// Side: both.
+    /// Whether the entity's eyes are submerged in water (`Entity.isUnderWater`:
+    /// `isEyeInFluid(WATER) && isInWater()`): players and mobs. On a client, reads its own
+    /// cached fluid update as `entity_eye_fluid` does. None for other kinds and stale handles.
+    #[access(WorldOnly)]
+    fn entity_is_under_water(&self, entity: EntityRef) -> Option<bool>;
+    /// Side: both.
+    /// Whether the entity is on fire (`Entity.isOnFire`): not fire-immune and either
+    /// burning (`fire_ticks > 0`) or carrying the client shared on-fire flag. Players, mobs,
+    /// armor stands and dropped items on a server; on a client, the local player's own fire
+    /// state, and None for any other entity there. None for other kinds and stale handles.
+    #[access(WorldOnly)]
+    fn entity_is_on_fire(&self, entity: EntityRef) -> Option<bool>;
     /// Side: both.
     /// Whether the entity is in lava (`Entity.isInLava`): players and mobs.
     /// On a client, the local player's own (`LocalPlayer`'s); None for any other entity there.

@@ -69,13 +69,27 @@ fn discovery_texture_uris(doc: &serde_json::Value) -> Option<Vec<String>> {
 /// `java.util.Base64.getDecoder().decode`.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     use base64::{
-        Engine,
-        engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+        Engine, alphabet,
+        engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
     };
-    STANDARD
-        .decode(text)
-        .or_else(|_| STANDARD_NO_PAD.decode(text))
-        .ok()
+    const JAVA_DECODER_PADDED: GeneralPurpose = GeneralPurpose::new(
+        &alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::RequireCanonical),
+    );
+    const JAVA_DECODER_NO_PAD: GeneralPurpose = GeneralPurpose::new(
+        &alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone),
+    );
+    let engine = if text.contains('=') {
+        &JAVA_DECODER_PADDED
+    } else {
+        &JAVA_DECODER_NO_PAD
+    };
+    engine.decode(text).ok()
 }
 
 // Limit owned string allocations as well as table entries: obsolete, rejected profile
@@ -190,6 +204,27 @@ pub fn unpack(value: &str, signature: Signature, valid_uris: &[impl AsRef<str>])
         *slot = Some(url.to_owned());
     }
     out
+}
+
+/// A `textures` property's value for `textures`: the base64 JSON payload [`unpack`] reads
+/// back. It names only the texture URLs, no profile id or name, and carries no signature.
+pub fn pack(textures: &Textures) -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let mut entries = serde_json::Map::new();
+    if let Some(url) = &textures.skin {
+        let mut skin = serde_json::json!({ "url": url });
+        if textures.slim {
+            skin["metadata"] = serde_json::json!({ "model": "slim" });
+        }
+        entries.insert("SKIN".into(), skin);
+    }
+    if let Some(url) = &textures.cape {
+        entries.insert("CAPE".into(), serde_json::json!({ "url": url }));
+    }
+    if let Some(url) = &textures.elytra {
+        entries.insert("ELYTRA".into(), serde_json::json!({ "url": url }));
+    }
+    STANDARD.encode(serde_json::json!({ "textures": entries }).to_string())
 }
 
 /// The skin URL of a `minecraft:profile` component's property list. Player
@@ -1533,6 +1568,26 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn packed_textures_unpack_to_themselves() {
+        let textures = super::Textures {
+            skin: Some("https://textures.minecraft.net/texture/skin1".into()),
+            slim: true,
+            cape: Some("https://textures.minecraft.net/texture/cape2".into()),
+            elytra: None,
+            signed: false,
+        };
+        let value = super::pack(&textures);
+        let back = super::unpack(&value, super::Signature::Unsigned, &super::TEXTURE_URIS);
+        assert_eq!(back, textures);
+        // No skin, no cape: nothing to name.
+        let none = super::pack(&super::Textures::default());
+        assert_eq!(
+            super::unpack(&none, super::Signature::Unsigned, &super::TEXTURE_URIS),
+            super::Textures::default()
+        );
+    }
+
+    #[test]
     fn an_invalid_name_is_answered_without_being_cached() {
         let mut resolver = super::Resolver::new();
         let key = super::NameOrId::Name("not a name!".into());
@@ -2772,5 +2827,44 @@ mod download_bound_tests {
             std::env::temp_dir(),
         ));
         assert!(d.resources.is_empty() && d.resource_order.is_empty());
+    }
+
+    #[test]
+    fn base64_decode_allows_java_nonzero_trailing_bits() {
+        // Canonical base64 of b"f" is "Zg==" (low 4 bits of 'g' are 0).
+        // Replacing 'g' (32 = 0b10_0000) with 'v' (47 = 0b10_1111) sets all 4 trailing bits;
+        // java.util.Base64.getDecoder().decode ignores them and yields b"f".
+        assert_eq!(
+            super::base64_decode("Zv==").as_deref(),
+            Some(b"f".as_slice())
+        );
+        assert_eq!(super::base64_decode("Zv").as_deref(), Some(b"f".as_slice()));
+        // Java rejects incomplete padding whenever '=' is present.
+        assert_eq!(super::base64_decode("Zv="), None);
+        assert_eq!(super::base64_decode("Zg="), None);
+
+        // A real textures JSON payload whose trailing bits are nonzero still unpacks the skin URL.
+        let json =
+            r#"{"textures":{"SKIN":{"url":"https://textures.minecraft.net/texture/abcdef"}}}"#;
+        assert_eq!(json.len() % 3, 2);
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let mut bytes = STANDARD.encode(json.as_bytes()).into_bytes();
+        assert_eq!(bytes.last(), Some(&b'='));
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let last_sym_idx = bytes.len() - 2;
+        let val = alphabet
+            .iter()
+            .position(|&b| b == bytes[last_sym_idx])
+            .unwrap();
+        // Flip the 2 unused low bits to nonzero (0b11).
+        bytes[last_sym_idx] = alphabet[val | 0b11];
+        let encoded = String::from_utf8(bytes).unwrap();
+        assert!(STANDARD.decode(&encoded).is_err());
+
+        let textures = super::unpack(&encoded, super::Signature::Signed, &super::TEXTURE_URIS);
+        assert_eq!(
+            textures.skin.as_deref(),
+            Some("https://textures.minecraft.net/texture/abcdef")
+        );
     }
 }

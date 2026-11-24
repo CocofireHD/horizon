@@ -2085,6 +2085,61 @@ fn session_lock_releases_while_a_descriptor_copy_lives() {
     drop(copy);
     let _ = std::fs::remove_dir_all(&dir);
 }
+/// #20841: vanilla's `DirectoryLock` takes Java's `FileChannel.tryLock()`, a POSIX
+/// record lock (`fcntl` `F_SETLK` over the whole file). A world it holds is locked
+/// for Horizon, and a world Horizon holds is locked for it. A POSIX lock is the
+/// process's, and closing any descriptor of the file in the process drops it, so
+/// it is taken again after each of Horizon's probes; Java, another process, keeps it.
+#[cfg(target_os = "linux")]
+#[test]
+fn session_lock_and_javas_file_lock_exclude_each_other() {
+    use rustix::fs::{FlockOperation, fcntl_lock};
+    let dir = std::env::temp_dir().join(format!("horizon-lock-java-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let java = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("session.lock"))
+        .unwrap();
+    let java_lock = || fcntl_lock(&java, FlockOperation::NonBlockingLockExclusive);
+    java_lock().unwrap();
+    assert!(super::SessionLock::acquire(&dir).is_err());
+    java_lock().unwrap();
+    assert!(super::SessionLock::is_locked(&dir));
+    fcntl_lock(&java, FlockOperation::Unlock).unwrap();
+    let horizon = super::SessionLock::acquire(&dir).expect("unlocked world");
+    assert!(java_lock().is_err());
+    drop(horizon);
+    assert!(java_lock().is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+/// A Horizon built before #20841 takes only `flock`, which Linux keeps apart from
+/// the OFD lock: an older and a newer build still exclude each other, in either order.
+#[cfg(target_os = "linux")]
+#[test]
+fn session_lock_and_an_older_horizons_flock_exclude_each_other() {
+    let dir = std::env::temp_dir().join(format!("horizon-lock-flock-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let older = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("session.lock"))
+        .unwrap();
+    older.try_lock().unwrap();
+    assert!(super::SessionLock::acquire(&dir).is_err());
+    assert!(super::SessionLock::is_locked(&dir));
+    older.unlock().unwrap();
+    let newer = super::SessionLock::acquire(&dir).expect("unlocked world");
+    assert!(matches!(
+        older.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(newer);
+    assert!(older.try_lock().is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
 #[test]
 fn crafter_block_entity_round_trips() {
     let mut crafter = crate::containers::Crafter::default();
@@ -2386,6 +2441,29 @@ fn a_loot_chest_keeps_the_components_and_lock_it_was_loaded_with() {
     assert!(full.get("keepPacked").is_none());
 }
 #[test]
+fn trial_spawner_save_overlay_uses_normalized_inline_configs() {
+    let saved = horizon_core::nbt::parse_snbt(
+        r#"{id:"minecraft:trial_spawner",x:1,y:2,z:3,normal_config:{spawn_range:4,total_mobs:6.0f},ominous_config:{spawn_range:5,total_mobs:6.0f},components:{"minecraft:custom_data":{k:1}}}"#,
+    )
+    .unwrap()
+    .0;
+    let (pos, spawner) = decode_block_entity(&saved).expect("trial_spawner");
+    let full = full_block_entity_data(
+        pos,
+        &spawner,
+        "minecraft:trial_spawner",
+        Some(&saved),
+        None,
+        None,
+    );
+    assert_eq!(full.get("normal_config"), None);
+    assert_eq!(
+        full.get("ominous_config"),
+        Some(&horizon_core::nbt::parse_snbt("{spawn_range:5}").unwrap().0)
+    );
+    assert_eq!(full.get("components"), saved.get("components"));
+}
+#[test]
 fn spawner_block_entity_round_trips() {
     // A dungeon spawner as vanilla saves it (`id` is mob_spawner, not the block).
     let saved = horizon_core::nbt::parse_snbt(
@@ -2629,6 +2707,61 @@ fn mod_block_entity_round_trips() {
         block_entity_encode::encode(pos, &back, "gtmod:macerator"),
         saved
     );
+    // A stack saved with a value equal to its item's default (`max_stack_size:64`) is
+    // still an item list: the plain decode keeps the patch as saved, so the list
+    // re-encodes exactly and its slots load.
+    let saved = horizon_core::nbt::parse_snbt(
+        r#"{id:"gtmod:macerator",x:5,y:-60,z:12,Items:[{Slot:0b,id:"minecraft:iron_ore",count:3,components:{"minecraft:max_stack_size":64}}]}"#,
+    )
+    .unwrap()
+    .0;
+    let (pos, back) = decode_block_entity(&saved).expect("mod block entity");
+    let crate::containers::BlockEntity::Mod(m) = &back else {
+        panic!("not a mod's");
+    };
+    assert!(!m.nbt.contains_key(&"Items".into()));
+    assert_eq!(m.items[0].as_ref().map(|s| s.count), Some(3));
+    assert_eq!(
+        block_entity_encode::encode(pos, &back, "gtmod:macerator"),
+        saved
+    );
+    // Taken in against the world's prototypes the slots are canonical, and a save over
+    // the loaded tag writes them so, keeping every other field as loaded.
+    let snbt = |text: &str| horizon_core::nbt::parse_snbt(text).unwrap().0;
+    let Tag::Compound(ore) = snbt(r#"{"minecraft:max_stack_size":64}"#) else {
+        unreachable!()
+    };
+    let prototypes =
+        crate::item_data::ItemPrototypes::from([("minecraft:iron_ore".to_owned(), ore)]);
+    let slot =
+        r#"{Slot:0b,id:"minecraft:iron_ore",count:3,components:{"minecraft:max_stack_size":64}}"#;
+    let clean_slot = r#"{Slot:0b,id:"minecraft:iron_ore",count:3}"#;
+    let source = snbt(&format!(
+        r#"{{id:"gtmod:macerator",x:5,y:-60,z:12,energy:1200L,Items:[{slot}]}}"#
+    ));
+    let (pos, mut back) = decode_block_entity(&source).expect("mod block entity");
+    assert!(back.clean_stacks(&prototypes));
+    assert!(
+        !back.clean_stacks(&prototypes),
+        "a second clean changes nothing"
+    );
+    assert_eq!(
+        full_block_entity_data(pos, &back, "gtmod:macerator", Some(&source), None, None),
+        snbt(&format!(
+            r#"{{id:"gtmod:macerator",x:5,y:-60,z:12,energy:1200L,Items:[{clean_slot}]}}"#
+        ))
+    );
+    // A chest saves the cleaned slot over its loaded tag.
+    let source = snbt(&format!(
+        r#"{{id:"minecraft:chest",x:0,y:0,z:0,Items:[{slot}]}}"#
+    ));
+    let (pos, mut chest) = decode_block_entity(&source).expect("chest");
+    assert!(chest.clean_stacks(&prototypes));
+    let saved = full_block_entity_data(pos, &chest, "minecraft:chest", Some(&source), None, None);
+    let Some(Tag::List(items)) = saved.get("Items") else {
+        panic!("chest items")
+    };
+    assert_eq!(items.as_slice(), [snbt(clean_slot)].as_slice());
     // `Items` that are not an item list stay the mod's, as saved.
     for items in [
         r#"Items:{energy:5}"#,
