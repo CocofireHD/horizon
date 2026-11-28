@@ -145,6 +145,8 @@ static RAMP_POINTS: AtomicUsize = AtomicUsize::new(0);
 static RAMP_VOLUMES: AtomicUsize = AtomicUsize::new(0);
 static COUNTED_POINTS: AtomicUsize = AtomicUsize::new(0);
 static COUNTED_VOLUMES: AtomicUsize = AtomicUsize::new(0);
+static LATTICE_POINTS: AtomicUsize = AtomicUsize::new(0);
+static LATTICE_VOLUMES: AtomicUsize = AtomicUsize::new(0);
 
 /// Every test's types, installed by whichever test runs first.
 fn install() {
@@ -161,6 +163,13 @@ fn install() {
             Arc::new(RampType {
                 points: &COUNTED_POINTS,
                 volumes: &COUNTED_VOLUMES,
+            }) as _,
+        ),
+        (
+            "worldgen_test:lattice".to_owned(),
+            Arc::new(RampType {
+                points: &LATTICE_POINTS,
+                volumes: &LATTICE_VOLUMES,
             }) as _,
         ),
         ("worldgen_test:flat".to_owned(), Arc::new(Flat) as _),
@@ -294,6 +303,53 @@ fn volume_readers_call_fill_not_sample() {
     pipeline.base_height(&mut worker.state, 5, 9, HeightmapType::WorldSurfaceWg);
     assert_eq!(COUNTED_POINTS.load(Ordering::Relaxed), 0);
     assert!(COUNTED_VOLUMES.load(Ordering::Relaxed) > 0);
+}
+
+/// A structure or feature height query reads the samples a chunk's biome pass already captured
+/// on the density lattice (`Pipeline::prepare_lattice`) instead of sampling the graph again.
+#[test]
+fn a_height_query_reuses_the_captured_lattice() {
+    install();
+    let Some(root) = resources() else { return };
+    let data = data(&root);
+    let (pipeline, mut worker) = ramp_world(&data, 5, "worldgen_test:lattice");
+    let (x, z) = (5, 9);
+    let kind = HeightmapType::WorldSurfaceWg;
+    let expected = pipeline.base_height(&mut worker.state, x, z, kind);
+    // The same column volume a height query samples, captured under the column's chunk.
+    let volume = DensityVolume::new(
+        [1, pipeline.settings.noise_height, 1],
+        [x, pipeline.settings.noise_min_y, z],
+        [1; 3],
+    )
+    .unwrap();
+    let mut context = SamplerContext::default();
+    context.capture_lattice();
+    let mut values = vec![0.0f32; volume.size()];
+    pipeline
+        .router
+        .get(RouterField::FinalDensity)
+        .sample_volume(&mut context, &mut values, volume)
+        .unwrap();
+    let lattice = context.take_lattice_capture();
+    assert!(
+        !lattice.is_empty(),
+        "the volume captured no lattice samples"
+    );
+    pipeline
+        .lattice_cache
+        .insert((x.div_euclid(16), z.div_euclid(16)), Arc::new(lattice));
+    let fills = LATTICE_VOLUMES.load(Ordering::Relaxed);
+    assert_eq!(
+        pipeline.base_height(&mut worker.state, x, z, kind),
+        expected
+    );
+    assert_eq!(
+        LATTICE_VOLUMES.load(Ordering::Relaxed),
+        fills,
+        "the height query sampled the density graph instead of the lattice"
+    );
+    assert_eq!(LATTICE_POINTS.load(Ordering::Relaxed), 0);
 }
 
 /// A Y-free mod type as the router's `continents` moves every climate reader: the biomes chunks

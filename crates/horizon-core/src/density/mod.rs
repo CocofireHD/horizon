@@ -156,6 +156,11 @@ impl SamplerContext {
     pub fn clear_lattice(&mut self) {
         self.lattice = Vec::new();
     }
+    /// Take the lattice list back (empty after a call), so a caller can keep
+    /// its storage between volumes instead of rebuilding it.
+    pub fn take_lattice(&mut self) -> Vec<LatticeSamples> {
+        std::mem::take(&mut self.lattice)
+    }
     /// Release retained storage between worlds or after unusually large work.
     pub fn clear_scratch(&mut self) {
         self.scratch.clear();

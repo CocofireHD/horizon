@@ -1231,16 +1231,7 @@ where
         worker.timings.noise += lap(&mut clock);
         // The density cells this fill needs are mostly in the climate volumes
         // of this chunk and its +X/+Z neighbours, sampled for their biomes.
-        let mut lattice = Vec::new();
-        for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-            if let Some(samples) = self
-                .lattice_cache
-                .get(&(pos.x.wrapping_add(dx), pos.z.wrapping_add(dz)))
-            {
-                lattice.extend(samples.iter().cloned());
-            }
-        }
-        context.set_lattice(lattice);
+        self.prepare_lattice(&mut worker.lattice_scratch, context, pos);
         let filled = match &self.mod_terrain {
             Some(terrain) => terrain.fill(&mut chunk, data.registry, self.seed, [min, height]),
             None => fill_noise(
@@ -1252,7 +1243,6 @@ where
                 self.settings.default_block,
             ),
         };
-        context.clear_lattice();
         filled.map_err(stage("noise"))?;
         let generation = self.generation();
         worker.timings.noise += lap(&mut clock);
@@ -1335,6 +1325,9 @@ where
         }
         worker.surface_rule = shared.map(|rule| Box::new(rule) as Box<dyn Any + Send>);
         worker.timings.carvers += lap(&mut clock);
+        // Fill, surface and carvers shared the lattice; keep its storage for
+        // the next volume and leave the context for the next stage.
+        worker.lattice_scratch = context.take_lattice();
         chunk
             .prime_heightmaps(&[
                 HeightmapType::MotionBlocking,
@@ -1364,6 +1357,29 @@ impl<R: RandomSource> Pipeline<R>
 where
     R::Positional: Clone + Send + Sync,
 {
+    /// Hand `context` the captured density lattice of the chunk at `pos` and
+    /// its +X/+Z neighbours, so interpolated samplers read samples their
+    /// biomes already took instead of sampling their graphs again. `scratch`
+    /// keeps the list's storage: `context.take_lattice()` gives it back.
+    fn prepare_lattice(
+        &self,
+        scratch: &mut Vec<LatticeSamples>,
+        context: &mut SamplerContext,
+        pos: ChunkPos,
+    ) {
+        scratch.clear();
+        for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            if let Some(samples) = self
+                .lattice_cache
+                .get(&(pos.x.wrapping_add(dx), pos.z.wrapping_add(dz)))
+            {
+                scratch.extend(samples.iter().cloned());
+            }
+        }
+        if !scratch.is_empty() {
+            context.set_lattice(std::mem::take(scratch));
+        }
+    }
     /// WorldGenRegion's level random, positioned at the center chunk.
     fn region_random_at(&self, center: ChunkPos) -> R {
         self.root
@@ -1494,6 +1510,13 @@ where
         };
         let context = &mut worker.column_context;
         context.reset();
+        // A height query re-runs the density graph only for the samples the
+        // chunk's (and its neighbours') biome lattices don't already hold.
+        self.prepare_lattice(
+            &mut worker.lattice_scratch,
+            context,
+            ChunkPos::new(x.div_euclid(16), z.div_euclid(16)),
+        );
         let mut aquifer: Box<dyn TerrainAquifer> = match &self.aquifer {
             Some(samplers) => match RegistryAquiferBlockStates::new(self.data.registry)
                 .ok()
@@ -1512,6 +1535,7 @@ where
                 }) {
                 Some(aquifer) => Box::new(aquifer),
                 None => {
+                    worker.lattice_scratch = context.take_lattice();
                     context.reset();
                     return;
                 }
@@ -1541,6 +1565,7 @@ where
                 }
             }
         }
+        worker.lattice_scratch = context.take_lattice();
         context.reset();
     }
 }
@@ -2042,6 +2067,9 @@ pub(super) struct WorkerState {
     carver_context: SamplerContext,
     column_context: SamplerContext,
     column_density: Vec<f32>,
+    /// Reused by [`Pipeline::prepare_lattice`]: the captured climate lattices
+    /// of the chunks around a column, taken back after each sample.
+    lattice_scratch: Vec<LatticeSamples>,
     /// Reusable 6-field climate volume buffers.
     climate_buffers: [Vec<f32>; 6],
     /// Seed/dimension-bound lookups avoid the shared mutex for overlapping
@@ -3211,6 +3239,7 @@ impl OverworldGenerator {
                 carver_context: SamplerContext::default(),
                 column_context: SamplerContext::cached(),
                 column_density: Vec::new(),
+                lattice_scratch: Vec::new(),
                 climate_buffers: Default::default(),
                 carver_biomes: FxHashMap::default(),
                 structure_biomes: FxHashMap::default(),
@@ -3401,6 +3430,7 @@ impl GeneratorWorker {
             context.clear_scratch();
         }
         state.column_density = Vec::new();
+        state.lattice_scratch = Vec::new();
         state.climate_buffers = Default::default();
         state.carver_biomes = FxHashMap::default();
         state.structure_biomes = FxHashMap::default();
